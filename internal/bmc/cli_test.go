@@ -187,7 +187,15 @@ func TestAwaitConsole(t *testing.T) {
 	sess := func(out string) *cliSession {
 		r, w := io.Pipe()
 		go func() { _, _ = io.WriteString(w, out) }()
-		return newCLISession(r, io.Discard, iloSpec)
+		s := newCLISession(r, io.Discard, iloSpec)
+		// The writer stays open until cleanup so the silent case waits out
+		// its timeout; closing both ends then ends the pipe goroutines.
+		t.Cleanup(func() {
+			s.Close()
+			_ = w.Close()
+			_ = r.Close()
+		})
+		return s
 	}
 	// Another session holds VSP: the iLO says so and shows its prompt again.
 	s := sess("Starting virtual serial port\r\nPress 'ESC (' to return to the CLI Session\r\n" +
