@@ -1,0 +1,6 @@
+/oob
+/dist/
+hosts.json
+known_hosts
+redfish_pins
+*.lock
