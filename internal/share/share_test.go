@@ -1075,3 +1075,61 @@ func TestAnOrphanedHubWhoseConsoleEndedStillReleasesItsSocketAndLock(t *testing.
 		t.Errorf("a new open after the cleanup: joined %v hosting %v", again.Joined(), again.Hosting())
 	}
 }
+
+func TestAgentKeysKeepTheirBoundariesThroughTheVSPMapping(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	host(t, f, Options{NoLinger: true})
+	ai := agent(t)
+	ctx, _, release, err := ai.Lease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	// "esc" then "enter" are two keys: ESC ESC CR.
+	if err := ai.TypeKeys(ctx, [][]byte{[]byte("\x1b"), []byte("\r")}); err != nil {
+		t.Fatalf("esc, enter: %v", err)
+	}
+	if got := f.got(); got != "\x1b\x1b\r" {
+		t.Fatalf("typed %q, want ESC ESC CR", got)
+	}
+	// The same bytes sent as one piece are an Alt-Enter, which the VSP can't pass.
+	if err := ai.Type(ctx, []byte("\x1b\r")); !errors.Is(err, console.ErrKeysDropped) {
+		t.Errorf("ESC CR as one piece: %v, want ErrKeysDropped", err)
+	}
+	// One unpassable key refuses the whole call before anything is typed.
+	before := f.got()
+	err = ai.TypeKeys(ctx, [][]byte{[]byte("abc"), []byte("\x1b"), []byte("\x1b[A")})
+	if !errors.Is(err, console.ErrKeysDropped) {
+		t.Errorf("with an arrow key: %v, want ErrKeysDropped", err)
+	}
+	if got := f.got(); got != before {
+		t.Errorf("a refused call typed %q", got[len(before):])
+	}
+	// Text, keys and empty parts together on a console that maps nothing.
+	if err := ai.TypeKeys(ctx, [][]byte{[]byte("ls"), nil, []byte("\r")}); err != nil {
+		t.Errorf("text then enter: %v", err)
+	}
+	if got := f.got()[len(before):]; got != "ls\r" {
+		t.Errorf("typed %q", got)
+	}
+}
+
+func TestBadKeyBoundariesAreRefused(t *testing.T) {
+	env(t)
+	f := newFake()
+	host(t, f, Options{NoLinger: true})
+	w := rawAgent(t)
+	_ = w.send(msg{T: tReq, ID: 1, Op: opLease, Lease: 1})
+	reply(t, w, 1)
+	for _, cuts := range [][]int{{5}, {2, 1}, {-1}} {
+		_ = w.send(msg{T: tReq, ID: 2, Op: opWrite, Data: []byte("abc"), Cuts: cuts})
+		if r := reply(t, w, 2); r.Err == "" {
+			t.Errorf("cuts %v were accepted", cuts)
+		}
+	}
+	if f.got() != "" {
+		t.Errorf("typed %q for bad boundaries", f.got())
+	}
+}

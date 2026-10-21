@@ -304,9 +304,20 @@ func (c *session) closeTransport() {
 // with console.ErrKeysDropped, so the AI tool isn't told it pressed a key that
 // never arrived.
 func (c *session) mapInput(b []byte) ([]byte, error) {
-	out, note := console.MapInput(c.tr.Link, b)
-	if note != "" {
-		return nil, console.ErrKeysDropped
+	return c.mapUnits([][]byte{b})
+}
+
+// mapUnits is mapInput for a call made of keys and text: each unit is mapped
+// on its own, so "esc" then "enter" is ESC ESC CR and not the Alt-Enter the
+// joined bytes would read as. Any unit the link would drop refuses the call.
+func (c *session) mapUnits(units [][]byte) ([]byte, error) {
+	var out []byte
+	for _, u := range units {
+		m, note := console.MapInput(c.tr.Link, u)
+		if note != "" {
+			return nil, console.ErrKeysDropped
+		}
+		out = append(out, m...)
 	}
 	return out, nil
 }
@@ -315,12 +326,22 @@ func (c *session) mapInput(b []byte) ([]byte, error) {
 // when the last one is out. On a serial console that takes a while, since the
 // queue paces them.
 func (c *session) write(ctx context.Context, b []byte) error {
+	return c.writeUnits(ctx, [][]byte{b})
+}
+
+// writeUnits is write for a call made of separate keys and text (see mapUnits).
+func (c *session) writeUnits(ctx context.Context, units [][]byte) error {
+	var b []byte
 	if c.sh == nil { // a shared console's hub maps and refuses these itself
-		out, err := c.mapInput(b)
+		out, err := c.mapUnits(units)
 		if err != nil {
 			return err
 		}
 		b = out
+	} else {
+		for _, u := range units {
+			b = append(b, u...)
+		}
 	}
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
@@ -328,7 +349,7 @@ func (c *session) write(ctx context.Context, b []byte) error {
 	c.mu.Unlock()
 	err := c.guarded(ctx, func() error {
 		if c.sh != nil { // the hub's one typer paces it, with the lease and typing checks
-			return c.sh.Type(context.Background(), b) // guarded ends it if ctx does
+			return c.sh.TypeKeys(context.Background(), units) // guarded ends it if ctx does
 		}
 		<-c.ty.Enqueue(b)
 		return nil

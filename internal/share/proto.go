@@ -69,6 +69,7 @@ type msg struct {
 	State *Status `json:"state,omitempty"` // state
 
 	ID       int    `json:"id,omitempty"`    // req, reply
+	Cuts     []int  `json:"cuts,omitempty"`  // req write: offsets in Data where a new key starts
 	Lease    int    `json:"lease,omitempty"` // req lease and release: which acquisition this is
 	Op       string `json:"op,omitempty"`
 	Rows     int    `json:"rows,omitempty"`

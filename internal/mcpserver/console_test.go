@@ -469,3 +469,28 @@ func TestSendKeysArrowsAreFineOffVSP(t *testing.T) {
 		t.Errorf("typed %q", got)
 	}
 }
+
+func TestSendKeysEscThenEnterKeepsTheKeysApartOnAnILOVSP(t *testing.T) {
+	h := start(t, Options{}, "accept") // esc then enter runs an edited line: the user is asked
+	h.setup = func(f *fakeHost) { f.vsp = true }
+	h.connect()
+	f := h.host("node01")
+	// Two keys: Escape, then Enter. Joined as ESC CR they would read as one
+	// Alt-Enter, which a VSP can't pass.
+	if out, isErr := h.keys("s1", "", "esc", "enter"); isErr {
+		t.Fatalf("esc, enter: %q", out)
+	}
+	if got := f.rawSent(); got != "\x1b\x1b\r" {
+		t.Errorf("typed %q, want ESC ESC CR", got)
+	}
+	// Text then a key keeps its boundary too, and the whole call is still
+	// checked first: one key the VSP can't pass sends nothing at all.
+	before := f.rawSent()
+	out, isErr := h.keys("s1", "abc", "esc", "up")
+	if !isErr || !strings.Contains(out, "iLO VSP") {
+		t.Fatalf("esc, up: %q %v", out, isErr)
+	}
+	if got := f.rawSent(); got != before {
+		t.Errorf("a refused call still typed %q", got[len(before):])
+	}
+}

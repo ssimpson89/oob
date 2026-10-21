@@ -730,7 +730,7 @@ func (h *hub) request(p *peer, m msg) {
 	case opLease, opRelease:
 		err = h.agentOp(p, m)
 	case opWrite:
-		err = h.agentWrite(p, m.Data)
+		err = h.agentWrite(p, m.Data, m.Cuts)
 	default:
 		err = h.linkOp(p, m, &reply)
 	}
@@ -851,16 +851,36 @@ func (h *hub) agentOp(p *peer, m msg) error {
 	return nil
 }
 
+// mapKeys fits an AI tool's write to the link, one key at a time. cuts are the
+// offsets in b where a key starts: the tool pressed named keys, and "esc" then
+// "enter" is two keys (ESC ESC CR on a VSP), not the Alt-Enter that the same
+// bytes would read as. The whole call is checked before any of it is typed: if
+// the link would drop any key, none is sent.
+func (h *hub) mapKeys(b []byte, cuts []int) ([]byte, error) {
+	prev, out := 0, make([]byte, 0, len(b)+len(cuts)+1)
+	for _, at := range append(append([]int(nil), cuts...), len(b)) {
+		if at < prev || at > len(b) {
+			return nil, errors.New("bad key boundaries in write")
+		}
+		m, note := console.MapInput(h.tr.Link, b[prev:at])
+		if note != "" {
+			return nil, console.ErrKeysDropped
+		}
+		out = append(out, m...)
+		prev = at
+	}
+	return out, nil
+}
+
 // agentWrite types the AI tool's bytes and returns once they are out. Only
 // while it has the keyboard, and not once the user has taken it back.
-func (h *hub) agentWrite(p *peer, b []byte) error {
-	b, note := console.MapInput(h.tr.Link, b)
-	if note != "" { // keys the link would drop: type none of it
-		return console.ErrKeysDropped
+func (h *hub) agentWrite(p *peer, b []byte, cuts []int) error {
+	b, err := h.mapKeys(b, cuts)
+	if err != nil { // keys the link would drop: type none of it
+		return err
 	}
 	h.enqMu.Lock()
 	h.mu.Lock()
-	var err error
 	switch {
 	case !p.agent:
 		err = errors.New("only an AI tool uses write")

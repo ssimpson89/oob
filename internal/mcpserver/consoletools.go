@@ -852,6 +852,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	}
 	cur := at.cursor
 	var wire strings.Builder
+	var units [][]byte // the text and each key on their own, for the console to map one by one
 	for i, st := range steps {
 		if st.text == "" && st.key == "" {
 			continue
@@ -883,9 +884,10 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		}
 		lastEsc = st.key == "esc"
 		wire.WriteString(st.text + keyBytes[st.key])
+		units = append(units, []byte(st.text), []byte(keyBytes[st.key]))
 	}
 	if c.sh == nil {
-		if _, err := c.mapInput([]byte(wire.String())); err != nil {
+		if _, err := c.mapUnits(units); err != nil {
 			return fail(err) // before asking the user to approve what can't be typed
 		}
 	}
@@ -925,7 +927,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		c.tx.Mark("agent pressed " + strings.Join(in.Keys, ", "))
 	}
 	changed := c.changes()
-	if err := c.write(ctx, []byte(wire.String())); err != nil {
+	if err := c.writeUnits(ctx, units); err != nil {
 		if w := why(); w != "" && w != "disconnected" && !errors.Is(err, errStuck) {
 			return text(true, c.output(), stoppedText(w)), nil, nil
 		}

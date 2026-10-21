@@ -558,6 +558,23 @@ func (c *Client) Type(ctx context.Context, b []byte) error {
 	return err
 }
 
+// TypeKeys is Type for keys: each part is one key press or piece of text, and
+// the hub fits each to the console on its own (a lone ESC part is an Escape
+// key, even when the next part starts with a byte that would otherwise be read
+// as its second half). Nothing is typed if any part can't be.
+func (c *Client) TypeKeys(ctx context.Context, parts [][]byte) error {
+	var b []byte
+	var cuts []int
+	for _, p := range parts {
+		if len(b) > 0 && len(p) > 0 {
+			cuts = append(cuts, len(b))
+		}
+		b = append(b, p...)
+	}
+	_, err := c.call(ctx, msg{Op: opWrite, Data: b, Cuts: cuts})
+	return err
+}
+
 // Lease gives an AI tool the keyboard for one command. The returned context
 // ends if the user stops it; why then says how (one of the Stop constants, or
 // "disconnected"). If the user is typing it waits, up to typingWindow, for them
