@@ -362,7 +362,7 @@ func (d *iloDriver) Power(act string) error {
 		if r.Failed {
 			return errors.New(strings.TrimPrefix(r.Text, "ERROR: "))
 		}
-		fmt.Println(r.Text)
+		fmt.Fprintln(Stdout(), r.Text)
 		return nil
 	}
 	if _, ok := redfishResetType(act); !ok {
@@ -378,9 +378,9 @@ func (d *iloDriver) Power(act string) error {
 		switch {
 		case err != nil:
 		case already != "":
-			fmt.Println(already)
+			fmt.Fprintln(Stdout(), already)
 		default:
-			fmt.Printf("Chassis Power Control: %s (Redfish %s)\n", act, rt)
+			fmt.Fprintf(Stdout(), "Chassis Power Control: %s (Redfish %s)\n", act, rt)
 		}
 		return err
 	}
@@ -388,7 +388,7 @@ func (d *iloDriver) Power(act string) error {
 	case "cycle", "reset":
 		out, err := iloPowerCycleFn(d.name, d.h)()
 		if err == nil {
-			fmt.Println(out)
+			fmt.Fprintln(Stdout(), out)
 		}
 		return err
 	}
@@ -403,7 +403,7 @@ func (d *iloDriver) Power(act string) error {
 		}
 		return err
 	}
-	fmt.Println(iloPowerText(act, res))
+	fmt.Fprintln(Stdout(), iloPowerText(act, res))
 	return nil
 }
 
@@ -465,7 +465,7 @@ func (d *iloDriver) Boot(dev string, legacy, persistent bool) error {
 			if legacy {
 				mode = ", Legacy"
 			}
-			fmt.Printf("Boot override set: %s once%s (Redfish)\n", target, mode)
+			fmt.Fprintf(Stdout(), "Boot override set: %s once%s (Redfish)\n", target, mode)
 		}
 		return err
 	}
@@ -515,6 +515,10 @@ func (d *iloDriver) Console(o SOLOptions) error {
 	return app.Code(cliConsole(d.name, d.h, iloSpec, d.ConsolePower()))
 }
 
+func (d *iloDriver) OpenConsole(o OpenConsoleOptions) (*ConsoleTransport, error) {
+	return cliOpen(d.name, d.h, iloSpec, o.Rows, o.Cols)
+}
+
 // ConsolePower is a Redfish power cycle when available, else the SSH CLI's
 // off, wait, on over a second connection.
 func (d *iloDriver) ConsolePower() func() (string, error) {
@@ -543,9 +547,9 @@ func iloPrint(name string, h config.Host, cmd string) error {
 		return err
 	}
 	if res.Body != "" {
-		fmt.Println(console.CleanRemote(res.Body))
+		fmt.Fprintln(Stdout(), console.CleanRemote(res.Body))
 	} else if res.StatusTag != "" {
-		fmt.Println(console.CleanRemote(res.StatusTag))
+		fmt.Fprintln(Stdout(), console.CleanRemote(res.StatusTag))
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ type history struct {
 	buf   []string // ring storage, grows to max then wraps
 	max   int
 	start int // index of the oldest line once the ring is full
+	n     int // lines completed since the start, including ones the ring dropped
 }
 
 func newHistory(max int) *history {
@@ -41,6 +42,7 @@ func (h *history) Feed(raw []byte) {
 }
 
 func (h *history) push(line string) {
+	h.n++
 	if len(h.buf) < h.max {
 		h.buf = append(h.buf, line)
 		return
@@ -61,3 +63,17 @@ func (h *history) Lines() []string {
 
 // Partial is the unfinished current line, usually a prompt.
 func (h *history) Partial() string { return h.cl.Partial() }
+
+// Count is how many lines have been completed since the start, including ones
+// the ring has dropped.
+func (h *history) Count() int { return h.n }
+
+// Last returns the newest k held lines, oldest first.
+func (h *history) Last(k int) []string {
+	k = max(0, min(k, len(h.buf)))
+	out := make([]string, 0, k)
+	for i := len(h.buf) - k; i < len(h.buf); i++ {
+		out = append(out, h.buf[(h.start+i)%len(h.buf)])
+	}
+	return out
+}

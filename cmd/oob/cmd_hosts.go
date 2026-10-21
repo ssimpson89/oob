@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -108,33 +107,8 @@ func statusCmd() *cobra.Command {
 	return c
 }
 
-// selectHosts returns sorted names matching sel: "" (all), "tag:x", a glob, or a
-// substring. Matching is case-insensitive.
-func selectHosts(c *config.Config, sel string) []string {
-	sel = strings.ToLower(sel)
-	var out []string
-	for _, n := range c.Names() {
-		h := c.Hosts[n]
-		ln := strings.ToLower(n)
-		switch {
-		case sel == "":
-			out = append(out, n)
-		case strings.HasPrefix(sel, "tag:"):
-			want := strings.TrimPrefix(sel, "tag:")
-			for _, t := range h.Tags {
-				if strings.ToLower(t) == want {
-					out = append(out, n)
-					break
-				}
-			}
-		default:
-			if ok, _ := path.Match(sel, ln); ok || strings.Contains(ln, sel) {
-				out = append(out, n)
-			}
-		}
-	}
-	return out
-}
+// selectHosts returns sorted names matching sel (see config.Select).
+func selectHosts(c *config.Config, sel string) []string { return c.Select(sel) }
 
 func lsCmd() *cobra.Command {
 	return &cobra.Command{

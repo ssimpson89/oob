@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
@@ -85,49 +86,94 @@ func ipmiPowerOutcome(name, out string, err error) (string, error) {
 	return out, nil
 }
 
-// solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
-// exit code.
-func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
+// openSOL starts `ipmitool sol activate` under a PTY of the given size and
+// returns it as a console transport. It needs no terminal of its own, so both
+// the console bar and a headless front end use it.
+func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	cmd, err := ipmiCmd(context.Background(), h, "-e", string([]byte{solEscape}), "sol", "activate")
 	if err != nil {
-		return 1, err
+		return nil, err
 	}
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
 	if err != nil {
-		return 1, err
+		return nil, fmt.Errorf("start ipmitool: %w", err)
 	}
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(console.RemoteRows(rows)), Cols: uint16(w)})
-	if err != nil {
-		return 1, fmt.Errorf("start ipmitool: %w", err)
-	}
-	defer ptmx.Close()
-
 	done := make(chan console.Result, 1)
+	// refused is set when ipmitool itself gave up with a non-zero exit status
+	// (for instance "SOL payload already active": someone else holds the
+	// session). This transport then never owned a session, and Release must not
+	// deactivate the other holder's. A kill by Close shows as a signal, not a
+	// status, so it doesn't count.
+	var refused atomic.Bool
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
 		err := cmd.Wait()
 		var ee *exec.ExitError
 		switch {
 		case err == nil:
 			done <- console.Result{}
 		case errors.As(err, &ee):
+			if ee.ExitCode() > 0 {
+				refused.Store(true)
+			}
 			done <- console.Result{Code: exitCodeOf(ee)}
 		default:
 			done <- console.Result{Code: 1, Err: err}
 		}
 	}()
-	var tail tailBuf
+	tail := &tailBuf{}
+	return &ConsoleTransport{
+		Kind: "sol",
+		Link: &solLink{ptmx: ptmx, cmd: cmd},
+		Out:  io.TeeReader(ptmx, tail),
+		Done: done,
+		Tail: tail.String,
+		Close: func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = ptmx.Close()
+		},
+		Release: func() {
+			// Close has killed the client by now; let the waiter record how it
+			// ended before deciding whether the session was ours.
+			select {
+			case <-exited:
+			case <-time.After(2 * time.Second):
+			}
+			if refused.Load() {
+				return
+			}
+			_, _ = ipmiOutput(h, ipmiQuickTimeout, "sol", "deactivate")
+		},
+	}, nil
+}
+
+// solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
+// exit code.
+func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
+	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return 1, err
+	}
+	tr, err := openSOL(h, console.RemoteRows(rows), w)
+	if err != nil {
+		return 1, err
+	}
+	defer tr.Close()
 	code, err := console.Run(console.Setup{
 		Host: name, Kind: "sol",
-		Link:       &solLink{ptmx: ptmx, cmd: cmd},
-		Out:        io.TeeReader(ptmx, &tail),
-		Done:       done,
+		Link:       tr.Link,
+		Out:        tr.Out,
+		Done:       tr.Done,
 		Power:      power,
 		Connecting: "connecting to " + name + " via IPMI...",
 	})
 	// The terminal is restored now. Repeat any ipmitool error below the bar's
 	// old row so it is still on screen after the console is torn down.
 	if code != 0 {
-		reportIpmiFailure(tail.String(), h)
+		reportIpmiFailure(tr.Tail(), h)
 	}
 	return code, err
 }

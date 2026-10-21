@@ -267,6 +267,26 @@ func (d *supermicroDriver) Console(o SOLOptions) error {
 	return (&ipmiDriver{d.name, h}).Console(SOLOptions{Raw: o.Raw})
 }
 
+// OpenConsole is Console without a terminal. Console always clears a stale SOL
+// session first; here that only happens with Force, because ending someone
+// else's session is for the caller to ask about. Otherwise a harmless power
+// status read settles which cipher works, then SOL starts.
+func (d *supermicroDriver) OpenConsole(o OpenConsoleOptions) (*ConsoleTransport, error) {
+	untestedNote(detect.VendorName(detect.TypeSupermicro))
+	args := []string{"chassis", "power", "status"}
+	if o.Force {
+		args = []string{"sol", "deactivate"}
+	}
+	h, r, sw := smcRetry(d.h, false, func(h config.Host, _ bool) ipmiRun {
+		return ipmiRunQuiet(h, ipmiQuickTimeout, args...)
+	})
+	afterSwitch(d.name, h, sw)
+	if !r.ok() && cipherFailure(r.out) {
+		return nil, fmt.Errorf("IPMI session failed: %s", console.CleanRemoteLine(r.out))
+	}
+	return (&ipmiDriver{d.name, h}).OpenConsole(OpenConsoleOptions{Rows: o.Rows, Cols: o.Cols})
+}
+
 // sshConsole is the SMASH-CLP fallback: cd to the SOL target and start it.
 func (d *supermicroDriver) sshConsole(o SOLOptions) error {
 	if err := rejectSOLFlags(o, "--ssh uses the BMC's SMASH-CLP shell instead"); err != nil {

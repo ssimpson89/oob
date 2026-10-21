@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -232,6 +233,47 @@ func (c *Config) Lookup(name string) (string, Host, error) {
 		return matches[0], h, nil
 	}
 	return "", Host{}, fmt.Errorf("%q is ambiguous: %s", name, strings.Join(matches, ", "))
+}
+
+// LookupExact finds a host by its exact name only (no prefix matching), with
+// defaults merged. Commands that change state use it so a short name can never
+// pick a different host than intended.
+func (c *Config) LookupExact(name string) (Host, error) {
+	h, ok := c.Hosts[name]
+	if !ok {
+		return Host{}, fmt.Errorf("no such host %q (see: %s ls)", name, app.Name)
+	}
+	h = c.merge(h)
+	h.Name = name
+	return h, nil
+}
+
+// Select returns sorted names matching sel: "" (all), "tag:x", a glob, or a
+// substring. Matching is case-insensitive.
+func (c *Config) Select(sel string) []string {
+	sel = strings.ToLower(sel)
+	var out []string
+	for _, n := range c.Names() {
+		h := c.Hosts[n]
+		ln := strings.ToLower(n)
+		switch {
+		case sel == "":
+			out = append(out, n)
+		case strings.HasPrefix(sel, "tag:"):
+			want := strings.TrimPrefix(sel, "tag:")
+			for _, t := range h.Tags {
+				if strings.ToLower(t) == want {
+					out = append(out, n)
+					break
+				}
+			}
+		default:
+			if ok, _ := path.Match(sel, ln); ok || strings.Contains(ln, sel) {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
 }
 
 // Names returns sorted host names.

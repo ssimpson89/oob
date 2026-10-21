@@ -134,6 +134,7 @@ no password uses the SSH CLI instead of Redfish.
 | `oob ls [filter]`, `add`, `rm`, `edit` | Manage the host list. `ls` and `status` filters are a glob (`web*`), a substring, or `tag:x`, all case-insensitive |
 | `oob add <name> [ip]` | New host, or on an existing host change only the flags you pass. `--pass-stdin` reads the password from stdin |
 | `oob import file.csv` | Bulk add from CSV: `name,ip,user,pass,port,cipher,notes,tags` |
+| `oob mcp` | Serve your hosts and their consoles to an AI agent over MCP, see [Use it with an AI agent](#use-it-with-an-ai-agent-mcp) |
 | `oob version` | Print the version |
 | `oob ipmi <name> -- <args>` | Run any other ipmitool command |
 
@@ -251,5 +252,82 @@ escape sequences removed, readable only by you. oob handles `~.` itself, and ipm
 
 Parts of the bar are adapted from [bauddy](https://github.com/ssimpson89/bauddy) (MIT), see
 [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Use it with an AI agent (MCP)
+
+`oob mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdin and stdout. It lets an
+AI agent such as Claude look at your BMCs and read a server's serial console: "node01 stopped answering,
+check its event log and see what's on the console". It uses the same drivers as the command line, so vendor
+detection applies.
+
+### Add it
+
+```
+claude mcp add oob -- oob mcp                   # this project only, just you (the default: --scope local)
+claude mcp add --scope user oob -- oob mcp      # every project, just you
+claude mcp remove oob                           # remove it, from whichever scope it is in
+```
+
+For another MCP client, run `oob mcp` as a stdio server: command `oob`, args `["mcp"]`. Use the full path to
+`oob` if the client doesn't see your `PATH`, and `-c FILE` to point it at another host file. Add `--read-only`
+after `oob mcp` and the agent gets only the read-only host tools: no changes, no console.
+
+### What the agent can do
+
+Host tools, which take host names from `list_hosts`:
+
+| Tool | What it does |
+| --- | --- |
+| `list_hosts` | Name, BMC address, type, tags and notes. Never passwords, keys or key paths. Long lists come in pages (`limit`, `offset`, `next_offset`) |
+| `power_status`, `status` | Power state of one host, or of many at once (glob, text or `tag:x`; paged like `list_hosts`) |
+| `sel_list`, `sensors`, `bmc_info` | Event log (newest entries when it is long), sensor readings, BMC identity |
+| `power`, `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset` | Change state. Always asks you first |
+
+Console tools, for the server's own serial console (its login prompt, GRUB, kernel messages), reached the
+same way as `oob sol`: IPMI SOL, iLO VSP over SSH, iDRAC `console com2`:
+
+| Tool | What it does |
+| --- | --- |
+| `connect` | Open the console and return a session id. `force` clears a stale IPMI SOL session (asks first) |
+| `read_output`, `read_history` | What is new since the last read (it can wait for some text), and earlier output (the last 10000 lines, searchable) |
+| `send_command` | Run a command and return its output. Stops at a `[y/N]` question or a pager |
+| `send_keys` | Text and keys: enter, arrows, ctrl+c, function keys, for answers and for GRUB or BIOS menus |
+| `send_break` | Serial BREAK, IPMI SOL only (iLO and iDRAC have none, and say so) |
+| `bmc_prompt` | iLO and iDRAC: switch between the server console and the BMC's own command line |
+| `disconnect` | Close the session |
+
+Several sessions can be open at once, one per host. They close when the client exits and after 15 idle
+minutes (`--idle-timeout`). With `--log`, each session is also saved as a log in
+`~/.local/state/oob/logs` (or `--log-dir`), readable only by you, with what the console printed and what the
+agent typed. Logs are off by default because a console can show secrets.
+
+### What always asks you first
+
+The agent can't answer for you. Your client shows the exact request and you accept or decline:
+
+- every state change: `power` (all actions, including `on`), `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset`
+- `connect` with `force`
+- console commands that reboot, power off, wipe, format or repartition, remove packages, cut the network or
+  change accounts, and anything that triggers SysRq
+- anything typed at a bootloader prompt (GRUB, UEFI shell, U-Boot), or at the BMC's own command line
+- `send_break`, and the first keys typed after one (on Linux the next key is a SysRq command)
+- an answer to a yes/no question the agent's own command raised, unless the answer is no or ctrl+c
+
+If your client can't ask, oob refuses and tells the agent so. There is no switch to skip this, and
+`-y` doesn't apply. State changes take exact host names, never a prefix.
+
+The console check is a safety net, not a guarantee: it reads the command line, so scripts, aliases and
+menus in firmware or BIOS setup can get past it. Read what the agent wants to run before you allow it.
+
+### What the agent never sees
+
+Passwords and keys stay inside oob: tools take host names, credentials are looked up from your host file when a
+tool runs, and no tool returns them. Anything a BMC or console prints passes through the same sanitizer as
+the rest of oob (escape sequences, control and bidi characters removed) and is treated as data, not
+instructions. Results are cut to a fixed size, every tool has a time limit, and nothing but the protocol is
+written to stdout.
+
+Parts of the console and approval logic are adapted from [bauddy](https://github.com/ssimpson89/bauddy)'s
+MCP server (MIT), see [THIRD_PARTY.md](THIRD_PARTY.md).
 
 More background on how it works is in [DESIGN.md](DESIGN.md).

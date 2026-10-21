@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ssimpson89/oob/internal/app"
@@ -132,5 +133,34 @@ func TestLookupEmptyAndPrefix(t *testing.T) {
 	}
 	if n, _, err := c.Lookup("rack1-a"); err != nil || n != "rack1-a" {
 		t.Errorf("exact: %q %v", n, err)
+	}
+}
+
+func TestLookupExactAndSelect(t *testing.T) {
+	c := &Config{
+		Defaults: Host{User: "admin", Pass: "pw"},
+		Hosts: map[string]Host{
+			"node01": {IP: "192.0.2.1", Tags: []string{"rack1"}},
+			"node02": {IP: "192.0.2.2", Tags: []string{"rack2"}},
+			"login1": {IP: "192.0.2.3"},
+		},
+	}
+	h, err := c.LookupExact("node01")
+	if err != nil || h.IP != "192.0.2.1" || h.User != "admin" || h.Name != "node01" {
+		t.Fatalf("LookupExact(node01) = %+v, %v", h, err)
+	}
+	if _, err := c.LookupExact("login"); err == nil {
+		t.Error("LookupExact matched by prefix")
+	}
+	for sel, want := range map[string]string{
+		"":          "login1 node01 node02",
+		"node*":     "node01 node02",
+		"tag:rack2": "node02",
+		"LOGIN":     "login1",
+		"nothing":   "",
+	} {
+		if got := strings.Join(c.Select(sel), " "); got != want {
+			t.Errorf("Select(%q) = %q, want %q", sel, got, want)
+		}
 	}
 }

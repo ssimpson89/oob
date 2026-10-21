@@ -1,0 +1,145 @@
+// Copyright (c) 2026 ssimpson89. MIT License. See THIRD_PARTY.md.
+//
+// Adapted from bauddy (internal/mcpserver/guard.go): approval through MCP
+// elicitation. The first call returns a result that has the client ask the
+// user; the client repeats the call with their answer, which is honored once,
+// for that same call only. Unlike bauddy there is no switch to skip the
+// question: a client that can't ask is refused.
+
+package mcpserver
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// target is what an approval is for: the host to name to the user, and where
+// to note the answer in the session log (nil for none).
+type target struct {
+	name, addr, typ string // the host as it was when the user is asked
+	mark            func(string)
+}
+
+func (t target) note(msg string) {
+	if t.mark != nil {
+		t.mark(msg)
+	}
+}
+
+func (t target) label() string {
+	if t.addr == "" {
+		return t.name
+	}
+	return fmt.Sprintf("%s (%s)", t.name, t.addr)
+}
+
+// approvalID names the approval among a call's input requests.
+const approvalID = "approve"
+
+// askedMax bounds approvals awaiting an answer.
+const askedMax = 16
+
+// approve checks that the user approved doing what, which needs it for the
+// reasons in whys. The model can't answer for them: the first time, approve
+// returns a result that has the client ask the user, and the client then
+// repeats the call with their answer, which is honored once, for that same
+// call, text and host only. A client that can't ask is refused. A nil result
+// and error means go ahead.
+func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys []string) (*mcp.CallToolResult, error) {
+	call, err := callKey(req.Params)
+	if err != nil {
+		return nil, err
+	}
+	// The address and type are part of what is approved: the host list is read
+	// again on every call, and an approval for one address must not carry over
+	// to another.
+	call += "\x00" + dev.name + "\x00" + dev.addr + "\x00" + dev.typ + "\x00" + what
+
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	if state := req.Params.RequestState; state != "" {
+		asked, ok := s.asked[state]
+		delete(s.asked, state)
+		if !ok || asked != call {
+			return nil, errors.New("refused, so nothing was done: that approval has expired or was for a different call; call again to ask the user")
+		}
+		if r, ok := req.Params.InputResponses[approvalID].(*mcp.ElicitResult); ok && r.Action == "accept" && r.Content["allow"] == true {
+			dev.note("user approved: " + visible(what))
+			return nil, nil
+		}
+		dev.note("user refused: " + visible(what))
+		return nil, errors.New("the user refused, so nothing was done. Don't do it another way; ask the user how they want to go on")
+	}
+
+	slices.Sort(whys)
+	why := strings.Join(slices.Compact(whys), "; it ")
+	if e := req.ClientCapabilities(); e == nil || e.Elicitation == nil || (e.Elicitation.Form == nil && e.Elicitation.URL != nil) {
+		return nil, fmt.Errorf("refused, so nothing was done: this needs the user's approval, since it %s, and this MCP "+
+			"client can't ask for it. Tell the user what you wanted to do and why; they can run it themselves with the oob command line", why)
+	}
+	if len(s.asked) >= askedMax {
+		clear(s.asked) // calls the client never repeated
+	}
+	state := rand.Text()
+	s.asked[state] = call
+	return &mcp.CallToolResult{
+		InputRequests: mcp.InputRequestMap{approvalID: &mcp.ElicitParams{
+			Message: fmt.Sprintf("An AI agent wants to do this on %s:\n\n%s\n\nIt %s.", visible(dev.label()), visible(what), why),
+			RequestedSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"allow": {Type: "boolean", Title: "Allow it", Default: json.RawMessage("false")},
+				},
+				Required: []string{"allow"},
+			},
+		}},
+		RequestState: state,
+	}, nil
+}
+
+// visible makes s safe to show a person who is deciding whether to allow it:
+// any character that doesn't print as itself (control characters, escape
+// sequences, bidirectional overrides such as U+202E, zero-width and other
+// invisible or non-ASCII space characters, invalid UTF-8) is written as a
+// Go-style escape (\u202e, \x1b), so nothing can hide or reorder what the
+// text says. Line breaks are kept, since the text may be several lines. The
+// approval itself is still matched on the raw text.
+func visible(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteRune(r)
+		case r == utf8.RuneError && !strings.HasPrefix(s[i:], string(utf8.RuneError)):
+			fmt.Fprintf(&b, "\\x%02x", s[i]) // an invalid byte, not a real U+FFFD
+		case strconv.IsPrint(r):
+			b.WriteRune(r)
+		default:
+			q := strconv.QuoteRune(r) // 'x' with the quotes
+			b.WriteString(q[1 : len(q)-1])
+		}
+	}
+	return b.String()
+}
+
+// callKey identifies a call by its tool and arguments, with the arguments
+// re-encoded so that key order and spacing don't matter.
+func callKey(p *mcp.CallToolParamsRaw) (string, error) {
+	var args any
+	if len(p.Arguments) > 0 {
+		if err := json.Unmarshal(p.Arguments, &args); err != nil {
+			return "", err
+		}
+	}
+	b, err := json.Marshal(args)
+	return p.Name + "\x00" + string(b), err
+}
