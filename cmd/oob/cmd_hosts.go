@@ -28,8 +28,12 @@ func clampWorkers(w, n int) int {
 	return max(1, min(w, n))
 }
 
+// powerStatus reads one host's power state. An untyped host is probed for its
+// vendor first, quietly and within the same per-host deadline.
 func powerStatus(name string, h config.Host, timeout time.Duration) bmc.StatusResult {
-	return bmc.DriverFor(name, h).PowerStatus(timeout)
+	start := time.Now()
+	h = bmc.Resolve(name, h, timeout)
+	return bmc.DriverFor(name, h).PowerStatus(max(timeout-time.Since(start), time.Second))
 }
 
 func statusCmd() *cobra.Command {
@@ -334,7 +338,7 @@ func addCmd() *cobra.Command {
 	f.IntVar(&h.Port, "port", 0, "SSH port")
 	f.StringVar(&h.Cipher, "cipher", "", "ipmitool lanplus cipher suite, e.g. 17 or 3")
 	f.StringVar(&h.Notes, "notes", "", "free-form notes")
-	f.StringVar(&h.Type, "type", "", "BMC type: "+strings.Join(validTypes(), ", ")+` ("ilo": HPE iLO, Redfish and SSH CLI; "idrac" and "supermicro" are untested; "ipmi" pins generic IPMI); default: generic, vendor auto-detected over SSH`)
+	f.StringVar(&h.Type, "type", "", "BMC type: "+strings.Join(validTypes(), ", ")+` ("ilo": HPE iLO, Redfish and SSH CLI; "idrac" and "supermicro" are untested; "ipmi" pins generic IPMI); default: generic, and the vendor is auto-detected over SSH on first use`)
 	f.StringSliceVar(&tags, "tag", nil, "tag (repeatable; replaces existing tags)")
 	return c
 }

@@ -238,12 +238,46 @@ func (d *Detector) WrapReader(r io.Reader) io.Reader {
 	return detectReader{r, d}
 }
 
-// markType sets the detected type on the saved host if it has none (and the iLO
-// generation if that is new), keeping the rest of the config, and queues a
-// one-time note for stderr. It goes through UpdateConfig, so it cannot undo a
-// concurrent change.
-func markType(name, typ string, gen int) error {
-	var msg string
+// Classify runs the vendor detector over an SSH pre-auth banner and the first
+// output of a session, without saving anything. Output wins over the banner (as
+// in a Detector); an iLO hit takes its generation from either.
+func Classify(banner, out string) (typ string, gen int) {
+	bt, bg := detectVendor(banner)
+	ot, og := detectVendor(console.CleanRemoteN(out, 0))
+	switch {
+	case ot != "":
+		if ot == TypeILO && og == 0 && bt == TypeILO {
+			og = bg
+		}
+		return ot, og
+	case bt != "":
+		return bt, bg
+	}
+	return "", 0
+}
+
+// WindowDone reports whether out (the post-login output so far) has reached the
+// end of the detection window: the first prompt, or detectWindow bytes.
+func WindowDone(out string) bool {
+	return len(out) >= detectWindow || promptEndRE.MatchString(console.CleanRemoteN(out, 0))
+}
+
+// Window is the most output a probe reads before it stops looking.
+const Window = detectWindow
+
+// VendorLabel is VendorName plus the iLO generation when known ("HPE iLO 7").
+func VendorLabel(typ string, gen int) string {
+	if typ == TypeILO && gen > 0 {
+		return fmt.Sprintf("%s %d", VendorName(typ), gen)
+	}
+	return VendorName(typ)
+}
+
+// SaveType saves a detected type (and iLO generation) for a saved host with no
+// type, exactly as the SSH-session detector does, but queues no note. It
+// reports whether the type was newly set.
+func SaveType(name, typ string, gen int) (bool, error) {
+	set := false
 	err := config.UpdateConfig(func(c *config.Config) error {
 		h, ok := c.Hosts[name]
 		if !ok {
@@ -252,14 +286,7 @@ func markType(name, typ string, gen int) error {
 		changed := false
 		if h.Type == "" {
 			h.Type = typ
-			changed = true
-			msg = fmt.Sprintf("detected %s on %s; saved type %q", VendorName(typ), name, typ)
-			switch typ {
-			case TypeILO:
-				msg += " (sol, power, boot, uid and nmi now use iLO Redfish and the SSH CLI)"
-			case TypeIDRAC, TypeSupermicro:
-				msg += " (support for this vendor is untested; please report results)"
-			}
+			changed, set = true, true
 		}
 		if h.Type == TypeILO && typ == TypeILO && gen > 0 && h.ILOGen != gen {
 			h.ILOGen = gen
@@ -271,7 +298,23 @@ func markType(name, typ string, gen int) error {
 		c.Hosts[name] = h
 		return nil
 	})
-	if err == nil && msg != "" {
+	return set, err
+}
+
+// markType sets the detected type on the saved host if it has none (and the iLO
+// generation if that is new), keeping the rest of the config, and queues a
+// one-time note for stderr. It goes through UpdateConfig, so it cannot undo a
+// concurrent change.
+func markType(name, typ string, gen int) error {
+	set, err := SaveType(name, typ, gen)
+	if err == nil && set {
+		msg := fmt.Sprintf("detected %s on %s; saved type %q", VendorName(typ), name, typ)
+		switch typ {
+		case TypeILO:
+			msg += " (sol, power, boot, uid and nmi now use iLO Redfish and the SSH CLI)"
+		case TypeIDRAC, TypeSupermicro:
+			msg += " (support for this vendor is untested; please report results)"
+		}
 		app.AddNotice(msg)
 	}
 	return err
