@@ -116,6 +116,21 @@ func guard(cleanup func(), fn func()) {
 	}()
 }
 
+// enterRaw opens the trace and then puts the terminal in raw mode. The trace
+// goes first so that a failure to open it leaves the terminal as it was.
+func enterRaw(fd int, open func() (*trace, error), raw func(int) (*term.State, error)) (*trace, *term.State, error) {
+	tr, err := open()
+	if err != nil {
+		return nil, nil, err
+	}
+	old, err := raw(fd)
+	if err != nil {
+		tr.close()
+		return nil, nil, err
+	}
+	return tr, old, nil
+}
+
 // Run puts the terminal in raw mode, runs the bar and key menu around
 // the transport, and restores everything on every exit path.
 func Run(cs Setup) (int, error) {
@@ -124,11 +139,7 @@ func Run(cs Setup) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	old, err := term.MakeRaw(fd)
-	if err != nil {
-		return 1, err
-	}
-	tr, err := openTrace()
+	tr, old, err := enterRaw(fd, openTrace, term.MakeRaw)
 	if err != nil {
 		return 1, err
 	}
@@ -317,23 +328,14 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 		return false
 	default:
 	}
-	// Keys typed before each paste are queued before it, so the remote sees
-	// keys and pastes in the order they came.
-	pos := len(fwd)
-	for _, a := range acts {
-		if a.act == actPaste || a.act == actPasteTooBig {
-			pos = a.at
-			break
-		}
-	}
-	k.typeKeys(fwd[:pos])
 	k.con.SetMode(k.parser.Mode())
+	// Bytes and actions run in the order the keys were pressed: each action
+	// carries the number of forwarded bytes that came before it.
+	pos := 0
 	for _, a := range acts {
-		if a.act == actPaste || a.act == actPasteTooBig {
-			if a.at > pos {
-				k.typeKeys(fwd[pos:a.at])
-			}
-			pos = max(pos, a.at)
+		if a.at > pos {
+			k.typeKeys(fwd[pos:a.at])
+			pos = a.at
 		}
 		k.do(a)
 	}
@@ -355,8 +357,11 @@ func (k *consoleKeys) do(a action) {
 	case actPasteTooBig:
 		con.Note(fmt.Sprintf("paste not sent: over %d MiB", pasteMax>>20), true)
 	case actStop:
-		if con.Pending() > 0 {
-			k.ty.Clear()
+		// Always clear: Enqueue may not have updated Pending yet. The count
+		// only decides whether there is anything to tell the user.
+		queued := con.Pending() > 0
+		k.ty.Clear()
+		if queued {
 			con.Note("typing queue cleared", false)
 			con.Mark("typing queue cleared")
 		}
