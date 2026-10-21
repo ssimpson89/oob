@@ -146,10 +146,38 @@ func TestConnectForceNeedsApproval(t *testing.T) {
 
 func TestConnectNoticesAConsoleThatEndsAtOnce(t *testing.T) {
 	h := start(t, Options{}, "")
+	// The quiet timer must not decide this: with it out of the picture, only
+	// the console ending can end connect's wait, however slowly the host runs.
+	quietFor = time.Minute
 	h.setup = func(f *fakeHost) { f.emit("Error: SOL payload already active\r\n"); f.finish() }
 	out, isErr := h.call("connect", map[string]any{"host": "node01"})
 	if !isErr || !strings.Contains(out, "ended right after connecting") {
 		t.Errorf("connect: %q %v", out, isErr)
+	}
+	if n := len(h.srv.sessions); n != 0 {
+		t.Errorf("%d sessions left open", n)
+	}
+}
+
+// The output hanging up is enough to know the console ended, even if its exit
+// status never arrives; connect must not return success after the full wait.
+func TestConnectNoticesAnOutputThatHangsUpWithoutAnExitStatus(t *testing.T) {
+	h := start(t, Options{}, "")
+	quietFor = time.Minute
+	oldGrace := connectEndGrace
+	connectEndGrace = 50 * time.Millisecond
+	t.Cleanup(func() { connectEndGrace = oldGrace })
+	h.setup = func(f *fakeHost) {
+		f.emit("Error: SOL payload already active\r\n")
+		go func() { time.Sleep(10 * time.Millisecond); f.pw.Close() }() // no f.done
+	}
+	begin := time.Now()
+	out, isErr := h.call("connect", map[string]any{"host": "node01"})
+	if !isErr || !strings.Contains(out, "ended right after connecting") {
+		t.Errorf("connect: %q %v", out, isErr)
+	}
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Errorf("connect took %v, it should notice the hang-up, not wait out the full settle", d)
 	}
 	if n := len(h.srv.sessions); n != 0 {
 		t.Errorf("%d sessions left open", n)

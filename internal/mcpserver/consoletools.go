@@ -357,8 +357,22 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		c.close()
 		return fail(err)
 	}
+	// It ended while we waited: the login or the session failed. The output
+	// hanging up counts even if the exit status is not in yet, so a console
+	// that prints an error and exits is caught however the quiet timer ran.
+	ended := false
 	select {
-	case <-c.doneC: // it ended while we waited: the login or the session failed
+	case <-c.doneC:
+		ended = true
+	case <-c.eofC:
+		ended = true
+		select { // the exit status is worth a moment, as in drain
+		case <-c.doneC:
+		case <-time.After(connectEndGrace):
+		}
+	default:
+	}
+	if ended {
 		why := c.output()
 		if tr.Tail != nil {
 			why = lastLines(tr.Tail(), 6)
@@ -366,7 +380,6 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		s.forget(c, "the console ended right after connecting")
 		c.close()
 		return fail("the console on "+name+" ended right after connecting:", why)
-	default:
 	}
 	out := c.output()
 	var quiet string
@@ -376,6 +389,10 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	head := fmt.Sprintf("Connected to %s as session %s (%s console).", name, id, tr.Kind)
 	return text(false, head+" "+logNote, out, quiet), nil, nil
 }
+
+// connectEndGrace is how long connect waits for the exit status once the
+// console's output has hung up. A variable so tests can shorten it.
+var connectEndGrace = 2 * time.Second
 
 // lastLines is the last n non-empty lines of s.
 func lastLines(s string, n int) string {
