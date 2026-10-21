@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,8 @@ type Typer struct {
 	// the current burst held in all. It runs in Run's goroutine, so it must
 	// not block, and not call back into the Typer.
 	Progress func(pending, total int)
+
+	queued atomic.Int64 // bytes accepted by Enqueue and not yet written or dropped
 
 	once    sync.Once
 	in      chan item
@@ -75,13 +78,20 @@ func (t *Typer) Enqueue(b []byte) <-chan struct{} {
 		close(done)
 		return done
 	}
+	t.queued.Add(int64(len(b))) // counted before Run can see it, so Queued never under-reports
 	select {
 	case t.in <- item{b, done}:
 	case <-t.stopped:
+		t.queued.Add(-int64(len(b)))
 		close(done)
 	}
 	return done
 }
+
+// Queued is how many bytes Enqueue has accepted that are neither written nor
+// dropped yet. Unlike Progress it is exact the moment Enqueue is called, from
+// any goroutine.
+func (t *Typer) Queued() int { return int(t.queued.Load()) }
 
 // Urgent drops everything queued and writes b now, for ctrl+c and the like:
 // whatever was waiting is stale once the user has interrupted.
@@ -144,6 +154,7 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 	}
 	drop := func() {
 		sent += len(q)
+		t.queued.Add(-int64(len(q)))
 		q, total = q[:0], 0
 		release(sent)
 		progress()
@@ -189,6 +200,7 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 			last := chunk[n-1]
 			q = q[n:]
 			sent += n
+			t.queued.Add(-int64(n))
 			release(sent)
 			if len(q) == 0 {
 				total = 0

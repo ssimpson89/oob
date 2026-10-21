@@ -404,21 +404,125 @@ func TestCtrlCJumpsTheQueue(t *testing.T) {
 func TestChordWritesDropTheQueueFirst(t *testing.T) {
 	g := newGated()
 	r := newRig(t, g, Pacing{}, g.wait)
-	r.paste(strings.Repeat("x", 100))
-	delay := g.held(t)
-	r.k.Input([]byte(string(rune(escapeByte)) + "b"))
-	if g.breaks != 1 || r.con.Pending() != 0 {
-		t.Errorf("breaks %d, pending %d; want the BREAK sent with the queue dropped", g.breaks, r.con.Pending())
-	}
-	delay <- time.Time{}
 	r.paste(strings.Repeat("y", 100))
 	g.held(t)
 	r.k.Input([]byte(string(rune(escapeByte)) + "]"))
 	<-g.wrote
 	<-g.wrote
-	<-g.wrote
-	if got := g.text(); got != "xy\x1d" {
+	if got := g.text(); got != "y\x1d" {
 		t.Errorf("sent %q, want the literal ctrl+] out at once after the queue was dropped", got)
+	}
+}
+
+// solModel is a remote line behind IPMI SOL: the link's Break sends what
+// internal/bmc/sol.go sends, CR then the escape char then B. ipmitool eats the
+// escape and B; the remote sees the CR as Enter and runs whatever is typed.
+type solModel struct {
+	gated
+	rmu    sync.Mutex
+	line   string
+	ran    []string
+	breaks int
+	wire   []byte
+}
+
+func newSolModel() *solModel { return &solModel{gated: *newGated()} }
+
+func (m *solModel) feed(b []byte) {
+	m.rmu.Lock()
+	defer m.rmu.Unlock()
+	m.wire = append(m.wire, b...)
+	for i := 0; i < len(b); i++ {
+		switch {
+		case b[i] == 0x1e && i+1 < len(b) && b[i+1] == 'B':
+			m.breaks++
+			i++
+		case b[i] == 0x03:
+			m.line = ""
+		case b[i] == '\r':
+			m.ran = append(m.ran, m.line)
+			m.line = ""
+		default:
+			m.line += string(rune(b[i]))
+		}
+	}
+}
+
+func (m *solModel) Send(b []byte) error { m.feed(b); return m.gated.Send(b) }
+func (m *solModel) Break() error        { return m.Send([]byte{'\r', 0x1e, 'B'}) }
+func (m *solModel) snapshot() ([]string, string, int) {
+	m.rmu.Lock()
+	defer m.rmu.Unlock()
+	return append([]string(nil), m.ran...), m.line, m.breaks
+}
+
+// pasteUntil pastes text and lets the typer write n bytes, leaving it held in
+// the delay after the nth.
+func (m *solModel) pasteUntil(t *testing.T, r *rig, text string, n int) {
+	t.Helper()
+	r.paste(text)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			m.held(t) <- time.Time{}
+		}
+		<-m.wrote
+	}
+	m.held(t)
+}
+
+func TestBreakIsRefusedWhileAPasteIsPending(t *testing.T) {
+	m := newSolModel()
+	r := newRig(t, m, Pacing{}, m.wait)
+	m.pasteUntil(t, r, "reboot --help", 6) // "reboot" is on the remote line, " --help" is still queued
+	r.k.Input([]byte(string(rune(escapeByte)) + "b"))
+	ran, line, breaks := m.snapshot()
+	if len(ran) != 0 || breaks != 0 {
+		t.Fatalf("remote ran %q with %d breaks; BREAK's leading CR must not submit a half-typed paste", ran, breaks)
+	}
+	if line != "reboot" {
+		t.Errorf("remote line = %q, want the typed prefix left alone", line)
+	}
+	if n := r.state().note; !strings.Contains(n, "ctrl+c") {
+		t.Errorf("note = %q, want it to say to clear the line first", n)
+	}
+	r.k.Input([]byte(string(rune(escapeByte)) + "rb")) // SysRq is refused the same way
+	if ran, _, breaks := m.snapshot(); len(ran) != 0 || breaks != 0 {
+		t.Errorf("SysRq got through: ran %q, breaks %d", ran, breaks)
+	}
+}
+
+func TestBreakIsRefusedAfterThePasteWasStoppedMidLine(t *testing.T) {
+	m := newSolModel()
+	r := newRig(t, m, Pacing{}, m.wait)
+	m.pasteUntil(t, r, "reboot --help", 6)
+	r.k.Input([]byte(string(rune(escapeByte)) + "x")) // drop the queue; "reboot" is already out
+	r.k.Input([]byte(string(rune(escapeByte)) + "b"))
+	if ran, line, breaks := m.snapshot(); len(ran) != 0 || breaks != 0 || line != "reboot" {
+		t.Fatalf("ran %q line %q breaks %d; BREAK must not run the leftover prefix", ran, line, breaks)
+	}
+	// ctrl+c clears the line, and then BREAK goes out with the real SOL bytes.
+	r.k.Input([]byte{0x03})
+	<-m.wrote
+	r.k.Input([]byte(string(rune(escapeByte)) + "b"))
+	ran, line, breaks := m.snapshot()
+	if breaks != 1 || line != "" || strings.Contains(strings.Join(ran, "|"), "reboot") {
+		t.Errorf("ran %q line %q breaks %d; want a clean BREAK after ctrl+c", ran, line, breaks)
+	}
+	m.rmu.Lock()
+	tail := string(m.wire[len(m.wire)-3:])
+	m.rmu.Unlock()
+	if tail != "\r\x1eB" {
+		t.Errorf("BREAK bytes = %q, want CR + 0x1e B", tail)
+	}
+}
+
+func TestBreakGoesOutOnACleanLine(t *testing.T) {
+	m := newSolModel()
+	r := newRig(t, m, Pacing{}, m.wait)
+	m.pasteUntil(t, r, "ls\n", 3)
+	r.k.Input([]byte(string(rune(escapeByte)) + "b"))
+	if _, _, breaks := m.snapshot(); breaks != 1 {
+		t.Errorf("breaks = %d, want 1 on a line that ends in Enter", breaks)
 	}
 }
 
