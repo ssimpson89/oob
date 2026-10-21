@@ -132,6 +132,55 @@ func (s *cliSession) expectPrompt(timeout time.Duration) (string, error) {
 	}
 }
 
+// awaitConsole is called after the command that starts the console. It reads
+// until the console says it started (started), or the CLI prompt comes back,
+// which means the console didn't start (on iLO: "Virtual Serial Port is
+// already in use"). Without either within timeout it assumes the console is
+// up. Everything read stays pending, so the console still shows it.
+func (s *cliSession) awaitConsole(started *regexp.Regexp, timeout time.Duration) error {
+	var buf []byte
+	defer func() { s.pending = append(buf, s.pending...) }()
+	tm := time.NewTimer(timeout)
+	defer tm.Stop()
+	for {
+		text := ansiRE.ReplaceAllString(string(buf), "")
+		if started.MatchString(text) {
+			return nil
+		}
+		if s.prompt.MatchString(text) {
+			return fmt.Errorf("the serial console didn't start: %s", firstLine(console.CleanRemote(text)))
+		}
+		select {
+		case b, ok := <-s.ch:
+			if !ok {
+				return nil // the console's own read reports the closed connection
+			}
+			buf = append(buf, b...)
+		case <-tm.C:
+			return nil
+		}
+	}
+}
+
+var inUseRE = regexp.MustCompile(`(?i)(virtual serial port|serial port|console)[^\n]*(in use|busy)[^\n]*`)
+
+// firstLine is the first non-empty line of s that isn't the start command's
+// banner, trimmed, for an error message.
+func firstLine(s string) string {
+	// The BMC's own reason, when it gives one (output left over from an
+	// earlier session can sit in front of it on the same line).
+	if m := inUseRE.FindString(s); m != "" {
+		return strings.TrimSpace(m)
+	}
+	for _, l := range strings.Split(s, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.HasPrefix(strings.ToLower(l), "starting") && !strings.HasPrefix(strings.ToLower(l), "press") && !strings.HasPrefix(l, "vsp") {
+			return l
+		}
+	}
+	return "the BMC returned to its prompt"
+}
+
 // Send types s at the CLI.
 func (s *cliSession) Send(str string) error {
 	_, err := io.WriteString(s.w, str)
@@ -401,6 +450,9 @@ type cliSpec struct {
 	label      string // for the progress line
 }
 
+// consoleStartWait is how long cliOpen waits for a console to say it started.
+var consoleStartWait = 5 * time.Second
+
 // cliOpen opens the CLI over SSH, starts the console and returns it as a
 // console transport. It needs no terminal of its own: rows and cols are the
 // size the remote is told. Both the console bar and a headless front end use it.
@@ -419,6 +471,15 @@ func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTr
 				s.Close()
 				return nil, err
 			}
+		}
+	}
+	// A console that announces itself (iLO VSP) can be refused, for example
+	// when another session already holds it; the BMC then shows its prompt
+	// again. Fail clearly instead of leaving the user at the BMC prompt.
+	if sp.entered != nil {
+		if err := s.awaitConsole(sp.entered, consoleStartWait); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	l := newCLILink(&sshLink{sess: sess, stdin: stdin}, sp, false, false)

@@ -182,3 +182,32 @@ func TestSkipEcho(t *testing.T) {
 		}
 	})
 }
+
+func TestAwaitConsole(t *testing.T) {
+	sess := func(out string) *cliSession {
+		r, w := io.Pipe()
+		go func() { _, _ = io.WriteString(w, out) }()
+		return newCLISession(r, io.Discard, iloSpec)
+	}
+	// Another session holds VSP: the iLO says so and shows its prompt again.
+	s := sess("Starting virtual serial port\r\nPress 'ESC (' to return to the CLI Session\r\n" +
+		"xyzVirtual Serial Port is already in use: from vsp.\r\r\n\r\n</>hpeiLO-> ")
+	if err := s.awaitConsole(iloSpec.entered, time.Second); err == nil || !strings.Contains(err.Error(), "didn't start: Virtual Serial Port is already in use") {
+		t.Errorf("busy console: err = %v, want 'already in use'", err)
+	}
+	// The console started: no error, and its output is still there to show.
+	s = sess("Starting virtual serial port\r\nVirtual Serial Port Active: COM1\r\nnode01 login: ")
+	if err := s.awaitConsole(iloSpec.entered, time.Second); err != nil {
+		t.Fatalf("started console: %v", err)
+	}
+	buf := make([]byte, 256)
+	n, _ := s.Read(buf)
+	if !strings.Contains(string(buf[:n]), "Virtual Serial Port Active") {
+		t.Errorf("console output lost: %q", buf[:n])
+	}
+	// Neither within the wait: assume the console is up.
+	s = sess("Starting virtual serial port\r\n")
+	if err := s.awaitConsole(iloSpec.entered, 100*time.Millisecond); err != nil {
+		t.Errorf("silent console: %v", err)
+	}
+}
