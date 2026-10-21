@@ -452,7 +452,12 @@ func (h *hub) leave(p *peer) {
 		h.note(p.name + " left")
 	}
 	h.broadcastState()
-	lastWindow := h.orphan && !h.closed
+	// An orphaned hub (its host process left it for the windows) ends with its
+	// last window, whether or not the console has ended meanwhile: finish only
+	// marks the hub closed, and it is shutdown that stops listening and lets
+	// go of the socket and lock. Skipping it for a closed hub left both behind
+	// in a still-running oob mcp. shutdown and release run once.
+	lastWindow := h.orphan
 	if lastWindow {
 		for q := range h.peers {
 			if !q.agent {

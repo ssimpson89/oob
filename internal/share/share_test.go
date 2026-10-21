@@ -1043,3 +1043,35 @@ func TestAnUnfinishedKeyAtTheHubTimesOutAndTypingGoesOn(t *testing.T) {
 	win.Enqueue([]byte("C"))
 	eventually(t, "the next key is typed, not eaten", func() bool { return f.got() == "C" })
 }
+
+func TestAnOrphanedHubWhoseConsoleEndedStillReleasesItsSocketAndLock(t *testing.T) {
+	env(t)
+	f := newFake()
+	owner := host(t, f, Options{Agent: true, Name: "Claude"}) // oob mcp opened it first
+	win, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.Close() // the AI disconnects; the hub stays for the window
+	if f.isClosed() || !Exists("node01", "") {
+		t.Fatal("the hub didn't linger for the window")
+	}
+	// The server's console ends while the window is on it.
+	f.emit("bye\r\n")
+	_ = f.Disconnect()
+	select {
+	case <-win.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the window was never told the console ended")
+	}
+	win.Close() // the last window leaves a hub that is already marked closed
+	eventually(t, "the transport closed", f.isClosed)
+	eventually(t, "released at the BMC's end", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.released })
+	eventually(t, "the socket is gone", func() bool { return !Exists("node01", "") })
+	// And the lock: this oob can host the console again.
+	f2 := newFake()
+	again := host(t, f2, Options{Agent: true, Name: "Claude"})
+	if again.Joined() || !again.Hosting() {
+		t.Errorf("a new open after the cleanup: joined %v hosting %v", again.Joined(), again.Hosting())
+	}
+}
