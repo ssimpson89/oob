@@ -23,8 +23,8 @@ import (
 // target is what an approval is for: the host to name to the user, and where
 // to note the answer in the session log (nil for none).
 type target struct {
-	name, addr string
-	mark       func(string)
+	name, addr, typ string // the host as it was when the user is asked
+	mark            func(string)
 }
 
 func (t target) note(msg string) {
@@ -57,7 +57,10 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 	if err != nil {
 		return nil, err
 	}
-	call += "\x00" + dev.name + "\x00" + what
+	// The address and type are part of what is approved: the host list is read
+	// again on every call, and an approval for one address must not carry over
+	// to another.
+	call += "\x00" + dev.name + "\x00" + dev.addr + "\x00" + dev.typ + "\x00" + what
 
 	s.askMu.Lock()
 	defer s.askMu.Unlock()

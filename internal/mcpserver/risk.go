@@ -145,7 +145,7 @@ const (
 	whySysrq   = "triggers a kernel SysRq action, which can crash, reboot or sync-and-halt the host"
 	whyAnswer  = "answers the host's question (a yes/no prompt that no approved command raised)"
 	whyBoot    = "is typed at a bootloader or firmware prompt, where commands can boot, erase or replace the software"
-	whyRecall  = "runs a line recalled from history or completed with tab, which can't be read for certain"
+	whyRecall  = "runs a line edited with cursor or editing keys, recalled from history or completed with tab, which can't be read for certain"
 	whyBreak   = "sends a serial BREAK: on Linux the next key typed is a SysRq command, and b reboots at once"
 	whyAfter   = "is typed right after a BREAK, where the Linux kernel takes the next key as a SysRq command"
 	whyFirmKey = "is a key that commonly boots, saves or resets in a bootloader or firmware menu"
@@ -178,8 +178,18 @@ var extras = []struct {
 	{regexp.MustCompile(`^((dnf|yum|microdnf|zypper|apt|apt-get|aptitude) .*(remove|erase|purge|autoremove|downgrade)\b|rpm( \S+)* (-e|--erase)\b|dpkg( \S+)* (-r|-p|--remove|--purge)\b)`), whyPackage},
 }
 
-// listOnly matches partitioning tools asked only to show what is there.
-var listOnly = regexp.MustCompile(`^(sgdisk|sfdisk|gdisk|fdisk|parted)\b.* (-l|--list|-p|--print|print)\b`)
+// listOnly matches partitioning tools asked only to show what is there. It
+// lists the exact read-only forms and nothing else: the whole command has to
+// match, so a write flag or subcommand anywhere (sgdisk --zap-all --print,
+// parted -s /dev/sda rm 1 print) leaves it needing approval.
+var listOnly = regexp.MustCompile(`^(` +
+	`fdisk (-l|--list)( /dev/[\w./-]+)*|` +
+	`sfdisk (-l|--list)( /dev/[\w./-]+)*|` +
+	`gdisk -l /dev/[\w./-]+|` +
+	`sgdisk (-p|--print) /dev/[\w./-]+|` +
+	`parted (-l|--list)|` +
+	`parted( (-s|--script))?( /dev/[\w./-]+)?( unit [a-z]+)? print( (free|all|/dev/[\w./-]+))?` +
+	`)$`)
 
 // risk says why line needs approval, or "" if it doesn't.
 func risk(line string) string {
@@ -275,7 +285,7 @@ func (l line) confirming() bool { return confirming.MatchString(l.cursor) }
 // line can be checked even before the host echoes it.
 type typing struct {
 	text    string
-	unknown bool // up, down or tab changed the line in ways the server can't follow
+	unknown bool // a key changed the line in ways the server can't follow
 	at      int  // the session's prompt count when typing began
 }
 
@@ -293,15 +303,29 @@ func (t *typing) add(text, key string, prompts int) {
 		if _, n := utf8.DecodeLastRuneInString(t.text); n > 0 {
 			t.text = t.text[:len(t.text)-n]
 		}
-	case "tab", "up", "down":
-		t.unknown = true
 	case "enter", "ctrl+u", "ctrl+c", "ctrl+z", "ctrl+d":
 		*t = typing{at: prompts}
+	case "":
+	default:
+		// Any other key (tab, up, down, home, end, delete, left, right, esc,
+		// ctrl+a/e/k/w/y/p/n/r/h/...) can move, change or replace the line, which
+		// the server doesn't follow. The line stays unknown until it is cleared
+		// (ctrl+u, ctrl+c, enter) or a new prompt appears.
+		if !paintKeys[key] {
+			t.unknown = true
+		}
 	}
 }
 
+// paintKeys are keys that don't edit a command line: function keys and paging
+// keys, which menus use.
+var paintKeys = map[string]bool{
+	"f1": true, "f2": true, "f3": true, "f4": true, "f5": true, "f6": true, "f7": true, "f8": true,
+	"f9": true, "f10": true, "f11": true, "f12": true, "pageup": true, "pagedown": true, "insert": true,
+}
+
 // pending returns what's typed and not yet entered, as of prompt count
-// prompts, and whether up, down or tab changed it.
+// prompts, and whether an editing key changed it.
 func (t typing) pending(prompts int) (string, bool) {
 	if t.at != prompts {
 		return "", false

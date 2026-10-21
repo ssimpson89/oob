@@ -42,6 +42,8 @@ var quietFor = 400 * time.Millisecond
 type session struct {
 	id   string
 	host string
+	addr string // the BMC address and type the console was opened on
+	typ  string
 	tr   *bmc.ConsoleTransport
 	tx   *console.Transcript
 
@@ -373,8 +375,8 @@ func shown(lines []string, cursor string, lost int) string {
 }
 
 // target is the host an approval is for, noting the answer in the log.
-func (c *session) target(addr string) target {
-	return target{name: c.host, addr: addr, mark: c.tx.Mark}
+func (c *session) target() target {
+	return target{name: c.host, addr: c.addr, typ: c.typ, mark: c.tx.Mark}
 }
 
 // close ends the session: it asks the console to disconnect, gives it a moment,

@@ -93,7 +93,7 @@ func (s *server) change(ctx context.Context, req *mcp.CallToolRequest, host, wha
 	if err != nil {
 		return fail(err)
 	}
-	if res, err := s.approve(req, target{name: name, addr: h.IP}, what, []string{why}); res != nil || err != nil {
+	if res, err := s.approve(req, target{name: name, addr: h.IP, typ: h.Type}, what, []string{why}); res != nil || err != nil {
 		if err != nil {
 			return fail(err)
 		}

@@ -49,9 +49,17 @@ var keyBytes = map[string]string{
 	"f7": "\x1b[18~", "f8": "\x1b[19~", "f9": "\x1b[20~", "f10": "\x1b[21~", "f11": "\x1b[23~", "f12": "\x1b[24~",
 }
 
+// aliasKeys are control keys that do what another listed key does, or submit
+// the line like enter: ctrl+m and ctrl+j are a carriage return and a line feed,
+// ctrl+i is tab, and Readline runs the line on ctrl+o as well. They would
+// bypass the checks made on enter and tab, so they aren't offered.
+var aliasKeys = map[string]bool{"ctrl+m": true, "ctrl+j": true, "ctrl+o": true, "ctrl+i": true}
+
 func init() {
 	for c := 'a'; c <= 'z'; c++ {
-		keyBytes["ctrl+"+string(c)] = string(rune(c - 'a' + 1))
+		if k := "ctrl+" + string(c); !aliasKeys[k] {
+			keyBytes[k] = string(rune(c - 'a' + 1))
+		}
 	}
 }
 
@@ -258,7 +266,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	s.mu.Unlock()
 
 	if in.Force {
-		if res, err := s.approve(req, target{name: name, addr: h.IP}, "end any other SOL session on "+name+" and take it over",
+		if res, err := s.approve(req, target{name: name, addr: h.IP, typ: h.Type}, "end any other SOL session on "+name+" and take it over",
 			[]string{whyForce}); res != nil || err != nil {
 			if err != nil {
 				return fail(err)
@@ -324,6 +332,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	s.nextID++
 	id := fmt.Sprintf("s%d", s.nextID)
 	c := newSession(id, name, tr, tx)
+	c.addr, c.typ = h.IP, h.Type // what was connected to, whatever the host list says later
 	s.sessions[id] = c
 	s.mu.Unlock()
 
@@ -481,18 +490,6 @@ func (c *session) onBMC() bool {
 	return c.atBMC
 }
 
-func (s *server) addrOf(host string) string {
-	cfg, err := s.be.Config()
-	if err != nil {
-		return ""
-	}
-	h, err := cfg.LookupExact(host)
-	if err != nil {
-		return ""
-	}
-	return h.IP
-}
-
 func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in commandIn) (*mcp.CallToolResult, any, error) {
 	c, err := s.session(in.Session)
 	if err != nil {
@@ -522,7 +519,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	if pending, unknown := c.typing.pending(at.prompts); len(pending) > len(typed) {
 		typed = pending // the echo hasn't caught up
 	} else if unknown && typed == "" {
-		typed = "a line recalled with up, down or tab"
+		typed = "a line edited or recalled with cursor, editing or history keys"
 	}
 	c.mu.Unlock()
 	if typed != "" && !answering {
@@ -551,7 +548,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		shownLines = append(shownLines, l)
 	}
 	if len(whys) > 0 {
-		if res, err := s.approve(req, c.target(s.addrOf(c.host)), "type at the console of "+c.host+":\n"+approvalText(shownLines), whys); res != nil || err != nil {
+		if res, err := s.approve(req, c.target(), "type at the console of "+c.host+":\n"+approvalText(shownLines), whys); res != nil || err != nil {
 			if err != nil {
 				return fail(err)
 			}
@@ -719,7 +716,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		if len(in.Keys) > 0 {
 			what += " (then " + strings.Join(in.Keys, ", ") + ")"
 		}
-		if res, err := s.approve(req, c.target(s.addrOf(c.host)), what, whys); res != nil || err != nil {
+		if res, err := s.approve(req, c.target(), what, whys); res != nil || err != nil {
 			if err != nil {
 				return fail(err)
 			}
@@ -764,7 +761,7 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 		return fail("nothing was sent: this console (" + c.tr.Kind + ", through the BMC's SSH command line) has no serial BREAK. " +
 			"Only IPMI SOL consoles do")
 	}
-	if res, err := s.approve(req, c.target(s.addrOf(c.host)), "send a serial BREAK to the console of "+c.host, []string{whyBreak}); res != nil || err != nil {
+	if res, err := s.approve(req, c.target(), "send a serial BREAK to the console of "+c.host, []string{whyBreak}); res != nil || err != nil {
 		if err != nil {
 			return fail(err)
 		}
