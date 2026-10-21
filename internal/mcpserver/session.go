@@ -84,6 +84,7 @@ type session struct {
 	closed    bool
 
 	doneC   chan struct{} // closed once the transport has ended
+	eofC    chan struct{} // closed once the output stream hit EOF: the console will say no more
 	result  console.Result
 	drained chan struct{} // closed once the output reader has finished
 	once    sync.Once
@@ -95,7 +96,7 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 	c := &session{
 		id: id, host: host, tr: tr, tx: tx, sh: sh, kind: tr.Kind, answersAt: -1,
 		lastUsed: time.Now(), changed: make(chan struct{}),
-		doneC: make(chan struct{}), drained: make(chan struct{}),
+		doneC: make(chan struct{}), eofC: make(chan struct{}), drained: make(chan struct{}),
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	c.stopTy = stop
@@ -139,6 +140,7 @@ func (c *session) drain() {
 			c.feed(buf[:n])
 		}
 		if err != nil {
+			close(c.eofC)
 			select { // the exit status is worth a moment
 			case <-c.doneC:
 			case <-time.After(2 * time.Second):
@@ -440,6 +442,8 @@ func (c *session) settle(ctx context.Context, changed <-chan struct{}, limit tim
 		case <-quiet:
 			return
 		case <-c.doneC:
+			return
+		case <-c.eofC:
 			return
 		case <-changed:
 			changed = c.changes()

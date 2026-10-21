@@ -325,6 +325,10 @@ type consoleKeys struct {
 	q  Queue        // ty, or the hub's queue
 
 	noted atomic.Bool // the link's input note was shown
+
+	// lineDirty: the last byte written was neither Enter nor ctrl+c, so the
+	// remote line may hold unsubmitted input. See breakSafe.
+	lineDirty atomic.Bool
 }
 
 func (k *consoleKeys) autoOn() bool {
@@ -367,9 +371,36 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 	return true
 }
 
+// breakSafe reports whether BREAK (and SysRq, which starts with one) may go
+// out now, and says why on the bar if not. A BREAK is not free of side
+// effects: IPMI SOL's escape starts with a CR, which the remote sees as Enter.
+// If a paste is part way through, or the remote line already holds typed text,
+// that CR would run a truncated command ("reboot" out of "reboot --help"). So
+// BREAK is refused until the line is clean. Dropping the queue first would not
+// help, since the bytes already sent stay on the remote line.
+func (k *consoleKeys) breakSafe() bool {
+	if k.ty == nil { // shared: the hub's typer and line tracking decide, and refuse
+		return true
+	}
+	if k.ty.Queued() == 0 && !k.lineDirty.Load() {
+		return true
+	}
+	k.con.Note("BREAK not sent: input is pending on the line; clear the line first (ctrl+c)", true)
+	return false
+}
+
+// track records what the remote line holds after b is written: Enter or
+// ctrl+c leaves it clean, anything else leaves typed-but-unsubmitted input.
+// It is deliberately pessimistic (it cannot see the remote's line editing).
+func (k *consoleKeys) track(b []byte) {
+	for _, c := range b {
+		k.lineDirty.Store(c != '\r' && c != '\n' && c != 0x03)
+	}
+}
+
 // do carries out one action. Anything that writes to the remote outside the
-// queue (BREAK, the disconnect sequence, the BMC prompt switch) clears the
-// queue first, so no half-typed paste follows it.
+// queue (the disconnect sequence, the BMC prompt switch) clears the queue
+// first, so no half-typed paste follows it.
 func (k *consoleKeys) do(a action) {
 	cs, con := k.cs, k.con
 	rows, cols := con.Size()
@@ -418,7 +449,9 @@ func (k *consoleKeys) do(a action) {
 	case actLog:
 		con.ToggleLog()
 	case actBreak:
-		k.q.Clear()
+		if !k.breakSafe() {
+			return
+		}
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
 			return
@@ -426,7 +459,9 @@ func (k *consoleKeys) do(a action) {
 		con.Note("BREAK sent", false)
 		con.Mark("BREAK sent")
 	case actSysrq:
-		k.q.Clear()
+		if !k.breakSafe() {
+			return
+		}
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
 			return
