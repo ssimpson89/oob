@@ -14,6 +14,10 @@ func TestRiskFlagsRebootAndWipeLikeCommands(t *testing.T) {
 		"passwd root", "usermod -L bob", "ifdown eth0", "ip link set eth0 down", "nmcli connection down x", "iptables -F",
 		"systemctl stop sshd", "dnf remove openssh", "yum erase kernel", "rpm -e foo", "apt-get purge x",
 		"ipmitool chassis power cycle", "ipmitool mc reset cold", "racadm serveraction powerdown",
+		"shutdown", "sudo shutdown", "/sbin/shutdown", "shutdown -h", "shutdown 5", "shutdown 23:00", "shutdown -P now",
+		"init 6", "telinit 0", "systemctl poweroff", "systemctl halt", "systemctl kexec", "systemctl -i reboot", "systemctl suspend",
+		"systemctl start reboot.target", "systemctl isolate poweroff.target", "systemctl start --no-block halt.target",
+		"loginctl reboot", "loginctl poweroff", "reboot -f", "halt -p", "poweroff -f", "busybox reboot", "sudo init 0",
 		"!!", "!reb", "sudo !!", "factory-reset", "efibootmgr -B -b 0001", "grub2-install /dev/sda",
 	} {
 		if risk(l) == "" {
@@ -28,6 +32,7 @@ func TestRiskLeavesReadOnlyCommandsAlone(t *testing.T) {
 		"systemctl status sshd", "systemctl is-active network", "rpm -qa | grep kernel", "dnf list installed", "dnf check-update",
 		"echo hello!", "echo reboot is a word", "ls /system/reboot", "grep reboot /var/log/messages", "mdadm --detail /dev/md0",
 		"zpool status", "nvme list", "fdisk -l", "ssacli ctrl all show", "cat /proc/sysrq-trigger-notes",
+		"systemctl status reboot.target", "systemctl list-units", "init --version", "echo shutdown",
 	} {
 		if why := risk(l); why != "" {
 			t.Errorf("%q flagged (%s)", l, why)
@@ -79,5 +84,29 @@ func TestPromptHelpers(t *testing.T) {
 	}
 	if p, u := ty.pending(2); p != "" || u {
 		t.Error("typing should reset at a new prompt")
+	}
+}
+
+// 4340888964: ctrl+d on a line with text deletes a character, it doesn't clear the line.
+func TestCtrlDOnlyClearsAnEmptyLine(t *testing.T) {
+	var ty typing
+	ty.add("xreboot", "", 1)
+	ty.add("", "ctrl+a", 1)
+	ty.add("", "ctrl+d", 1)
+	if text, unknown := ty.pending(1); !unknown {
+		t.Errorf("ctrl+d on a nonempty line left the line known: %q", text)
+	}
+	// EOF on an empty line is still a clean slate.
+	var empty typing
+	empty.add("", "ctrl+d", 1)
+	if text, unknown := empty.pending(1); text != "" || unknown {
+		t.Errorf("ctrl+d on an empty line: %q %v", text, unknown)
+	}
+	// An empty text with an unmodelled edit before it isn't known to be empty.
+	var edited typing
+	edited.add("", "up", 1)
+	edited.add("", "ctrl+d", 1)
+	if _, unknown := edited.pending(1); !unknown {
+		t.Error("ctrl+d after an unmodelled edit cleared the unknown state")
 	}
 }

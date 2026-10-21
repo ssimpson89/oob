@@ -19,12 +19,15 @@ import (
 // dangerous matches commands, as splitCommands returns them, that can reboot a
 // device or erase or replace its configuration or software.
 var dangerousRE = regexp.MustCompile(`^((reload|write erase|erase|format|delete|factory-?reset|reboot|poweroff|halt|` +
-	`mkfs\S*|wipefs|(tel)?init [06]|request system (reboot|halt|power-off|zeroize|software add)|` +
+	`mkfs\S*|wipefs|(tel)?init (0|6|--reboot|--poweroff|--halt)|request system (reboot|halt|power-off|zeroize|software add)|` +
 	`request vmhost (reboot|halt|power-off)|request (restart|shutdown) system|request platform software package install|` +
 	`load (override|factory-default)|configure (replace|factory-default)|crypto key zeroize|` +
 	`boot (system|nxos|kickstart)|install (all|add|activate)|redundancy force-switchover|system switchover|` +
-	`/?system (reset-configuration|reboot|shutdown)|systemctl( -\S+)* (reboot|poweroff|halt|kexec)|` +
-	`shutdown (now|-[hrp]|\+)|rm -(rf|fr)|racadm (serveraction|racresetcfg))\b|` +
+	`/?system (reset-configuration|reboot|shutdown)|` +
+	`systemctl( -\S+)* ((reboot|poweroff|halt|kexec|soft-reboot|suspend|hibernate|hybrid-sleep)|` +
+	`(start|isolate)( -\S+)* (reboot|poweroff|halt|kexec|shutdown|rescue|emergency)(\.target)?)|` +
+	`loginctl( -\S+)* (reboot|poweroff|halt|suspend|hibernate)|` +
+	`shutdown|rm -(rf|fr)|racadm (serveraction|racresetcfg))\b|` +
 	`clear config|copy \S+ (nvram:)?start|execute (factory|reboot|shutdown|restore|formatlogdisk|erase-disk)|` +
 	`dd .*of=/dev/|ipmitool .*(chassis power (off|cycle|reset)|mc reset)|` +
 	`!(!|-?\d+|\??[\w./-]+)$)`) // shell history recall (!!, !-1, !reb): no telling what it runs
@@ -168,7 +171,7 @@ var extras = []struct {
 		`(ss|hpss)acli .*(delete|erase|modify)|(stor|perc)cli.* (del|delete|clear)\b)`), whyStorage},
 	{regexp.MustCompile(`^(?:(?:echo|printf|tee)\b.*sysrq-trigger( |$)|.*>+ ?/proc/sysrq-trigger( |$)|kexec\b|` +
 		`systemctl( -\S+)* (isolate|rescue|emergency)\b|` +
-		`shutdown( -\S+)+|grub2?-(install|mkconfig|set-default)\b|efibootmgr .*(-b\b|--delete)|update-grub\b|dracut\b|` +
+		`grub2?-(install|mkconfig|set-default)\b|efibootmgr .*(-b\b|--delete)|update-grub\b|dracut\b|` +
 		`flashrom\b|fwupdmgr (install|update|downgrade)\b|ilorest\b)`), whyRestart},
 	{regexp.MustCompile(`^(passwd\b|chpasswd\b|usermod .*-[pl]\b|userdel\b|visudo\b|chage\b)`), whyAccount},
 	{regexp.MustCompile(`^(ifdown\b|ip (link|addr|address|route) (set .* down|del|delete|flush)\b|ifconfig \S+ down\b|` +
@@ -303,8 +306,17 @@ func (t *typing) add(text, key string, prompts int) {
 		if _, n := utf8.DecodeLastRuneInString(t.text); n > 0 {
 			t.text = t.text[:len(t.text)-n]
 		}
-	case "enter", "ctrl+u", "ctrl+c", "ctrl+z", "ctrl+d":
+	case "enter", "ctrl+u", "ctrl+c", "ctrl+z":
 		*t = typing{at: prompts}
+	case "ctrl+d":
+		// On an empty line it is EOF (a logout or a shell exit); on a line with
+		// text Readline deletes the character under the cursor, which edits the
+		// line in a way the server doesn't follow.
+		if t.text == "" && !t.unknown {
+			*t = typing{at: prompts}
+		} else {
+			t.unknown = true
+		}
 	case "":
 	default:
 		// Any other key (tab, up, down, home, end, delete, left, right, esc,
