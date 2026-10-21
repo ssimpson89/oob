@@ -601,8 +601,14 @@ func describeGate(g gate) string {
 // key may be a SysRq command.
 func (c *session) sinceBreak() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return !c.breakAt.IsZero() && time.Since(c.breakAt) < afterBreak
+	at := c.breakAt
+	c.mu.Unlock()
+	if c.sh != nil { // a BREAK sent from a window counts the same
+		if t := c.sh.BreakAt(); t.After(at) {
+			at = t
+		}
+	}
+	return !at.IsZero() && time.Since(at) < afterBreak
 }
 
 func (c *session) onBMC() bool {

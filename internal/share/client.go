@@ -108,6 +108,7 @@ type Client struct {
 	err       error
 	closed    bool
 	ended     bool
+	breakAt   time.Time // when a BREAK last went out on this console, whoever sent it
 	obsKind   string
 	obsAt     bool
 }
@@ -370,6 +371,10 @@ func (c *Client) handle(m msg) {
 		if f != nil {
 			f(m.Pending, m.Total)
 		}
+	case tBreak:
+		c.mu.Lock()
+		c.breakAt = time.Now().Add(-time.Duration(m.AgoMS) * time.Millisecond)
+		c.mu.Unlock()
 	case tStopped:
 		c.mu.Lock()
 		if c.lease != nil {
@@ -617,6 +622,15 @@ func (c *Client) Lease(ctx context.Context) (_ context.Context, why func() strin
 func (c *Client) Break(ctx context.Context) error {
 	_, err := c.call(ctx, msg{Op: opBreak})
 	return err
+}
+
+// BreakAt is when a BREAK last went out on this console from any window or AI
+// tool (zero if none is known). A BREAK makes the next key a SysRq command on
+// Linux, so an AI tool's safety checks need to know about one the user sent.
+func (c *Client) BreakAt() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.breakAt
 }
 
 // Toggle switches between the host console and the BMC prompt.

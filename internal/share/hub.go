@@ -34,6 +34,9 @@ const (
 	endWait        = 2 * time.Second // after the output ends, how long to wait for the exit status
 )
 
+// breakMemory is how long a BREAK is reported to a client that joins after it.
+const breakMemory = time.Minute
+
 // typingWindow: an AI tool can't take the keyboard this soon after the user's
 // last key. A variable so tests can shorten it.
 var typingWindow = 3 * time.Second
@@ -95,6 +98,7 @@ type hub struct {
 	paused    bool
 	gen       int // changes whenever the AI tool's keyboard is taken back
 	lastKey   time.Time
+	breakAt   time.Time // the last BREAK that went out, from any client
 	userTyped int
 	agentLine typing
 	busy      bool
@@ -372,6 +376,9 @@ func (h *hub) serve(conn net.Conn, local bool) {
 	// The state, then the output so far, then live output: all queued under
 	// mu, so nothing is lost or repeated in between.
 	h.broadcastState()
+	if !h.breakAt.IsZero() && h.now().Sub(h.breakAt) < breakMemory {
+		h.queue(p, msg{T: tBreak, AgoMS: h.now().Sub(h.breakAt).Milliseconds()})
+	}
 	if replay := h.replay(p.agent, hello.Replay); len(replay) > 0 {
 		h.queue(p, msg{T: tData, Data: replay, Replay: true})
 	}
@@ -903,7 +910,16 @@ func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 		if h.ty.Queued() > 0 || h.lineDirty.Load() {
 			return ErrLinePending
 		}
-		return h.tr.Link.Break()
+		err := h.tr.Link.Break()
+		if err == nil {
+			h.mu.Lock()
+			h.breakAt = h.now()
+			for q := range h.peers { // the AI tool's safety checks care whoever sent it
+				h.queue(q, msg{T: tBreak})
+			}
+			h.mu.Unlock()
+		}
+		return err
 	case opToggle:
 		if h.tr.Toggle == nil {
 			return errors.New("this console has no BMC prompt")

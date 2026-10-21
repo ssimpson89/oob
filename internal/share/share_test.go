@@ -961,3 +961,39 @@ func TestBreakIsRefusedWhileInputIsQueued(t *testing.T) {
 		t.Fatalf("Break = %v, want ErrLinePending", err)
 	}
 }
+
+func TestABreakFromAnyWindowIsReportedToEveryClient(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	ai := agent(t)
+	if !ai.BreakAt().IsZero() {
+		t.Fatal("a BREAK is known before any was sent")
+	}
+	win2, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := win2.Transport().Link.Break(); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]*Client{"agent": ai, "host window": win, "sender": win2} {
+		eventually(t, name+" learns of the BREAK", func() bool { return time.Since(c.BreakAt()) < 5*time.Second })
+	}
+	late, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "a client that joins later is told", func() bool { return time.Since(late.BreakAt()) < 5*time.Second })
+	// A refused BREAK is not reported.
+	win.Enqueue([]byte("x"))
+	eventually(t, "typed", func() bool { return strings.HasSuffix(f.got(), "x") })
+	before := ai.BreakAt()
+	if err := win.Transport().Link.Break(); !errors.Is(err, ErrLinePending) {
+		t.Fatalf("Break = %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if !ai.BreakAt().Equal(before) {
+		t.Error("a BREAK that was refused was reported")
+	}
+}

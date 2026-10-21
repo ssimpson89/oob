@@ -190,3 +190,46 @@ func TestAnApprovalDoesNotCarryToAnotherPlaceOnTheConsole(t *testing.T) {
 		t.Fatalf("the host got %q on an approval for the shell prompt", got)
 	}
 }
+
+func TestABreakSentFromAWindowCountsForTheAgentsApprovalChecks(t *testing.T) {
+	h := start(t, Options{}, "accept")
+	h.connect()
+	w := window(t)
+	if err := w.Transport().Link.Break(); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.mu.Lock()
+	c := h.srv.sessions["s1"]
+	h.srv.mu.Unlock()
+	eventually(t, "the agent's session learns of the BREAK", c.sinceBreak)
+	// The next key could be a SysRq command, so even uname needs the user's say.
+	out, isErr := h.send("s1", "uname -r")
+	if isErr || !strings.Contains(out, "5.14.0-test") {
+		t.Fatalf("send_command: %q %v", out, isErr)
+	}
+	if n := len(h.asked); n != 1 || !strings.Contains(h.asked[0], "right after a BREAK") {
+		t.Errorf("approvals asked: %q, want one about the BREAK", h.asked)
+	}
+}
+
+func TestAnAgentJoiningJustAfterAWindowsBreakKnowsOfIt(t *testing.T) {
+	h := start(t, Options{}, "accept")
+	f := newFakeHost(t, "node01")
+	user, err := share.Open(context.Background(), share.Options{Host: "node01", Addr: "192.0.2.11:22", Type: "ipmi", NoLinger: true,
+		Open: func() (*bmc.ConsoleTransport, error) { return f.transport(), nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { user.Close() })
+	if err := user.Transport().Link.Break(); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := h.call("connect", map[string]any{"host": "node01"})
+	if !strings.Contains(out, "Joined node01") {
+		t.Fatalf("connect: %q", out)
+	}
+	h.srv.mu.Lock()
+	c := h.srv.sessions["s1"]
+	h.srv.mu.Unlock()
+	eventually(t, "the joiner is told of the earlier BREAK", c.sinceBreak)
+}

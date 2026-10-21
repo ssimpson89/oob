@@ -29,6 +29,7 @@ const (
 	tStopped = "stopped" // hub to agent: the user stopped it
 	tProg    = "prog"    // hub to windows: typing queue progress
 	tEnd     = "end"     // hub to client: the console ended
+	tBreak   = "break"   // hub to clients: a BREAK went out, from whoever sent it; AgoMS says how long ago
 	tWrite   = "write"   // window to hub: typed bytes, queued behind the rest
 	tUrgent  = "urgent"  // window to hub: bytes that jump the queue (ctrl+c)
 	tClear   = "clear"   // window to hub: drop what is queued
@@ -77,6 +78,7 @@ type msg struct {
 	AtPrompt bool   `json:"atPrompt,omitempty"`
 	OK       bool   `json:"ok,omitempty"` // reply to sizeline
 	Code     int    `json:"code,omitempty"`
+	AgoMS    int64  `json:"agoMs,omitempty"`   // break: milliseconds since it was sent
 	Pending  int    `json:"pending,omitempty"` // prog
 	Total    int    `json:"total,omitempty"`
 }
