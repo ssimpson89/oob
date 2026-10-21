@@ -91,21 +91,22 @@ type Client struct {
 	doneC chan console.Result
 	done  chan struct{}
 
-	mu       sync.Mutex
-	w        *wire
-	link     net.Conn
-	holder   *holder
-	status   Status
-	joined   bool
-	pending  map[int]chan msg
-	nextID   int
-	lease    context.CancelCauseFunc
-	progress func(pending, total int)
-	err      error
-	closed   bool
-	ended    bool
-	obsKind  string
-	obsAt    bool
+	mu        sync.Mutex
+	w         *wire
+	link      net.Conn
+	holder    *holder
+	status    Status
+	joined    bool
+	pending   map[int]chan msg
+	nextID    int
+	nextLease int
+	lease     context.CancelCauseFunc
+	progress  func(pending, total int)
+	err       error
+	closed    bool
+	ended     bool
+	obsKind   string
+	obsAt     bool
 }
 
 // holder is the hub, socket and lock of the process that opened the console.
@@ -566,9 +567,13 @@ func (c *Client) Lease(ctx context.Context) (_ context.Context, why func() strin
 		c.mu.Unlock()
 		cancel(nil)
 	}
+	c.mu.Lock()
+	c.nextLease++
+	id := c.nextLease
+	c.mu.Unlock()
 	giveUpAt := time.Now().Add(typingWindow)
 	for {
-		_, err = c.call(ctx, msg{Op: opLease})
+		_, err = c.call(ctx, msg{Op: opLease, Lease: id})
 		if !errors.Is(err, ErrTyping) || time.Now().After(giveUpAt) {
 			break
 		}
@@ -582,7 +587,14 @@ func (c *Client) Lease(ctx context.Context) (_ context.Context, why func() strin
 		}
 	}
 	if err != nil {
+		abandoned := ctx.Err() != nil // the caller gave up (or was stopped) with the answer unknown
 		forget()
+		// Giving up on a request doesn't stop the hub granting it: the answer
+		// may be on its way. Release this acquisition by its id, which also
+		// covers a grant that was never seen.
+		if abandoned {
+			go func() { _, _ = c.call(context.Background(), msg{Op: opRelease, Lease: id}) }()
+		}
 		return nil, nil, nil, err
 	}
 	why = func() string {
@@ -594,7 +606,7 @@ func (c *Client) Lease(ctx context.Context) (_ context.Context, why func() strin
 	}
 	return ctx, why, func() {
 		forget()
-		_, _ = c.call(context.Background(), msg{Op: opRelease})
+		_, _ = c.call(context.Background(), msg{Op: opRelease, Lease: id})
 	}, nil
 }
 

@@ -85,6 +85,9 @@ type hub struct {
 	atPrompt  bool
 	agent     *peer
 	lease     bool
+	leaseID   int         // which acquisition holds the keyboard, while lease is set
+	cancelled map[int]int // lease ids released before their request arrived, in order seen
+	cancelSeq int
 	paused    bool
 	gen       int // changes whenever the AI tool's keyboard is taken back
 	lastKey   time.Time
@@ -630,7 +633,7 @@ const (
 func (h *hub) revoke(bool) (note, reason string) {
 	h.mu.Lock()
 	h.gen++
-	h.lease = false
+	h.lease, h.leaseID = false, 0
 	h.mu.Unlock()
 	partial := h.dropQueued()
 	h.mu.Lock()
@@ -741,7 +744,13 @@ func (h *hub) refuse(p *peer) error {
 	return nil
 }
 
+// cancelledMax bounds how many early releases the hub remembers.
+const cancelledMax = 64
+
 // agentOp is the AI tool taking the keyboard for a command, or giving it back.
+// Each acquisition carries an id, so a release names the acquisition it ends:
+// a late one can't free a newer lease, and a request its client gave up on
+// (the release can arrive first) is refused instead of granted to nobody.
 func (h *hub) agentOp(p *peer, m msg) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -749,18 +758,40 @@ func (h *hub) agentOp(p *peer, m msg) error {
 	case !p.agent:
 		return errors.New("only an AI tool takes the keyboard")
 	case m.Op == opRelease:
-		if h.lease {
-			h.lease = false // what it typed without Enter stays tracked, for its next command or a stop
+		switch {
+		case h.lease && h.leaseID == m.Lease:
+			h.lease, h.leaseID = false, 0 // what it typed without Enter stays tracked, for its next command or a stop
 			h.broadcastState()
+		case m.Lease != 0 && !(h.lease && h.leaseID == m.Lease):
+			// Not held now: either long over, or its request is still on the
+			// way. Remember it, so the request is refused when it arrives.
+			if h.cancelled == nil {
+				h.cancelled = map[int]int{}
+			}
+			h.cancelSeq++
+			h.cancelled[m.Lease] = h.cancelSeq
+			if len(h.cancelled) > cancelledMax {
+				oldest, at := 0, 0
+				for id, seq := range h.cancelled {
+					if at == 0 || seq < at {
+						oldest, at = id, seq
+					}
+				}
+				delete(h.cancelled, oldest)
+			}
 		}
 		return nil
 	case h.lease:
 		return ErrBusy
 	}
+	if _, gone := h.cancelled[m.Lease]; gone && m.Lease != 0 {
+		delete(h.cancelled, m.Lease)
+		return errors.New("the lease request was cancelled")
+	}
 	if err := h.refuse(p); err != nil {
 		return err
 	}
-	h.lease, h.agentLine.entered = true, false
+	h.lease, h.leaseID, h.agentLine.entered = true, m.Lease, false
 	h.broadcastState()
 	return nil
 }

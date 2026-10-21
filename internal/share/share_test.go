@@ -814,3 +814,107 @@ func TestJoinWithADifferentAddressOrTypeIsRefusedAtHello(t *testing.T) {
 		t.Errorf("a joiner with no type: %v", err)
 	}
 }
+
+// rawAgent is an AI tool's connection driven by hand, so a test chooses what
+// the hub sees and in what order.
+func rawAgent(t *testing.T) *wire {
+	t.Helper()
+	sock, _, _ := paths("node01", "")
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	w := newWire(conn)
+	if err := w.send(msg{T: tHello, Version: version, Agent: true, Name: "Raw"}); err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// reply waits for the reply to request id, skipping everything else.
+func reply(t *testing.T, w *wire, id int) msg {
+	t.Helper()
+	for {
+		m, err := w.recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.T == tReply && m.ID == id {
+			return m
+		}
+	}
+}
+
+func working(c *Client) bool { return c.Window().Status().Working }
+
+func TestACancelledLeaseDoesNotLeaveTheHubHoldingTheKeyboard(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	ai := agent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // gives up the moment it asks; the request is already on its way
+	if _, _, _, err := ai.Lease(ctx); err == nil {
+		t.Fatal("a cancelled Lease succeeded")
+	}
+	time.Sleep(200 * time.Millisecond) // long enough for a late grant to show
+	eventually(t, "the hub gave the keyboard back", func() bool { return !working(win) })
+	// The user's keys reach the console, not the "AI is working" drop.
+	win.Enqueue([]byte("ls\r"))
+	eventually(t, "the window types", func() bool { return f.got() == "ls\r" })
+	// And the AI tool can take it again.
+	if _, _, release, err := ai.Lease(context.Background()); err != nil {
+		t.Errorf("lease after the cancelled one: %v", err)
+	} else {
+		release()
+	}
+}
+
+func TestAReleaseThatArrivesBeforeItsRequestRefusesTheRequest(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	w := rawAgent(t)
+	// The release for lease 7 overtakes the request for it.
+	_ = w.send(msg{T: tReq, ID: 1, Op: opRelease, Lease: 7})
+	reply(t, w, 1)
+	_ = w.send(msg{T: tReq, ID: 2, Op: opLease, Lease: 7})
+	if r := reply(t, w, 2); r.Err == "" {
+		t.Fatal("a request already released was granted")
+	}
+	if working(win) {
+		t.Error("the hub is holding the keyboard for a request nobody wants")
+	}
+	// Its id is spent, not the keyboard: a new acquisition works.
+	_ = w.send(msg{T: tReq, ID: 3, Op: opLease, Lease: 8})
+	if r := reply(t, w, 3); r.Err != "" {
+		t.Errorf("lease 8: %s", r.Err)
+	}
+}
+
+func TestALateReleaseDoesNotFreeANewerLease(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	w := rawAgent(t)
+	for i, c := range []msg{
+		{Op: opLease, Lease: 1},
+		{Op: opRelease, Lease: 1},
+		{Op: opLease, Lease: 2},
+	} {
+		c.T, c.ID = tReq, i+1
+		_ = w.send(c)
+		if r := reply(t, w, c.ID); r.Err != "" {
+			t.Fatalf("%s %d: %s", c.Op, c.Lease, r.Err)
+		}
+	}
+	_ = w.send(msg{T: tReq, ID: 4, Op: opRelease, Lease: 1}) // a duplicate of the earlier release
+	reply(t, w, 4)
+	if !working(win) {
+		t.Error("an old release freed the keyboard from the lease that followed it")
+	}
+	_ = w.send(msg{T: tReq, ID: 5, Op: opRelease, Lease: 2})
+	reply(t, w, 5)
+	eventually(t, "lease 2 released", func() bool { return !working(win) })
+}

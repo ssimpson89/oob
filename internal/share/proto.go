@@ -67,7 +67,8 @@ type msg struct {
 	Text  string  `json:"text,omitempty"`  // note, mark, stopped, bye, end, reply
 	State *Status `json:"state,omitempty"` // state
 
-	ID       int    `json:"id,omitempty"` // req, reply
+	ID       int    `json:"id,omitempty"`    // req, reply
+	Lease    int    `json:"lease,omitempty"` // req lease and release: which acquisition this is
 	Op       string `json:"op,omitempty"`
 	Rows     int    `json:"rows,omitempty"`
 	Cols     int    `json:"cols,omitempty"`
