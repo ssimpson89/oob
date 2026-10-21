@@ -43,7 +43,7 @@ Most used tasks, in order: SOL console, power status/on/off/cycle/reset, chassis
 
 ## Drivers
 - `bmc.Driver` (internal/bmc/driver.go) is the per-vendor interface: Power, PowerStatus, Boot, UID, NMI, SEL,
-  Console, ConsolePower. Commands validate arguments and confirm; the driver does the work.
+  Console, OpenConsole, ConsolePower. Commands validate arguments and confirm; the driver does the work.
   `bmc.DriverFor` picks one from the host `type`; empty and `ipmi` are generic IPMI (ipmitool).
 - iLO is Redfish-first (power, one-time PXE boot) and falls back to the iLO CLI over SSH when
   Redfish is unreachable or rejects the login. iLO 7 has no SSH exec, only an interactive shell.
@@ -66,7 +66,28 @@ Most used tasks, in order: SOL console, power status/on/off/cycle/reset, chassis
 - `internal/console`: bottom bar, key menu, session loop, log files, text sanitizing.
 - `internal/detect`: vendor detection. `internal/sshx`: SSH connect, host keys, auth.
 - `internal/bmc`: drivers (IPMI, Redfish, iLO, iDRAC, Supermicro) and the vendor SSH CLI console.
+- `internal/mcpserver`: the MCP server (`oob mcp`): host tools, console sessions, approvals.
 - Imports run one way: bmc -> sshx, detect -> console, config -> app; none import cmd/oob.
+
+## MCP server
+`oob mcp` (internal/mcpserver, built on the same go-sdk version bauddy pins) serves the drivers and consoles
+over stdio. Three rules shape it.
+- Credentials never cross the tool boundary. Tools take host names; the host is looked up per call
+  (`config.LookupExact` for anything that changes state, so no prefix can pick another host) and handed to a
+  driver. `hostInfo` has no field for a secret.
+- Everything that changes state goes through `server.approve`, MCP elicitation adapted from bauddy: the first
+  call returns an input request, the client asks the user and repeats the call, and the answer is honored once,
+  for that exact call and host. A client that can't ask is refused; there is no bypass flag. Console input is
+  checked by `risk.go` (bauddy's command list plus server additions), and the cursor line, typed-but-not-entered
+  text and yes/no questions are tracked so a command split across keystrokes or calls is still caught.
+- Remote text is data. `text()` runs every result through `console.CleanRemoteN`, and results are bounded.
+Drivers print through `bmc.Stdout()` rather than `os.Stdout`; `bmc.Capture` collects one call's output in a
+bounded buffer, gives ipmitool no stdin, and kills it when the tool's deadline passes. Captures run one at a time
+because the seam is package-level, so a slow BMC call delays the next one (the bulk `status` does not use it).
+`Run` also points `os.Stdout` at stderr so nothing but the protocol can reach the stream.
+The console runs headless through `Driver.OpenConsole`, which returns a `bmc.ConsoleTransport` (link, output,
+exit, optional BMC-prompt toggle). `oob sol` builds the same transports (`openSOL`, `cliOpen`) and adds the bar
+on top. `console.Transcript` keeps the 10000-line history, the read position and the optional log.
 
 ## Console scrollback
 The bar uses a DECSTBM scroll region on the normal screen (not the alternate screen), so lines
