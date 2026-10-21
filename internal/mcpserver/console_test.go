@@ -351,14 +351,14 @@ func TestSendCommandStopsBeforeEnterWhenTheEchoIsWrong(t *testing.T) {
 	f.dropFirst = true
 	f.mu.Unlock()
 	out, isErr := h.send("s1", "uname -r\necho two")
-	if !isErr || !strings.Contains(out, "Sending stopped at line 1") || !strings.Contains(out, "ctrl+u") {
-		t.Errorf("got %q %v, want a stop with the ctrl+u advice", out, isErr)
+	if !isErr || !strings.Contains(out, "Sending stopped at line 1") || !strings.Contains(out, "ctrl+c") {
+		t.Errorf("got %q %v, want a stop with the ctrl+c advice", out, isErr)
 	}
 	if got := f.entered(); len(got) != 0 {
 		t.Errorf("host ran %q; Enter must not be pressed on a line that echoed wrong", got)
 	}
 	// The session is still usable: clear the line, then send again.
-	if out, isErr := h.call("send_keys", map[string]any{"session": "s1", "keys": []string{"ctrl+u"}}); isErr {
+	if out, isErr := h.call("send_keys", map[string]any{"session": "s1", "keys": []string{"ctrl+c"}}); isErr {
 		t.Fatalf("send_keys: %q", out)
 	}
 	if out, isErr := h.send("s1", "echo three"); isErr || !strings.Contains(out, "sh: echo three: ok") {
