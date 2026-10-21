@@ -13,6 +13,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 	"golang.org/x/term"
 )
 
@@ -165,30 +166,31 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 }
 
 // solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
-// exit code.
+// exit code. The console is shared: if another oob (an MCP server, or another
+// window) already has it, this joins it; otherwise this opens it and others
+// can join.
 func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
 	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		return 1, err
 	}
-	tr, err := openSOL(h, console.RemoteRows(rows), w)
+	c, err := share.Open(context.Background(), share.Options{
+		Host: name, NoLinger: true,
+		Open: func() (*console.Transport, error) { return openSOL(h, console.RemoteRows(rows), w) },
+	})
 	if err != nil {
 		return 1, err
 	}
-	defer tr.Close()
-	code, err := console.Run(console.Setup{
-		Host: name, Kind: "sol",
-		Link:       tr.Link,
-		Out:        tr.Out,
-		Done:       tr.Done,
-		Power:      power,
-		Pacing:     tr.Pacing,
-		Connecting: "connecting to " + name + " via IPMI...",
-	})
+	defer c.Close()
+	connecting := "connecting to " + name + " via IPMI..."
+	if c.Joined() {
+		connecting = ""
+	}
+	code, err := share.RunWindow(c, name, power, connecting)
 	// The terminal is restored now. Repeat any ipmitool error below the bar's
 	// old row so it is still on screen after the console is torn down.
-	if code != 0 {
-		reportIpmiFailure(tr.Tail(), h)
+	if code != 0 && c.Hosting() {
+		reportIpmiFailure(c.Tail(), h)
 	}
 	return code, err
 }

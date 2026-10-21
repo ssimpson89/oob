@@ -20,6 +20,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 	"github.com/ssimpson89/oob/internal/typer"
 )
 
@@ -47,7 +48,10 @@ type session struct {
 	addr string // the BMC address and type the console was opened on
 	typ  string
 	tr   *bmc.ConsoleTransport
-	tx   *console.Transcript
+	// sh is the shared console the session types through (the hub owns the one
+	// typer); nil when tests or callers supply a bare transport.
+	sh *share.Client
+	tx *console.Transcript
 	// ty queues everything typed at the console, paced if the link is serial.
 	// txErr is the write error that ended it, if one did.
 	ty     *typer.Typer
@@ -85,26 +89,18 @@ type session struct {
 }
 
 // newSession starts recording tr's output.
-func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcript) *session {
+func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcript, sh *share.Client) *session {
 	c := &session{
-		id: id, host: host, tr: tr, tx: tx, kind: tr.Kind, answersAt: -1,
+		id: id, host: host, tr: tr, tx: tx, sh: sh, kind: tr.Kind, answersAt: -1,
 		lastUsed: time.Now(), changed: make(chan struct{}),
 		doneC: make(chan struct{}), drained: make(chan struct{}),
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	c.stopTy = stop
 	c.ty = console.NewTyper(tr.Link, tr.Pacing)
-	go func() {
-		_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
-			err := tr.Link.Send(b)
-			if err != nil {
-				c.mu.Lock()
-				c.txErr = err
-				c.mu.Unlock()
-			}
-			return len(b), err
-		}))
-	}()
+	if sh == nil {
+		go c.runTyper(ctx, tr)
+	}
 	go func() {
 		r := <-tr.Done
 		c.mu.Lock()
@@ -114,6 +110,19 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 	}()
 	go c.drain()
 	return c
+}
+
+// runTyper types the session's queue at the transport's link, when no hub does.
+func (c *session) runTyper(ctx context.Context, tr *bmc.ConsoleTransport) {
+	_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
+		err := tr.Link.Send(b)
+		if err != nil {
+			c.mu.Lock()
+			c.txErr = err
+			c.mu.Unlock()
+		}
+		return len(b), err
+	}))
 }
 
 // drain records the console's output until it ends.
@@ -228,6 +237,9 @@ func (c *session) canSend() error {
 	if c.ended {
 		return fmt.Errorf("%s, so nothing was sent. Disconnect and connect again", c.endMsg)
 	}
+	if c.sh != nil && c.sh.Status().Paused {
+		return errors.New(pausedText) // before anything else, so a paused tool is told so
+	}
 	return nil
 }
 
@@ -280,11 +292,17 @@ func (c *session) write(ctx context.Context, b []byte) error {
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
 	c.mu.Unlock()
 	err := c.guarded(ctx, func() error {
+		if c.sh != nil { // the hub's one typer paces it, with the lease and typing checks
+			return c.sh.Type(context.Background(), b) // guarded ends it if ctx does
+		}
 		<-c.ty.Enqueue(b)
 		return nil
 	})
 	if err != nil {
-		return err
+		if errors.Is(err, errStuck) {
+			return err
+		}
+		return shareError(err)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

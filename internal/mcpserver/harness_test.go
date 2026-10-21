@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -430,12 +431,26 @@ func (h *harness) host(name string) *fakeHost {
 // user to approve things, and the user answers: "accept" ticks "Allow it" and
 // accepts, "unticked" accepts without ticking, anything else is the action,
 // such as "decline".
+// shareState points the share sockets at a fresh short folder: a unix socket
+// path is limited to about 100 bytes, which t.TempDir often exceeds.
+func shareState(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "oob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", d)
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
+}
+
 func start(t *testing.T, opt Options, answer string) *harness {
 	return startVersion(t, opt, answer, "")
 }
 
 func startVersion(t *testing.T, opt Options, answer, version string) *harness {
 	t.Helper()
+	shareState(t)
 	oldQuiet := quietFor
 	quietFor = 25 * time.Millisecond
 	t.Cleanup(func() { quietFor = oldQuiet })

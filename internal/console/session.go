@@ -68,6 +68,12 @@ type Setup struct {
 	NoToggle string
 	// Pacing overrides the typing delays on serial links.
 	Pacing Pacing
+	// Queue, if set, replaces the console's own typing queue: the console is
+	// shared and one typer at the hub paces what every window types.
+	Queue Queue
+	// Shared, if set, says the console is shared: the bar shows who is on it
+	// and the i key pauses the AI tool.
+	Shared Shared
 }
 
 // UseBar reports whether the bottom bar can run: stdin and stdout must both be
@@ -160,6 +166,20 @@ func Run(cs Setup) (int, error) {
 
 	auto := cs.Link.SizeIsFree()
 	con.SetAuto(auto)
+
+	if cs.Shared != nil {
+		con.SetShared(cs.Shared.Status())
+		guard(cleanup, func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case n := <-cs.Shared.Notes():
+					con.SharedNote(n, cs.Shared.Status())
+				}
+			}
+		})
+	}
 
 	outDone := make(chan struct{})
 	guard(cleanup, func() {
@@ -289,7 +309,8 @@ type consoleKeys struct {
 	autoMu sync.Mutex // guards auto
 	auto   bool
 
-	ty *typer.Typer // everything typed or pasted goes through it, in order
+	ty *typer.Typer // everything typed or pasted goes through it, in order (nil when shared)
+	q  Queue        // ty, or the hub's queue
 }
 
 func (k *consoleKeys) autoOn() bool {
@@ -350,13 +371,13 @@ func (k *consoleKeys) do(a action) {
 	switch a.act {
 	case actPaste:
 		b := pasteBytes(a.text)
-		k.ty.Enqueue(b)
+		k.q.Enqueue(b)
 		con.Mark(fmt.Sprintf("pasted %d bytes", len(b)))
 	case actPasteTooBig:
 		con.Note(fmt.Sprintf("paste not sent: over %d MiB", pasteMax>>20), true)
 	case actStop:
 		if con.Pending() > 0 {
-			k.ty.Clear()
+			k.q.Clear()
 			con.Note("typing queue cleared", false)
 			con.Mark("typing queue cleared")
 		}
@@ -385,7 +406,7 @@ func (k *consoleKeys) do(a action) {
 	case actLog:
 		con.ToggleLog()
 	case actBreak:
-		k.ty.Clear()
+		k.q.Clear()
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
 			return
@@ -393,13 +414,13 @@ func (k *consoleKeys) do(a action) {
 		con.Note("BREAK sent", false)
 		con.Mark("BREAK sent")
 	case actSysrq:
-		k.ty.Clear()
+		k.q.Clear()
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
 			return
 		}
 		time.Sleep(sysrqGap)
-		k.ty.Urgent([]byte{a.arg})
+		k.q.Urgent([]byte{a.arg})
 		con.Note("SysRq "+string(a.arg)+" sent", false)
 		con.Mark("SysRq " + string(a.arg) + " sent")
 	case actBMC:
@@ -412,7 +433,7 @@ func (k *consoleKeys) do(a action) {
 			con.Note(msg, false)
 			return
 		}
-		k.ty.Clear()
+		k.q.Clear()
 		kind, at, err := t.Toggle()
 		con.SetKind(kind, at)
 		if err != nil {
@@ -422,7 +443,7 @@ func (k *consoleKeys) do(a action) {
 		con.Note("now at "+kind, false)
 		con.Mark("switched to " + kind)
 	case actLiteral:
-		k.ty.Urgent([]byte{escapeByte})
+		k.q.Urgent([]byte{escapeByte})
 	case actPower:
 		if cs.Power == nil {
 			return
@@ -442,8 +463,16 @@ func (k *consoleKeys) do(a action) {
 		})
 	case actDisconnect:
 		con.Mark("disconnect")
-		k.ty.Clear()
+		k.q.Clear()
 		_ = cs.Link.Disconnect()
+	case actAI:
+		if cs.Shared == nil {
+			con.Note("this console isn't shared with an AI tool", false)
+			return
+		}
+		if err := cs.Shared.TogglePause(); err != nil {
+			con.Note(err.Error(), true)
+		}
 	case actHelp:
 		con.Print(helpText())
 	}

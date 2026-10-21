@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // destructiveActions is the one list of commands that change or erase state
@@ -69,6 +71,30 @@ func confirmDestructive(cmd, name string, h config.Host, rest []string) error {
 	return nil
 }
 
+// joinSharedConsole joins the console another oob has open for name, as a
+// window. joined is false when nobody has it, and the caller opens it itself.
+func joinSharedConsole(name string, o bmc.SOLOptions, drv bmc.Driver) (joined bool, err error) {
+	if o.Raw || o.Deact || o.Force {
+		if share.Exists(name) {
+			return true, fmt.Errorf("%s's console is open in another oob and shared; --raw, --force and --deactivate would take it from them. Run `%s sol %s` to join it", name, app.Name, name)
+		}
+		return false, nil
+	}
+	if !console.UseBar() {
+		return false, nil
+	}
+	c, err := share.Open(context.Background(), share.Options{Host: name, NoLinger: true})
+	if errors.Is(err, share.ErrNoHub) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	defer c.Close()
+	code, err := share.RunWindow(c, name, drv.ConsolePower(), "")
+	return true, app.Code(code, err)
+}
+
 // bmcCmds returns the commands that act on a single BMC (over IPMI, SSH or
 // Redfish, depending on its driver).
 func bmcCmds() []*cobra.Command {
@@ -96,7 +122,9 @@ func bmcCmds() []*cobra.Command {
 			"overruns. Set 0 for no delay; the host's char_delay_ms and line_delay_ms set them per host.\n" +
 			"Like ssh, ~. at the start of a line also disconnects and ~~ sends a single ~.\n" +
 			"Inside an outer ssh session the outer ssh eats the first tilde, so type ~~. to reach oob.\n" +
-			"With --raw, or when stdout is not a terminal, ipmitool runs directly and its own ~. applies.",
+			"With --raw, or when stdout is not a terminal, ipmitool runs directly and its own ~. applies.\n\n" +
+			"The console is shared: if another oob (a second window, or `oob mcp` for an AI agent) already has\n" +
+			"it open, this joins it instead of opening a second connection. ~. then leaves only this window.",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: hostCompletion,
 		RunE: withHost(func(name string, h config.Host, _ []string) error {
@@ -106,7 +134,11 @@ func bmcCmds() []*cobra.Command {
 			if sol.Flags().Changed("line-delay") {
 				h.LineDelayMS = ptrMS(lineDelay)
 			}
-			return bmc.DriverForProbed(name, h).Console(o)
+			drv := bmc.DriverForProbed(name, h)
+			if joined, err := joinSharedConsole(name, o, drv); joined {
+				return err
+			}
+			return drv.Console(o)
 		}),
 	}
 	sol.Flags().DurationVar(&charDelay, "char-delay", console.DefaultCharDelay, "gap after each typed byte on a serial console (0 for none)")

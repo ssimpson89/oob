@@ -18,6 +18,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 const (
@@ -308,31 +309,39 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	}()
 
 	type opened struct {
-		tr  *bmc.ConsoleTransport
+		cl  *share.Client
 		err error
 	}
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	ch := make(chan opened, 1)
+	who := clientName(req)
 	go func() {
-		tr, err := s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
-		ch <- opened{tr, err}
+		// Join the console if the user already has it open in an oob window (an
+		// iLO allows one VSP session, so a second connection couldn't work);
+		// otherwise open it here, and a window opened later joins this one.
+		cl, err := share.Open(ctx, share.Options{Host: name, Agent: true, Name: who,
+			Open: func() (*bmc.ConsoleTransport, error) {
+				return s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
+			}})
+		ch <- opened{cl, err}
 	}()
-	var tr *bmc.ConsoleTransport
+	var cl *share.Client
 	select {
 	case o := <-ch:
 		if o.err != nil {
-			return fail("can't open the console on "+name+": ", o.err)
+			return fail("can't open the console on "+name+": ", shareError(o.err))
 		}
-		tr = o.tr
+		cl = o.cl
 	case <-ctx.Done():
 		go func() { // it may still finish; don't leave it open
-			if o := <-ch; o.tr != nil {
-				o.tr.Close()
+			if o := <-ch; o.cl != nil {
+				o.cl.Close()
 			}
 		}()
 		return fail(errTimeout("opening the console on "+name, connectTimeout, false))
 	}
+	tr := cl.Transport()
 
 	tx := console.NewTranscript(name, tr.Kind)
 	logNote := "Not logging."
@@ -346,7 +355,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	s.mu.Lock()
 	s.nextID++
 	id := fmt.Sprintf("s%d", s.nextID)
-	c := newSession(id, name, tr, tx)
+	c := newSession(id, name, tr, tx, cl)
 	c.addr, c.typ = h.IP, h.Type // what was connected to, whatever the host list says later
 	s.sessions[id] = c
 	s.mu.Unlock()
@@ -360,7 +369,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	select {
 	case <-c.doneC: // it ended while we waited: the login or the session failed
 		why := c.output()
-		if tr.Tail != nil {
+		if tr.Tail != nil && !cl.Joined() {
 			why = lastLines(tr.Tail(), 6)
 		}
 		s.forget(c, "the console ended right after connecting")
@@ -374,6 +383,10 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		quiet = "The console has printed nothing yet. send_keys with keys [\"enter\"] usually brings up the prompt."
 	}
 	head := fmt.Sprintf("Connected to %s as session %s (%s console).", name, id, tr.Kind)
+	if cl.Joined() {
+		head = fmt.Sprintf("Joined %s as session %s (%s console), which the user already has open in an oob window. "+
+			"They see everything you type and can pause you. You see the line the cursor is on, not what came before.", name, id, tr.Kind)
+	}
 	return text(false, head+" "+logNote, out, quiet), nil, nil
 }
 
@@ -587,6 +600,17 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		c.mu.Unlock()
 	}
 
+	ctx, why, release, err := c.keyboard(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	defer release()
+	stopped := func() (*mcp.CallToolResult, any, error, bool) {
+		if w := why(); w != "" {
+			return text(true, c.output(), stoppedText(w)), nil, nil, true
+		}
+		return nil, nil, nil, false
+	}
 	for i, l := range lines {
 		// The approval covered the context the batch started in. Each line
 		// after the first is typed where the earlier ones left the console: if
@@ -600,7 +624,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 			}
 		}
 		c.tx.Mark("agent typed: " + l)
-		if err := c.runLine(ctx, l, wait); err != nil {
+		err := c.runLine(ctx, l, wait)
+		if res, out, e, ok := stopped(); ok {
+			return res, out, e
+		}
+		if err != nil {
 			s.stuck(c, err)
 			return fail(c.output(), "Sending stopped: "+err.Error())
 		}
@@ -788,6 +816,11 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		c.mu.Unlock()
 	}
 
+	ctx, why, release, err := c.keyboard(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack+c.typingTime(wire.Len(), 1))
 	defer cancel()
 	if len(in.Keys) > 0 {
@@ -795,6 +828,9 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	}
 	changed := c.changes()
 	if err := c.write(ctx, []byte(wire.String())); err != nil {
+		if w := why(); w != "" {
+			return text(true, c.output(), stoppedText(w)), nil, nil
+		}
 		s.stuck(c, err)
 		return fail(err)
 	}
@@ -802,6 +838,9 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	c.typing = sim
 	c.mu.Unlock()
 	c.settle(ctx, changed, wait, false)
+	if w := why(); w != "" {
+		return text(true, c.output(), stoppedText(w)), nil, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
@@ -838,7 +877,7 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 	changed := c.changes()
 	if err := c.guarded(ctx, c.tr.Link.Break); err != nil {
 		s.stuck(c, err)
-		return fail("the BREAK wasn't sent: ", err)
+		return fail("the BREAK wasn't sent: ", shareError(err))
 	}
 	c.mu.Lock()
 	c.breakAt = time.Now()
@@ -897,7 +936,7 @@ func (s *server) bmcPrompt(ctx context.Context, _ *mcp.CallToolRequest, in bmcPr
 	c.kind, c.atBMC = kind, at
 	c.mu.Unlock()
 	if err != nil {
-		return fail("couldn't switch: ", err)
+		return fail("couldn't switch: ", shareError(err))
 	}
 	c.tx.Mark("switched to " + kind)
 	c.settle(ctx, changed, keysWait, false)

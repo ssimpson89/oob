@@ -226,3 +226,6 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		}
 	}
 }
+
+// OnProgress sets Progress, so a Typer is a console.Queue.
+func (t *Typer) OnProgress(f func(pending, total int)) { t.Progress = f }

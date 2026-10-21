@@ -5,6 +5,7 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -399,4 +400,55 @@ func (c *console) Close() []string {
 	}
 	c.write(pasteOff + "\x1b[0m\x1b7\x1b[r" + fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.rows) + "\x1b8\r\n")
 	return c.logs
+}
+
+// SetShared shows who else is on a shared console.
+func (c *console) SetShared(s SharedStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setSharedLocked(s)
+}
+
+func (c *console) setSharedLocked(s SharedStatus) {
+	c.st.sharing = true
+	c.st.aiPaused = s.Paused
+	label := ""
+	switch {
+	case s.Agent != "" && s.Paused:
+		label = "shared · " + s.Agent + " paused"
+	case s.Agent != "" && s.Working:
+		label = "shared · " + s.Agent + " working"
+	case s.Agent != "":
+		label = "shared · " + s.Agent + " connected"
+	case s.Windows == 1:
+		label = "shared · 1 other window"
+	case s.Windows > 1:
+		label = "shared · " + strconv.Itoa(s.Windows) + " other windows"
+	case s.Paused:
+		label = "shared · AI paused"
+	}
+	if label != c.st.shared {
+		c.st.shared = CleanRemoteLine(label)
+		c.repaint()
+	}
+}
+
+// SharedNote applies a note from the hub and redraws for the new status.
+func (c *console) SharedNote(n Note, s SharedStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	if n.Text != "" {
+		text := strings.ReplaceAll(n.Text, "{keys}", shortKey("ctrl+]"))
+		if n.Mark {
+			if c.log != nil {
+				_ = c.log.Mark(text)
+			}
+		} else {
+			c.noteLocked(text, false)
+		}
+	}
+	c.setSharedLocked(s)
 }
