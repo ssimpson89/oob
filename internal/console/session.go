@@ -514,7 +514,13 @@ func (k *consoleKeys) do(a action) {
 		})
 	case actDisconnect:
 		con.Mark("disconnect")
-		k.q.Clear()
+		// A local typer is this window's own, and goes with it. A shared
+		// console's queue is the hub's, with other windows' and the AI tool's
+		// typing in it: a window leaving must not clear it. (The window that
+		// opened the console ends it, and the hub drops the queue itself.)
+		if k.ty != nil {
+			k.ty.Clear()
+		}
 		_ = cs.Link.Disconnect()
 	case actAI:
 		if cs.Shared == nil {
