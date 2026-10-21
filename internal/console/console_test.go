@@ -34,9 +34,9 @@ func TestKeyParser(t *testing.T) {
 		{"double escape", []string{esc + esc}, "", []action{{act: actLiteral}}, modeConsole},
 		{"disconnect", []string{esc + "."}, "", []action{{act: actDisconnect}}, modeConsole},
 		{"help", []string{esc + "?"}, "", []action{{act: actHelp}}, modeConsole},
-		{"esc stops a paste", []string{esc + "\x1b"}, "", []action{{act: actStop}}, modeConsole},
-		{"x stops a paste", []string{esc + "x"}, "", []action{{act: actStop}}, modeConsole},
-		{"w toggles raw paste", []string{esc + "w"}, "", []action{{act: actRaw}}, modeConsole},
+		{"esc clears the queue", []string{esc + "\x1b"}, "", []action{{act: actStop}}, modeConsole},
+		{"x clears the queue", []string{esc + "x"}, "", []action{{act: actStop}}, modeConsole},
+		{"w is no longer a key", []string{esc + "w"}, "", []action{{act: actCancel}}, modeConsole},
 		{"unknown key cancels", []string{esc + "z"}, "", []action{{act: actCancel}}, modeConsole},
 		{"pending command", []string{esc}, "", nil, modeCommand},
 		{"arrow key swallowed", []string{esc + "\x1b[A" + "s"}, "", []action{{act: actSize}}, modeConsole},
@@ -591,7 +591,8 @@ func TestConsoleKeyActions(t *testing.T) {
 	powered := make(chan struct{})
 	cs := &Setup{Link: fl, Power: func() (string, error) { close(powered); return "ok\n", nil }}
 	stop := make(chan struct{})
-	k := &consoleKeys{cs: cs, con: con, cleanup: func() {}, stop: stop}
+	k := newKeys(cs, con, func() {}, stop)
+	k.start(nil)
 	esc := string(rune(escapeByte))
 
 	k.Input([]byte(esc + "s"))

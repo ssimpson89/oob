@@ -57,7 +57,7 @@ func SSHConsole(c *ssh.Client, name string, h config.Host) (int, error) {
 	sl := &sshLink{sess: sess, stdin: stdin}
 	var l console.Link = sl
 	disc := &sl.disconnected
-	setup := console.Setup{NoToggle: "no BMC console known for this host (set its type to ilo, idrac or supermicro)"}
+	setup := console.Setup{Pacing: console.PacingMS(h.CharDelayMS, h.LineDelayMS), NoToggle: "no BMC console known for this host (set its type to ilo, idrac or supermicro)"}
 	// On a vendor host the session starts at the BMC's CLI prompt, so c can
 	// start the console there and return to the prompt.
 	if sp, ok := cliSpecFor(h.Type); ok {

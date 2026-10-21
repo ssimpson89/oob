@@ -20,7 +20,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
-	"github.com/ssimpson89/oob/internal/paste"
+	"github.com/ssimpson89/oob/internal/typer"
 )
 
 const (
@@ -48,7 +48,11 @@ type session struct {
 	typ  string
 	tr   *bmc.ConsoleTransport
 	tx   *console.Transcript
-	taps paste.Hub // copies of the console output for the pacer that types a line
+	// ty queues everything typed at the console, paced if the link is serial.
+	// txErr is the write error that ended it, if one did.
+	ty     *typer.Typer
+	stopTy context.CancelFunc
+	txErr  error // guarded by mu
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -87,6 +91,20 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 		lastUsed: time.Now(), changed: make(chan struct{}),
 		doneC: make(chan struct{}), drained: make(chan struct{}),
 	}
+	ctx, stop := context.WithCancel(context.Background())
+	c.stopTy = stop
+	c.ty = console.NewTyper(tr.Link, tr.Pacing)
+	go func() {
+		_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
+			err := tr.Link.Send(b)
+			if err != nil {
+				c.mu.Lock()
+				c.txErr = err
+				c.mu.Unlock()
+			}
+			return len(b), err
+		}))
+	}()
 	go func() {
 		r := <-tr.Done
 		c.mu.Lock()
@@ -120,14 +138,10 @@ func (c *session) drain() {
 
 // feed records console output and follows the cursor.
 func (c *session) feed(b []byte) {
-	// One critical section for the transcript and the taps, so a pacer that
-	// starts a tap and reads the cursor line together neither misses output
-	// nor sees it twice.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	before := c.tx.Count()
 	c.tx.Feed(b)
-	c.taps.Feed(b)
 	completed := c.tx.Count() - before
 	if c.tr.Observe != nil {
 		kind, at, _ := c.tr.Observe(b)
@@ -157,6 +171,7 @@ func (c *session) markEnded() {
 		return
 	}
 	c.ended = true
+	c.stopTy()
 	switch {
 	case c.result.Err != nil:
 		c.endMsg = "the console connection ended: " + c.result.Err.Error()
@@ -253,36 +268,47 @@ func (c *session) closeTransport() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
+	c.stopTy()
 	c.trOnce.Do(c.tr.Close)
 }
 
-// write types b at the console, within ctx.
+// write types b at the console, within ctx: it queues the bytes and returns
+// when the last one is out. On a serial console that takes a while, since the
+// queue paces them.
 func (c *session) write(ctx context.Context, b []byte) error {
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
 	c.mu.Unlock()
-	return c.guarded(ctx, func() error { return c.tr.Link.Send(b) })
+	err := c.guarded(ctx, func() error {
+		<-c.ty.Enqueue(b)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.txErr != nil:
+		return c.txErr
+	case c.closed:
+		return errors.New("the session was closed before everything was typed")
+	}
+	return nil
 }
 
-// typeLine types l and presses Enter, a few characters ahead of the console's
-// echo and only when the whole line has echoed, so a serial console behind a
-// slow link can't drop part of it. It doesn't wait for the answer: runLine does
-// that. A *paste.StopError means the echo never matched and Enter wasn't
-// pressed, which leaves the session usable.
-func (c *session) typeLine(ctx context.Context, l string) error {
-	c.mu.Lock()
-	rx, untap := c.taps.Tap()
-	cursor := c.tx.Partial()
-	c.mu.Unlock()
-	defer untap()
-	p := &paste.Pacer{
-		Write:  func(b []byte) error { return c.write(ctx, b) },
-		Rx:     rx,
-		Baud:   115200,
-		Prompt: cursor,
+// typingTime is how long the queue takes to type n bytes in lines lines, so a
+// tool's time limit covers it. It is zero for a console that isn't paced.
+func (c *session) typingTime(n, lines int) time.Duration {
+	if c.ty.Paced == nil || !c.ty.Paced() {
+		return 0
 	}
-	return p.Type(ctx, l+"\r")
+	return time.Duration(n)*c.ty.CharDelay + time.Duration(lines)*c.ty.LineDelay
 }
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 
 // unread returns what the console printed since output was last returned,
 // ending with the line the cursor is on, and marks it returned.

@@ -125,10 +125,10 @@ type fakeHost struct {
 	unstick     chan struct{} // closed by Close
 	unstickOnce sync.Once
 
-	writes, maxWrite int           // Send calls and the longest one, to see that a line isn't typed in one burst
-	noEcho           bool          // never echoes what is typed
+	writes, maxWrite int           // Send calls and the longest one, to see whether a line is typed in one burst
 	sendDelay        time.Duration // each Send takes this long, like a slow serial link
-	dropFirst        bool          // loses the first byte of the next Send, as a laggy serial link does
+	serial           bool          // a serial console: the session paces what it types, by pacing
+	pacing           console.Pacing
 }
 
 func newFakeHost(t *testing.T, name string) *fakeHost {
@@ -172,9 +172,6 @@ func (f *fakeHost) Send(b []byte) error {
 	f.writes++
 	f.maxWrite = max(f.maxWrite, len(b))
 	f.sent = append(f.sent, b...)
-	if f.dropFirst && len(b) > 0 {
-		f.dropFirst, b = false, b[1:]
-	}
 	f.mu.Unlock()
 	time.Sleep(delay)
 	for _, c := range b {
@@ -209,11 +206,8 @@ func (f *fakeHost) Send(b []byte) error {
 			if c >= 0x20 && c < 0x7f {
 				f.mu.Lock()
 				f.buf += string(rune(c))
-				noEcho := f.noEcho
 				f.mu.Unlock()
-				if !noEcho {
-					f.emit(string(rune(c)))
-				}
+				f.emit(string(rune(c)))
 			}
 		}
 	}
@@ -296,6 +290,7 @@ func (f *fakeHost) Disconnect() error {
 func (f *fakeHost) Resize(rows, cols int) error  { return nil }
 func (f *fakeHost) FitSize(rows, cols int) error { return nil }
 func (f *fakeHost) SizeIsFree() bool             { return false }
+func (f *fakeHost) Serial() bool                 { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
 
 // finish ends the transport the way a hung-up console does.
 func (f *fakeHost) finish() {
@@ -348,7 +343,7 @@ func (f *fakeHost) rawSent() string {
 }
 
 func (f *fakeHost) transport() *bmc.ConsoleTransport {
-	tr := &bmc.ConsoleTransport{Kind: "sol", Link: f, Out: f.pr, Done: f.done, Close: f.Close, Tail: func() string { return "" }}
+	tr := &bmc.ConsoleTransport{Kind: "sol", Link: f, Out: f.pr, Done: f.done, Close: f.Close, Tail: func() string { return "" }, Pacing: f.pacing}
 	tr.Release = func() {
 		f.mu.Lock()
 		f.released, f.closedFirst = true, f.closed

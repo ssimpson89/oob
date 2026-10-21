@@ -27,6 +27,8 @@ type ConsoleTransport struct {
 	// right. Both are nil where the console has no BMC prompt (IPMI SOL).
 	Toggle  func() (kind string, atPrompt bool, err error)
 	Observe func(b []byte) (kind string, atPrompt, changed bool)
+	// Pacing is the host's typing delays for this console.
+	Pacing console.Pacing
 	// Close tears the transport down and releases everything. Safe to call
 	// after the session ended.
 	Close func()

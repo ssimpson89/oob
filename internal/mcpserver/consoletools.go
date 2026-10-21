@@ -18,7 +18,6 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
-	"github.com/ssimpson89/oob/internal/paste"
 )
 
 const (
@@ -541,7 +540,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	if err != nil {
 		return fail(err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(len(lines))*wait+toolSlack)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(len(lines))*wait+toolSlack+c.typingTime(len(in.Line), len(lines)))
 	defer cancel()
 
 	at := c.line()
@@ -603,11 +602,6 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		c.tx.Mark("agent typed: " + l)
 		if err := c.runLine(ctx, l, wait); err != nil {
 			s.stuck(c, err)
-			var se *paste.StopError
-			if errors.As(err, &se) {
-				return fail(c.output(), "Sending stopped at line "+strconv.Itoa(i+1)+": "+se.Reason+". Part of the line may be typed at the prompt: "+
-					"clear it with send_keys keys [\"ctrl+c\"] before sending anything else. Lines not sent: "+strconv.Itoa(len(lines)-i))
-			}
 			return fail(c.output(), "Sending stopped: "+err.Error())
 		}
 		if err := ctx.Err(); err != nil {
@@ -626,7 +620,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 // at a prompt or a question, or wait passes.
 func (c *session) runLine(ctx context.Context, l string, wait time.Duration) error {
 	changed := c.changes()
-	if err := c.typeLine(ctx, l); err != nil {
+	if err := c.write(ctx, []byte(l+"\r")); err != nil {
 		return err
 	}
 	deadline := time.Now().Add(wait) // typing a line paced takes a while; wait_seconds is for the answer
@@ -794,7 +788,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		c.mu.Unlock()
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack)
+	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack+c.typingTime(wire.Len(), 1))
 	defer cancel()
 	if len(in.Keys) > 0 {
 		c.tx.Mark("agent pressed " + strings.Join(in.Keys, ", "))

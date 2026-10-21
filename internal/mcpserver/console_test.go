@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ssimpson89/oob/internal/console"
 )
 
 func (h *harness) send(session, line string) (string, bool) {
@@ -321,11 +323,13 @@ func TestSessionLog(t *testing.T) {
 	}
 }
 
-// send_command types each line a few characters ahead of the echo instead of
-// writing it in one burst, so a serial console behind a slow link can't drop
-// part of it.
-func TestSendCommandTypesPacedAndEchoChecked(t *testing.T) {
+// On a serial console everything typed goes through the paced queue: a byte at
+// a time with a gap, so the BMC's small buffer can't overrun. On anything else
+// a line is one write.
+func TestSendCommandOnASerialConsoleIsTypedByteByByte(t *testing.T) {
+	ms := time.Millisecond
 	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) { f.serial, f.pacing = true, console.Pacing{Char: &ms, Line: &ms} }
 	h.connect()
 	line := "echo " + strings.Repeat("abcdefghij", 10)
 	out, isErr := h.send("s1", line+"\necho two")
@@ -338,31 +342,40 @@ func TestSendCommandTypesPacedAndEchoChecked(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.maxWrite > 9 {
-		t.Errorf("longest write was %d bytes; a line must be typed a few characters at a time", f.maxWrite)
+	if f.maxWrite != 1 {
+		t.Errorf("longest write was %d bytes; a serial console is typed a byte at a time", f.maxWrite)
 	}
 }
 
-func TestSendCommandStopsBeforeEnterWhenTheEchoIsWrong(t *testing.T) {
+func TestSendCommandOnAnSSHConsoleIsOneWritePerLine(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	line := "echo " + strings.Repeat("abcdefghij", 10)
+	if out, isErr := h.send("s1", line); isErr || !strings.Contains(out, "sh: "+line+": ok") {
+		t.Fatalf("got %q %v", out, isErr)
+	}
+	f := h.host("node01")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writes != 1 || f.maxWrite != len(line)+1 {
+		t.Errorf("%d writes, longest %d; want the line and Enter in one write", f.writes, f.maxWrite)
+	}
+}
+
+// A write that fails stops the call and says so; nothing later is typed.
+func TestSendCommandReportsAWriteError(t *testing.T) {
 	h := start(t, Options{}, "")
 	h.connect()
 	f := h.host("node01")
 	f.mu.Lock()
-	f.dropFirst = true
+	f.ended = true // the console's input is closed, as when the connection drops
 	f.mu.Unlock()
 	out, isErr := h.send("s1", "uname -r\necho two")
-	if !isErr || !strings.Contains(out, "Sending stopped at line 1") || !strings.Contains(out, "ctrl+c") {
-		t.Errorf("got %q %v, want a stop with the ctrl+c advice", out, isErr)
+	if !isErr || !strings.Contains(out, "Sending stopped") && !strings.Contains(out, "ended") {
+		t.Errorf("got %q %v, want an error", out, isErr)
 	}
 	if got := f.entered(); len(got) != 0 {
-		t.Errorf("host ran %q; Enter must not be pressed on a line that echoed wrong", got)
-	}
-	// The session is still usable: clear the line, then send again.
-	if out, isErr := h.call("send_keys", map[string]any{"session": "s1", "keys": []string{"ctrl+c"}}); isErr {
-		t.Fatalf("send_keys: %q", out)
-	}
-	if out, isErr := h.send("s1", "echo three"); isErr || !strings.Contains(out, "sh: echo three: ok") {
-		t.Errorf("after the stop: %q %v", out, isErr)
+		t.Errorf("host ran %q after the write failed", got)
 	}
 }
 
@@ -371,7 +384,8 @@ func TestSendCommandStopsBeforeEnterWhenTheEchoIsWrong(t *testing.T) {
 func TestSendCommandWaitStartsAfterTyping(t *testing.T) {
 	h := start(t, Options{}, "")
 	h.setup = func(f *fakeHost) {
-		f.sendDelay = 150 * time.Millisecond
+		ms := time.Millisecond
+		f.sendDelay, f.serial, f.pacing = 15*time.Millisecond, true, console.Pacing{Char: &ms, Line: &ms}
 		f.respond = func(f *fakeHost, cmd string) bool {
 			go func() {
 				time.Sleep(300 * time.Millisecond)
@@ -381,7 +395,7 @@ func TestSendCommandWaitStartsAfterTyping(t *testing.T) {
 		}
 	}
 	h.connect()
-	line := "echo " + strings.Repeat("abcdefgh", 5) // several paced writes, 0.75s or more to type
+	line := "echo " + strings.Repeat("abcdefgh", 5) // typed a byte at a time: 0.7s or more
 	start := time.Now()
 	out, isErr := h.call("send_command", map[string]any{"session": "s1", "line": line, "wait_seconds": 0.6})
 	if isErr || !strings.Contains(out, "late-result") {

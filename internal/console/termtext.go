@@ -1,8 +1,7 @@
 // Copyright (c) 2026 ssimpson89. MIT License. See THIRD_PARTY.md.
 //
 // The cleaner itself lives in internal/termtext (copied from bauddy's
-// internal/termtext), shared with the paste pacer, which cannot import this
-// package.
+// internal/termtext).
 
 package console
 

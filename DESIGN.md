@@ -64,6 +64,7 @@ Most used tasks, in order: SOL console, power status/on/off/cycle/reset, chassis
 - `cmd/oob`: cobra wiring, flags, notices and the confirmation prompts.
 - `internal/app`: the name, exit-code error and the notice hooks. `internal/config`: hosts file.
 - `internal/console`: bottom bar, key menu, session loop, log files, text sanitizing.
+- `internal/typer`: the paced input queue every typed or pasted byte goes through (one goroutine owns the queue).
 - `internal/detect`: vendor detection. `internal/sshx`: SSH connect, host keys, auth.
 - `internal/bmc`: drivers (IPMI, Redfish, iLO, iDRAC, Supermicro) and the vendor SSH CLI console.
 - `internal/mcpserver`: the MCP server (`oob mcp`): host tools, console sessions, approvals.

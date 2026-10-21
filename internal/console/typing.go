@@ -1,14 +1,17 @@
 package console
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/ssimpson89/oob/internal/paste"
+	"github.com/ssimpson89/oob/internal/typer"
 )
 
 // serialLink is a link that can say whether what it is typing at is a serial
@@ -20,214 +23,178 @@ type serialLink interface {
 }
 
 // sizeLiner is a link whose FitSize types a command at the remote (stty over
-// a serial console). It gives that line so the console can type it paced and
-// echo-checked; ok is false when FitSize types nothing.
+// a serial console). It gives that line so the console can send it through
+// the typing queue like everything else; ok is false when FitSize types
+// nothing (an ssh window change).
 type sizeLiner interface {
 	SizeLine(rows, cols int) (line string, ok bool)
 }
 
-// pasteBaud is the line rate the pacer assumes. It only sets a short settle
-// time after Enter, so a wrong guess costs a few milliseconds.
-const pasteBaud = 115200
+// The delays between bytes on a serial link: short between characters, long
+// after Enter, when the remote may be busy running the line.
+const (
+	DefaultCharDelay = 10 * time.Millisecond
+	DefaultLineDelay = 200 * time.Millisecond
+)
 
-// pasteNoteTTL is how long the reason a paste stopped stays on the bar.
-const pasteNoteTTL = 20 * time.Second
-
-// typer is the paced-typing state of a console session.
-type typer struct {
-	wmu sync.Mutex // held while a paste or a size line is being typed
-
-	mu      sync.Mutex
-	raw     bool // pastes go out unpaced
-	pasting bool
-	cancel  context.CancelFunc
-	at      int // the line a paste is on, counting from 0
+// Pacing overrides the default delays for serial links. A nil field keeps the
+// default; a pointer to zero turns that delay off.
+type Pacing struct {
+	Char, Line *time.Duration
 }
 
-func (k *consoleKeys) isPasting() bool {
-	k.ty.mu.Lock()
-	defer k.ty.mu.Unlock()
-	return k.ty.pasting
-}
-
-// paced reports whether a paste is typed paced: on a serial link, unless the
-// user switched to raw.
-func (k *consoleKeys) paced() bool {
-	k.ty.mu.Lock()
-	raw := k.ty.raw
-	k.ty.mu.Unlock()
-	return !raw && k.serial()
-}
-
-func (k *consoleKeys) serial() bool {
-	s, ok := k.cs.Link.(serialLink)
-	return ok && s.Serial()
-}
-
-// busy notes that a paste is running and reports true if so. Anything that
-// would type at the remote waits for it: keystrokes are dropped, not held,
-// because a held Enter would run half of a pasted line.
-func (k *consoleKeys) busy(what string) bool {
-	if !k.isPasting() {
-		return false
+// PacingMS is Pacing from millisecond settings, as the host config holds them.
+func PacingMS(char, line *int) Pacing {
+	ms := func(n *int) *time.Duration {
+		if n == nil {
+			return nil
+		}
+		d := time.Duration(max(0, *n)) * time.Millisecond
+		return &d
 	}
-	k.con.Note(what+" ignored: paste in progress (ctrl+] x stops it)", true)
-	return true
+	return Pacing{ms(char), ms(line)}
 }
 
-// runCtx is a context that ends when the session does.
-func (k *consoleKeys) runCtx() (context.Context, context.CancelFunc) {
+// NewTyper makes the input queue for a link: paced on a serial link, a plain
+// writer otherwise. Run it with the link's Send as the writer.
+func NewTyper(l Link, p Pacing) *typer.Typer {
+	t := &typer.Typer{CharDelay: DefaultCharDelay, LineDelay: DefaultLineDelay}
+	if p.Char != nil {
+		t.CharDelay = *p.Char
+	}
+	if p.Line != nil {
+		t.LineDelay = *p.Line
+	}
+	t.Paced = func() bool {
+		s, ok := l.(serialLink)
+		return ok && s.Serial()
+	}
+	return t
+}
+
+// pasteBytes is what a paste types: every line break is Enter (CR), Tab
+// becomes a space (a CLI takes Tab as "complete this word"), and other control
+// characters are dropped, since they would act instead of type.
+func pasteBytes(text string) []byte {
+	text = strings.NewReplacer("\r\n", "\r", "\n", "\r", "\t", " ").Replace(text)
+	return []byte(strings.Map(func(r rune) rune {
+		if r != '\r' && (r < ' ' || r == 0x7f) {
+			return -1
+		}
+		return r
+	}, text))
+}
+
+// newKeys is a consoleKeys with its typing queue made but not yet running.
+func newKeys(cs *Setup, con *console, cleanup func(), stop <-chan struct{}) *consoleKeys {
+	k := &consoleKeys{cs: cs, con: con, cleanup: cleanup, stop: stop}
+	k.ty = NewTyper(cs.Link, cs.Pacing)
+	k.ty.Progress = con.SetSend
+	return k
+}
+
+// start runs the typing queue until the session ends. tr, if not nil, records
+// the bytes it writes.
+func (k *consoleKeys) start(tr *trace) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		select {
-		case <-k.stop:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
-}
-
-// pacer builds a Pacer that types at the link, reading the echo from a tap
-// opened together with the prompt snapshot. Call untap when done.
-func (k *consoleKeys) pacer() (p *paste.Pacer, untap func()) {
-	rx, untap, cursor := k.con.Tap()
-	return &paste.Pacer{
-		Write:  k.cs.Link.Send,
-		Rx:     rx,
-		Baud:   pasteBaud,
-		Prompt: cursor,
-	}, untap
-}
-
-// pasteText handles a finished bracketed paste.
-func (k *consoleKeys) pasteText(text string) bool {
-	if k.busy("paste") {
-		return true
-	}
-	if !k.paced() {
-		k.ty.wmu.Lock()
-		defer k.ty.wmu.Unlock()
-		return k.cs.Link.Send([]byte(text)) == nil
-	}
-	lines := paste.Lines(text)
-	if len(lines) == 0 {
-		return true
-	}
-	ctx, cancel := k.runCtx()
-	k.ty.mu.Lock()
-	k.ty.pasting, k.ty.cancel, k.ty.at = true, cancel, 0
-	k.ty.mu.Unlock()
-	k.con.SetPaste(1, len(lines))
-	guard(k.cleanup, func() {
-		defer cancel()
-		k.ty.wmu.Lock()
-		defer k.ty.wmu.Unlock()
-		p, untap := k.pacer()
-		err := p.Run(ctx, lines, func(i int) {
-			k.ty.mu.Lock()
-			k.ty.at = i
-			k.ty.mu.Unlock()
-			k.con.SetPaste(i+1, len(lines))
-		})
-		untap()
-		k.pasteEnded(err, lines)
-	})
-	return true
-}
-
-// pasteEnded reports how a paste finished, on the bar and in the log.
-func (k *consoleKeys) pasteEnded(err error, lines []string) {
-	k.ty.mu.Lock()
-	at := k.ty.at
-	k.ty.pasting, k.ty.cancel = false, nil
-	k.ty.mu.Unlock()
-	k.con.SetPaste(0, 0)
-	n := len(lines)
-	var se *paste.StopError
-	var msg string
-	switch {
-	case err == nil:
-		if n == 1 && !strings.HasSuffix(lines[0], "\r") {
-			msg = "pasted 1 line, left at the prompt"
-		} else {
-			msg = fmt.Sprintf("pasted %d lines", n)
-		}
-		k.con.Note(msg, false)
-		k.con.Mark(msg)
-		return
-	case errors.As(err, &se):
-		msg = fmt.Sprintf("paste stopped at line %d of %d: %s", se.Line, n, se.Reason)
-		if se.Unentered {
-			msg += "; ctrl+u clears the line, ctrl+] w pastes raw"
-		}
-	case errors.Is(err, context.Canceled):
-		msg = fmt.Sprintf("paste cancelled at line %d of %d; a half-typed line may remain (ctrl+u clears it)", at+1, n)
-	default:
-		msg = fmt.Sprintf("paste stopped at line %d of %d: %v", at+1, n, err)
-	}
-	k.con.NoteFor(msg, true, pasteNoteTTL)
-	k.con.Mark(msg)
-}
-
-// stopPaste cancels a paste in progress.
-func (k *consoleKeys) stopPaste() {
-	k.ty.mu.Lock()
-	cancel := k.ty.cancel
-	k.ty.mu.Unlock()
-	if cancel != nil {
+		<-k.stop
 		cancel()
-	}
+	}()
+	guard(k.cleanup, func() {
+		w := writerFunc(func(b []byte) (int, error) {
+			tr.log("TX", b)
+			return len(b), k.cs.Link.Send(b)
+		})
+		if err := k.ty.Run(ctx, w); ctx.Err() == nil {
+			k.con.Note("typing stopped: "+err.Error(), true)
+		}
+	})
 }
 
-// toggleRaw switches between paced and raw paste.
-func (k *consoleKeys) toggleRaw() {
-	if !k.serial() {
-		k.con.Note("pastes are never paced here: ssh has flow control", false)
-		return
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
+
+// typeKeys queues keystrokes. ctrl+c is the exception: it jumps the queue,
+// dropping what was waiting, because nothing typed before an interrupt matters.
+func (k *consoleKeys) typeKeys(b []byte) {
+	if i := bytes.LastIndexByte(b, 0x03); i >= 0 {
+		k.ty.Urgent([]byte{0x03})
+		b = b[i+1:]
 	}
-	k.ty.mu.Lock()
-	k.ty.raw = !k.ty.raw
-	raw := k.ty.raw
-	k.ty.mu.Unlock()
-	k.con.SetRaw(raw)
-	if raw {
-		k.con.Note("raw paste on: pastes go out all at once", false)
-	} else {
-		k.con.Note("paced paste on", false)
-	}
+	k.ty.Enqueue(b)
 }
 
-// fitSize makes the remote agree with rows x cols. Where that means typing
-// stty at a serial console, the line is typed paced and echo-checked, so a
-// dropped first byte can't turn stty into tty. This goes through the pacer
-// even in raw paste mode.
+// fitSize makes the remote agree with rows x cols: where that means typing
+// stty at a serial console, it goes through the queue like anything typed.
 func (k *consoleKeys) fitSize(rows, cols int) error {
 	if sl, ok := k.cs.Link.(sizeLiner); ok {
 		if line, ok := sl.SizeLine(rows, cols); ok {
-			return k.typeLine(line + "\r")
+			k.ty.Enqueue([]byte(line + "\r"))
+			return nil
 		}
 	}
 	return k.cs.Link.FitSize(rows, cols)
 }
 
-// typeLine types one line, echo-checked, and presses Enter. It waits for a
-// paste in progress to end.
-func (k *consoleKeys) typeLine(line string) error {
-	ctx, cancel := k.runCtx()
-	defer cancel()
-	k.ty.wmu.Lock()
-	defer k.ty.wmu.Unlock()
-	p, untap := k.pacer()
-	defer untap()
-	return p.Type(ctx, line)
+// sizeError is the bar text for a size that didn't go out.
+func sizeError(err error) string { return "size: " + err.Error() }
+
+// sendLabel is the bar text for a queue being sent: "1.2k/4k" of bytes sent.
+func sendLabel(sent, total int) string { return kilo(sent) + "/" + kilo(total) }
+
+func kilo(n int) string {
+	if n < 1000 {
+		return fmt.Sprint(n)
+	}
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", float64(n)/1000), ".0") + "k"
 }
 
-// sizeError is the bar text for a size line that didn't go out.
-func sizeError(err error) string {
-	var se *paste.StopError
-	if errors.As(err, &se) {
-		return "size not sent: " + se.Reason + "; ctrl+u clears the line"
+// sendShowMin is how much must be queued before the bar shows the progress:
+// a line of typing is out in a moment and needs no meter.
+const sendShowMin = 64
+
+// trace is the opt-in byte trace, OOB_DEBUG_PASTE=<file>: every byte the
+// queue writes (TX) and every byte the remote sends (RX), with the time. It
+// holds everything typed, passwords included, so it is only for diagnosis.
+type trace struct {
+	mu sync.Mutex
+	w  io.WriteCloser
+	t0 time.Time
+}
+
+// openTrace opens the trace file named by OOB_DEBUG_PASTE (mode 0600, even if
+// it existed). It returns nil, which logs nothing, if the variable is unset.
+func openTrace() (*trace, error) {
+	path := os.Getenv("OOB_DEBUG_PASTE")
+	if path == "" {
+		return nil, nil
 	}
-	return "size: " + err.Error()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("OOB_DEBUG_PASTE: %w", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("OOB_DEBUG_PASTE: %w", err)
+	}
+	return &trace{w: f, t0: time.Now()}, nil
+}
+
+func (t *trace) close() {
+	if t != nil {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.w.Close()
+	}
+}
+
+func (t *trace) log(dir string, b []byte) {
+	if t == nil || len(b) == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	fmt.Fprintf(t.w, "%.6f %s %q\n", time.Since(t.t0).Seconds(), dir, b)
 }

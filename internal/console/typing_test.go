@@ -1,0 +1,538 @@
+package console
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// All the timing here is virtual: the typing queue's Wait is replaced by one
+// that advances a clock and returns at once, so nothing sleeps.
+
+// serialDev is a fake serial console behind a Link. Like a real BMC it has a
+// small input FIFO that drains slowly, and while it runs a line it takes
+// nothing; bytes arriving into a full FIFO are lost. It keeps the line being
+// typed and the lines it ran.
+type serialDev struct {
+	mu      sync.Mutex
+	now     time.Duration // virtual time, advanced by wait
+	free    time.Duration // when the device can take its next byte
+	fifo    []byte
+	cap     int
+	drain   time.Duration // time to take one byte out of the FIFO
+	busy    time.Duration // time to run a line after Enter
+	dropped int
+	sends   int
+	sent    []byte
+	buf     string
+	applied []string
+	fits    [][2]int
+	serial  bool
+	size    bool // has a size line (stty), not a window change
+	note    chan struct{}
+}
+
+func newSerialDev() *serialDev {
+	return &serialDev{cap: 16, drain: 8 * time.Millisecond, busy: 150 * time.Millisecond, serial: true, size: true, note: make(chan struct{}, 1)}
+}
+
+// advance lets the device take what it can by time to.
+func (d *serialDev) advance(to time.Duration) {
+	for len(d.fifo) > 0 && d.free <= to {
+		c := d.fifo[0]
+		d.fifo = d.fifo[1:]
+		d.free += d.drain
+		if c == '\r' {
+			d.applied = append(d.applied, d.buf)
+			d.buf = ""
+			d.free += d.busy
+		} else {
+			d.buf += string(rune(c))
+		}
+	}
+}
+
+func (d *serialDev) Send(b []byte) error {
+	d.mu.Lock()
+	d.advance(d.now)
+	if len(d.fifo) == 0 && d.free < d.now {
+		d.free = d.now
+	}
+	d.sends++
+	d.sent = append(d.sent, b...)
+	for _, c := range b {
+		if len(d.fifo) >= d.cap {
+			d.dropped++
+			continue
+		}
+		d.fifo = append(d.fifo, c)
+	}
+	d.mu.Unlock()
+	select {
+	case d.note <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (d *serialDev) wait(dd time.Duration) <-chan time.Time {
+	d.mu.Lock()
+	d.now += dd
+	d.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	ch <- time.Time{}
+	return ch
+}
+
+// waitSent blocks until n bytes have been sent, then lets the device finish.
+func (d *serialDev) waitSent(t *testing.T, n int) {
+	t.Helper()
+	for {
+		d.mu.Lock()
+		got := len(d.sent)
+		d.mu.Unlock()
+		if got >= n {
+			break
+		}
+		select {
+		case <-d.note:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d bytes were sent", got, n)
+		}
+	}
+	d.mu.Lock()
+	d.advance(d.now + time.Hour)
+	d.mu.Unlock()
+}
+
+func (d *serialDev) lines() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.applied...)
+}
+
+func (d *serialDev) Break() error          { return nil }
+func (d *serialDev) Disconnect() error     { return nil }
+func (d *serialDev) Resize(r, c int) error { return nil }
+func (d *serialDev) FitSize(r, c int) error {
+	d.mu.Lock()
+	d.fits = append(d.fits, [2]int{r, c})
+	d.mu.Unlock()
+	return nil
+}
+func (d *serialDev) SizeIsFree() bool { return false }
+func (d *serialDev) Serial() bool     { return d.serial }
+func (d *serialDev) SizeLine(r, c int) (string, bool) {
+	return fmt.Sprintf("stty rows %d cols %d", r, c), d.size
+}
+
+// plainLink is a link that is not serial and has no size line: a plain ssh
+// session. It records what it was sent and tells when something arrives.
+type plainLink struct {
+	fakeLink
+	sends int
+	note  chan struct{}
+}
+
+func (p *plainLink) Send(b []byte) error {
+	p.mu.Lock()
+	p.sends++
+	p.mu.Unlock()
+	err := p.fakeLink.Send(b)
+	if p.note != nil {
+		select {
+		case p.note <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
+
+func (p *plainLink) waitSent(t *testing.T, n int) {
+	t.Helper()
+	for {
+		p.mu.Lock()
+		got := len(p.sent)
+		p.mu.Unlock()
+		if got >= n {
+			return
+		}
+		select {
+		case <-p.note:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d bytes were sent", got, n)
+		}
+	}
+}
+
+// outLocked makes the console's output buffer safe to read while the console
+// writes it.
+type outLocked struct {
+	mu sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (o *outLocked) Write(b []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.w.Write(b)
+}
+
+// rig is a console and key handler on a link, with the typing queue running.
+type rig struct {
+	k   *consoleKeys
+	con *console
+}
+
+func newRig(t *testing.T, l Link, p Pacing, wait func(time.Duration) <-chan time.Time) *rig {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&outLocked{w: &out}, "node01", "sol", 24, 80)
+	con.Start()
+	stop := make(chan struct{})
+	k := newKeys(&Setup{Link: l, Pacing: p}, con, func() {}, stop)
+	if wait != nil {
+		k.ty.Wait = wait
+	}
+	k.start(nil)
+	t.Cleanup(func() { close(stop); con.Close() })
+	return &rig{k, con}
+}
+
+func (r *rig) paste(text string) { r.k.Input([]byte(pasteStart + text + pasteEnd)) }
+
+func (r *rig) state() barState {
+	r.con.mu.Lock()
+	defer r.con.mu.Unlock()
+	return r.con.st
+}
+
+var pasteLines = []string{
+	"interface bond0 description uplink-to-switch-a",
+	"ip link set dev bond0 mtu 9000 up",
+	"echo configured the second interface fully",
+	"systemctl restart NetworkManager-wait-online",
+	"ls",
+	"cat /etc/os-release | grep -i pretty_name",
+}
+
+func TestPasteArrivesIntactOnASerialDeviceAtTheDefaults(t *testing.T) {
+	d := newSerialDev()
+	r := newRig(t, d, Pacing{}, d.wait)
+	text := strings.Join(pasteLines, "\n") + "\n"
+	r.paste(text)
+	d.waitSent(t, len(text))
+	if got := d.lines(); strings.Join(got, "|") != strings.Join(pasteLines, "|") {
+		t.Errorf("device ran:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(pasteLines, "\n  "))
+	}
+	if d.dropped != 0 {
+		t.Errorf("dropped %d bytes", d.dropped)
+	}
+}
+
+func TestTheSameDeviceLosesAnUnpacedPaste(t *testing.T) {
+	zero := time.Duration(0)
+	d := newSerialDev()
+	r := newRig(t, d, Pacing{Char: &zero, Line: &zero}, d.wait)
+	text := strings.Join(pasteLines, "\n") + "\n"
+	r.paste(text)
+	d.waitSent(t, len(text))
+	if d.dropped == 0 {
+		t.Error("an unpaced paste did not overrun the model device, so the intact test above proves nothing")
+	}
+}
+
+func TestKeysAndPastesKeepTheirOrder(t *testing.T) {
+	d := newSerialDev()
+	r := newRig(t, d, Pacing{}, d.wait)
+	r.k.Input([]byte("ab" + pasteStart + "cd\n" + pasteEnd + "ef" + pasteStart + "gh" + pasteEnd + "\r"))
+	d.waitSent(t, len("abcd\refgh\r"))
+	if got := strings.Join(d.lines(), "|"); got != "abcd|efgh" {
+		t.Errorf("device ran %q, want abcd|efgh (typing order)", got)
+	}
+}
+
+func TestPlainSSHIsNotDelayed(t *testing.T) {
+	pl := &plainLink{note: make(chan struct{}, 1)}
+	waits := 0
+	r := newRig(t, pl, Pacing{}, func(time.Duration) <-chan time.Time { waits++; return nil })
+	text := strings.Join(pasteLines, "\r") + "\r"
+	r.paste(text)
+	pl.waitSent(t, len(text))
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	if pl.sends != 1 || string(pl.sent) != text || waits != 0 {
+		t.Errorf("%d sends and %d waits, sent %q; want the paste in one write, as typed", pl.sends, waits, pl.sent)
+	}
+}
+
+func TestSerialLinkAtTheBMCPromptIsNotDelayed(t *testing.T) {
+	d := newSerialDev()
+	d.serial = false // the BMC's own CLI over ssh
+	r := newRig(t, d, Pacing{}, d.wait)
+	r.paste("ls\runtime\r")
+	d.waitSent(t, 10)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.sends != 1 || d.now != 0 {
+		t.Errorf("sends = %d, virtual time %v; want one write and no delay", d.sends, d.now)
+	}
+}
+
+func TestSizeKeyTypesSttyThroughTheQueue(t *testing.T) {
+	d := newSerialDev()
+	r := newRig(t, d, Pacing{}, d.wait)
+	r.k.Input([]byte(string(rune(escapeByte)) + "s"))
+	d.waitSent(t, len("stty rows 23 cols 80\r"))
+	if got := d.lines(); len(got) != 1 || got[0] != "stty rows 23 cols 80" {
+		t.Errorf("device ran %q", got)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.fits) != 0 {
+		t.Error("FitSize was called; the console should type the line itself")
+	}
+	if d.sends != len("stty rows 23 cols 80\r") {
+		t.Errorf("%d writes, want one byte at a time", d.sends)
+	}
+}
+
+func TestSizeWithoutASizeLineUsesFitSize(t *testing.T) {
+	d := newSerialDev()
+	d.size = false // a window change over ssh types nothing
+	r := newRig(t, d, Pacing{}, d.wait)
+	r.k.Input([]byte(string(rune(escapeByte)) + "s"))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.fits) != 1 || len(d.sent) != 0 {
+		t.Errorf("fits %v, sent %q", d.fits, d.sent)
+	}
+}
+
+// gated is a link whose delays end only when the test says so, to stop a paste
+// part way through.
+type gated struct {
+	fakeLink
+	waits  chan chan time.Time
+	wrote  chan struct{}
+	serial bool
+}
+
+func newGated() *gated {
+	return &gated{waits: make(chan chan time.Time, 4096), wrote: make(chan struct{}, 4096), serial: true}
+}
+
+func (g *gated) Serial() bool { return g.serial }
+
+func (g *gated) Send(b []byte) error {
+	err := g.fakeLink.Send(b)
+	g.wrote <- struct{}{}
+	return err
+}
+
+func (g *gated) wait(time.Duration) <-chan time.Time {
+	ch := make(chan time.Time, 1)
+	g.waits <- ch
+	return ch
+}
+
+// held waits until the typing queue is inside a delay: its last write is done
+// and the bar has been told.
+func (g *gated) held(t *testing.T) chan time.Time {
+	t.Helper()
+	select {
+	case ch := <-g.waits:
+		return ch
+	case <-time.After(10 * time.Second):
+		t.Fatal("the queue is not in a delay")
+		return nil
+	}
+}
+
+func (g *gated) text() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return string(g.sent)
+}
+
+func TestCtrlXClearsTheQueue(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	big := strings.Repeat("0123456789", 20) // 200 bytes
+	r.paste(big)
+	g.held(t)
+	if r.state().sending == "" || r.con.Pending() != 199 {
+		t.Fatalf("sending %q, pending %d; want progress on the bar", r.state().sending, r.con.Pending())
+	}
+	r.k.Input([]byte(string(rune(escapeByte)) + "x"))
+	if r.con.Pending() != 0 || r.state().sending != "" {
+		t.Errorf("pending %d, sending %q after ctrl+] x", r.con.Pending(), r.state().sending)
+	}
+	if n := r.state().note; !strings.Contains(n, "cleared") {
+		t.Errorf("note = %q", n)
+	}
+	if got := g.text(); got != "0" {
+		t.Errorf("sent %q, want only the byte already out", got)
+	}
+}
+
+func TestCtrlCJumpsTheQueue(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	r.paste(strings.Repeat("x", 100))
+	g.held(t)
+	r.k.Input([]byte{0x03}) // the delay hasn't ended, and ctrl+c still goes out
+	<-g.wrote
+	<-g.wrote
+	if got := g.text(); got != "x\x03" {
+		t.Errorf("sent %q, want x then ctrl+c", got)
+	}
+	if r.con.Pending() != 0 {
+		t.Errorf("pending %d, want the queue dropped", r.con.Pending())
+	}
+}
+
+func TestChordWritesDropTheQueueFirst(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	r.paste(strings.Repeat("x", 100))
+	delay := g.held(t)
+	r.k.Input([]byte(string(rune(escapeByte)) + "b"))
+	if g.breaks != 1 || r.con.Pending() != 0 {
+		t.Errorf("breaks %d, pending %d; want the BREAK sent with the queue dropped", g.breaks, r.con.Pending())
+	}
+	delay <- time.Time{}
+	r.paste(strings.Repeat("y", 100))
+	g.held(t)
+	r.k.Input([]byte(string(rune(escapeByte)) + "]"))
+	<-g.wrote
+	<-g.wrote
+	<-g.wrote
+	if got := g.text(); got != "xy\x1d" {
+		t.Errorf("sent %q, want the literal ctrl+] out at once after the queue was dropped", got)
+	}
+}
+
+func TestPasteMarkersAreNotForwardedAndPasteIsNormalised(t *testing.T) {
+	pl := &plainLink{note: make(chan struct{}, 1)}
+	r := newRig(t, pl, Pacing{}, nil)
+	r.paste("a\tb\r\nc\nd\x1b[31m\x00e")
+	want := "a b\rc\rd[31me"
+	pl.waitSent(t, len(want))
+	if got := string(pl.sent); got != want {
+		t.Errorf("sent %q, want %q", got, want)
+	}
+}
+
+func TestSendLabelAndBarThreshold(t *testing.T) {
+	for _, c := range []struct {
+		sent, total int
+		want        string
+	}{{35, 100, "35/100"}, {1200, 4000, "1.2k/4k"}, {0, 1000, "0/1k"}, {999, 12500, "999/12.5k"}} {
+		if got := sendLabel(c.sent, c.total); got != c.want {
+			t.Errorf("sendLabel(%d,%d) = %q, want %q", c.sent, c.total, got, c.want)
+		}
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&outLocked{w: &out}, "node01", "sol", 24, 80)
+	bar := func() string {
+		con.mu.Lock()
+		defer con.mu.Unlock()
+		return plain(barLine(con.st, 100))
+	}
+	con.SetSend(sendShowMin, 70)
+	if strings.Contains(bar(), "sending") {
+		t.Errorf("bar shows a meter for %d bytes: %q", sendShowMin, bar())
+	}
+	con.SetSend(sendShowMin+1, 4000)
+	if b := bar(); !strings.Contains(b, "sending 3.9k/4k") || !strings.Contains(b, "x clears") {
+		t.Errorf("bar = %q", b)
+	}
+	con.SetSend(0, 0)
+	if strings.Contains(bar(), "sending") {
+		t.Error("meter still on the bar after the queue emptied")
+	}
+	st := barState{host: "node01", kind: "sol", mode: modeCommand}
+	if got := plain(barLine(st, 200)); strings.Contains(got, "clear queue") || strings.Contains(got, "raw paste") {
+		t.Errorf("command bar = %q, want no clear queue hint while idle and no raw paste", got)
+	}
+	st.sending = "1/2k"
+	if got := plain(barLine(st, 200)); !strings.Contains(got, "x clear queue") {
+		t.Errorf("command bar = %q, want the clear queue hint while sending", got)
+	}
+}
+
+func TestNewTyperDefaultsAndOverrides(t *testing.T) {
+	if ty := NewTyper(&fakeLink{}, Pacing{}); ty.CharDelay != DefaultCharDelay || ty.LineDelay != DefaultLineDelay {
+		t.Errorf("defaults = %v, %v", ty.CharDelay, ty.LineDelay)
+	}
+	ty := NewTyper(newSerialDev(), PacingMS(intp(20), intp(0)))
+	if ty.CharDelay != 20*time.Millisecond || ty.LineDelay != 0 {
+		t.Errorf("overrides = %v, %v", ty.CharDelay, ty.LineDelay)
+	}
+	if !ty.Paced() {
+		t.Error("a serial link is paced")
+	}
+	if NewTyper(&fakeLink{}, Pacing{}).Paced() {
+		t.Error("a link with no Serial is never paced")
+	}
+	if p := PacingMS(nil, nil); p.Char != nil || p.Line != nil {
+		t.Error("unset stays unset")
+	}
+}
+
+func intp(n int) *int { return &n }
+
+func TestOversizedPasteIsRejectedWhole(t *testing.T) {
+	pl := &plainLink{note: make(chan struct{}, 1)}
+	r := newRig(t, pl, Pacing{}, nil)
+	big := strings.Repeat("x", pasteMax+1)
+	// Arrive in several reads, with typing before and after.
+	r.k.Input([]byte("a" + pasteStart + big[:pasteMax/2]))
+	r.k.Input([]byte(big[pasteMax/2:] + "\r"))
+	r.k.Input([]byte(pasteEnd + "z"))
+	pl.waitSent(t, 2)
+	pl.mu.Lock()
+	sent := string(pl.sent)
+	pl.mu.Unlock()
+	if sent != "az" {
+		t.Errorf("sent %d bytes (%.20q...), want only the typed a and z", len(sent), sent)
+	}
+	if st := r.state(); !st.noteErr || !strings.Contains(st.note, "paste not sent") {
+		t.Errorf("note = %q (err %v), want a paste not sent error", st.note, st.noteErr)
+	}
+}
+
+func TestTraceLogsBothWaysAndFixesTheMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OOB_DEBUG_PASTE", path)
+	tr, err := openTrace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.log("TX", []byte("ls\r"))
+	tr.log("RX", []byte("ls\r\n"))
+	tr.close()
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 3 || lines[0] != "old" || !strings.Contains(lines[1], ` TX "ls\r"`) || !strings.Contains(lines[2], ` RX "ls\r\n"`) {
+		t.Errorf("trace = %q", b)
+	}
+	if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", st.Mode().Perm())
+	}
+	t.Setenv("OOB_DEBUG_PASTE", "")
+	if tr, err := openTrace(); tr != nil || err != nil {
+		t.Errorf("unset: %v, %v; want no trace", tr, err)
+	}
+}

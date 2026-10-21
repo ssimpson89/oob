@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ssimpson89/oob/internal/typer"
 	"golang.org/x/term"
 )
 
@@ -65,6 +66,8 @@ type Setup struct {
 	// NoToggle is the bar note for the c key when link can't toggle; empty
 	// means the IPMI SOL text.
 	NoToggle string
+	// Pacing overrides the typing delays on serial links.
+	Pacing Pacing
 }
 
 // UseBar reports whether the bottom bar can run: stdin and stdout must both be
@@ -125,6 +128,11 @@ func Run(cs Setup) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	tr, err := openTrace()
+	if err != nil {
+		return 1, err
+	}
+	defer tr.close()
 	con := newConsole(os.Stdout, cs.Host, cs.Kind, h, w)
 	var once sync.Once
 	var logs []string
@@ -159,6 +167,7 @@ func Run(cs Setup) (int, error) {
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := cs.Out.Read(buf)
+			tr.log("RX", buf[:n])
 			con.Output(buf[:n])
 			if o, ok := cs.Link.(observer); ok && n > 0 {
 				if kind, at, changed := o.Observe(buf[:n]); changed {
@@ -171,7 +180,9 @@ func Run(cs Setup) (int, error) {
 		}
 	})
 
-	keys := &consoleKeys{cs: &cs, con: con, cleanup: cleanup, stop: stop, auto: auto}
+	keys := newKeys(&cs, con, cleanup, stop)
+	keys.auto = auto
+	keys.start(tr)
 
 	// Window changes: follow the size at once, type stty only if asked.
 	winch := make(chan os.Signal, 1)
@@ -278,7 +289,7 @@ type consoleKeys struct {
 	autoMu sync.Mutex // guards auto
 	auto   bool
 
-	ty typer // paced paste and size typing
+	ty *typer.Typer // everything typed or pasted goes through it, in order
 }
 
 func (k *consoleKeys) autoOn() bool {
@@ -306,9 +317,8 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 		return false
 	default:
 	}
-	// Bytes typed before each paste go out before that paste starts, so the
-	// remote sees keys and pastes in the order they came. A paste that runs
-	// paced makes later keys and pastes in this read get dropped by busy.
+	// Keys typed before each paste are queued before it, so the remote sees
+	// keys and pastes in the order they came.
 	pos := len(fwd)
 	for _, a := range acts {
 		if a.act == actPaste || a.act == actPasteTooBig {
@@ -316,66 +326,51 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 			break
 		}
 	}
-	if !k.send(fwd[:pos]) {
-		return false
-	}
+	k.typeKeys(fwd[:pos])
 	k.con.SetMode(k.parser.Mode())
 	for _, a := range acts {
 		if a.act == actPaste || a.act == actPasteTooBig {
-			if a.at > pos && !k.send(fwd[pos:a.at]) {
-				return false
+			if a.at > pos {
+				k.typeKeys(fwd[pos:a.at])
 			}
 			pos = max(pos, a.at)
 		}
-		if !k.do(a) {
-			return false
-		}
+		k.do(a)
 	}
-	return k.send(fwd[pos:])
+	k.typeKeys(fwd[pos:])
+	return true
 }
 
-// send types keystrokes at the remote. During a paste they are dropped with a
-// note on the bar; waiting for a size line to finish is fine. It reports false
-// if the link refused the bytes.
-func (k *consoleKeys) send(b []byte) bool {
-	if len(b) == 0 {
-		return true
-	}
-	if k.busy("typing") {
-		return true
-	}
-	k.ty.wmu.Lock()
-	defer k.ty.wmu.Unlock()
-	return k.cs.Link.Send(b) == nil
-}
-
-// do carries out one action. It reports false if the link refused a paste.
-func (k *consoleKeys) do(a action) bool {
+// do carries out one action. Anything that writes to the remote outside the
+// queue (BREAK, the disconnect sequence, the BMC prompt switch) clears the
+// queue first, so no half-typed paste follows it.
+func (k *consoleKeys) do(a action) {
 	cs, con := k.cs, k.con
 	rows, cols := con.Size()
 	switch a.act {
 	case actPaste:
-		return k.pasteText(a.text)
+		b := pasteBytes(a.text)
+		k.ty.Enqueue(b)
+		con.Mark(fmt.Sprintf("pasted %d bytes", len(b)))
 	case actPasteTooBig:
 		con.Note(fmt.Sprintf("paste not sent: over %d MiB", pasteMax>>20), true)
 	case actStop:
-		k.stopPaste()
-	case actRaw:
-		k.toggleRaw()
-	case actSize:
-		if k.busy("size") {
-			return true
+		if con.Pending() > 0 {
+			k.ty.Clear()
+			con.Note("typing queue cleared", false)
+			con.Mark("typing queue cleared")
 		}
+	case actSize:
 		if err := k.fitSize(RemoteRows(rows), cols); err != nil {
 			con.Note(sizeError(err), true)
-			return true
+			return
 		}
 		con.Note(fmt.Sprintf("sent size %dx%d", RemoteRows(rows), cols), false)
 		con.Mark(fmt.Sprintf("size sent: %d rows, %d cols", RemoteRows(rows), cols))
 	case actAuto:
 		if cs.Link.SizeIsFree() {
 			con.Note("ssh follows the window size automatically", false)
-			return true
+			return
 		}
 		k.autoMu.Lock()
 		k.auto = !k.auto
@@ -390,31 +385,24 @@ func (k *consoleKeys) do(a action) bool {
 	case actLog:
 		con.ToggleLog()
 	case actBreak:
-		if k.busy("key") {
-			return true
-		}
+		k.ty.Clear()
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
-			return true
+			return
 		}
 		con.Note("BREAK sent", false)
 		con.Mark("BREAK sent")
 	case actSysrq:
-		if k.busy("key") {
-			return true
-		}
+		k.ty.Clear()
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
-			return true
+			return
 		}
 		time.Sleep(sysrqGap)
-		_ = cs.Link.Send([]byte{a.arg})
+		k.ty.Urgent([]byte{a.arg})
 		con.Note("SysRq "+string(a.arg)+" sent", false)
 		con.Mark("SysRq " + string(a.arg) + " sent")
 	case actBMC:
-		if k.busy("key") {
-			return true
-		}
 		t, ok := cs.Link.(toggler)
 		if !ok {
 			msg := cs.NoToggle
@@ -422,24 +410,22 @@ func (k *consoleKeys) do(a action) bool {
 				msg = "no BMC prompt on IPMI SOL"
 			}
 			con.Note(msg, false)
-			return true
+			return
 		}
+		k.ty.Clear()
 		kind, at, err := t.Toggle()
 		con.SetKind(kind, at)
 		if err != nil {
 			con.Note("bmc prompt: "+err.Error(), true)
-			return true
+			return
 		}
 		con.Note("now at "+kind, false)
 		con.Mark("switched to " + kind)
 	case actLiteral:
-		if k.busy("key") {
-			return true
-		}
-		_ = cs.Link.Send([]byte{escapeByte})
+		k.ty.Urgent([]byte{escapeByte})
 	case actPower:
 		if cs.Power == nil {
-			return true
+			return
 		}
 		con.Note("power cycling...", false)
 		con.Mark("power cycle requested")
@@ -456,11 +442,11 @@ func (k *consoleKeys) do(a action) bool {
 		})
 	case actDisconnect:
 		con.Mark("disconnect")
+		k.ty.Clear()
 		_ = cs.Link.Disconnect()
 	case actHelp:
 		con.Print(helpText())
 	}
-	return true
 }
 
 // RestoreOnSignal restores the terminal and exits with 128+signal if one of sigs

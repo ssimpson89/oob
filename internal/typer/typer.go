@@ -1,0 +1,219 @@
+// Package typer is a paced input queue for slow serial links. Everything a
+// user types or pastes goes through one queue and comes out one byte at a time
+// with a short gap, a longer one after Enter, so a BMC's small input buffer
+// never overruns and what was typed is what arrives.
+package typer
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+)
+
+// Typer paces bytes into a writer. Set the fields, then call Run in a
+// goroutine; Enqueue, Urgent and Clear are safe to call from any other. The
+// queue lives inside Run and is touched by nothing else.
+type Typer struct {
+	// CharDelay is the gap after each byte, LineDelay the gap after CR or LF
+	// (the remote may be busy running the line). The first byte of an idle
+	// queue goes out at once; delays only separate bytes. Both zero makes
+	// Typer a plain writer.
+	CharDelay, LineDelay time.Duration
+	// Paced, if set, is asked before each byte; while it says false the
+	// delays are zero. A console that can move between a serial line and an
+	// ssh prompt uses this.
+	Paced func() bool
+	// Wait returns a channel that fires after d. It defaults to time.After;
+	// tests inject one that fires at once.
+	Wait func(d time.Duration) <-chan time.Time
+	// Progress, if set, is told how many bytes are still queued and how many
+	// the current burst held in all. It runs in Run's goroutine, so it must
+	// not block, and not call back into the Typer.
+	Progress func(pending, total int)
+
+	once    sync.Once
+	in      chan item
+	urgent  chan []byte
+	clear   chan chan struct{}
+	stopped chan struct{}
+}
+
+type item struct {
+	b    []byte
+	done chan struct{}
+}
+
+type waiter struct {
+	upto int // closed once this many bytes have been written or dropped
+	done chan struct{}
+}
+
+func (t *Typer) init() {
+	t.once.Do(func() {
+		t.in = make(chan item)
+		t.urgent = make(chan []byte)
+		t.clear = make(chan chan struct{})
+		t.stopped = make(chan struct{})
+	})
+}
+
+// Enqueue queues b behind everything already queued. The returned channel
+// closes once b has been written, or dropped by Clear, Urgent or the end of
+// Run, so a caller can wait for its text to be out.
+func (t *Typer) Enqueue(b []byte) <-chan struct{} {
+	t.init()
+	done := make(chan struct{})
+	if len(b) == 0 {
+		close(done)
+		return done
+	}
+	select {
+	case t.in <- item{b, done}:
+	case <-t.stopped:
+		close(done)
+	}
+	return done
+}
+
+// Urgent drops everything queued and writes b now, for ctrl+c and the like:
+// whatever was waiting is stale once the user has interrupted.
+func (t *Typer) Urgent(b []byte) {
+	t.init()
+	if len(b) == 0 {
+		return
+	}
+	select {
+	case t.urgent <- append([]byte(nil), b...):
+	case <-t.stopped:
+	}
+}
+
+// Clear drops everything queued, and returns once that is done: nothing
+// dropped is written after it, and Progress has been told.
+func (t *Typer) Clear() {
+	t.init()
+	ack := make(chan struct{})
+	select {
+	case t.clear <- ack:
+		<-ack
+	case <-t.stopped:
+	}
+}
+
+// Run writes queued bytes to w until ctx ends or a write fails, and returns
+// that error. Whatever is queued then is dropped, and later calls do nothing.
+func (t *Typer) Run(ctx context.Context, w io.Writer) error {
+	t.init()
+	wait := t.Wait
+	if wait == nil {
+		wait = time.After
+	}
+	var (
+		q       []byte
+		waiters []waiter
+		sent    int              // bytes written or dropped, ever
+		total   int              // bytes in the current burst
+		hold    <-chan time.Time // the gap after the last byte, while it runs
+	)
+	paced := func() bool {
+		return (t.CharDelay > 0 || t.LineDelay > 0) && (t.Paced == nil || t.Paced())
+	}
+	progress := func() { // an unpaced write is over before anyone could see it
+		if t.Progress != nil && (len(q) == 0 || paced()) {
+			t.Progress(len(q), total)
+		}
+	}
+	release := func(upto int) { // close the waiters whose bytes are all accounted for
+		n := 0
+		for _, wt := range waiters {
+			if wt.upto > upto {
+				break
+			}
+			close(wt.done)
+			n++
+		}
+		waiters = waiters[n:]
+	}
+	drop := func() {
+		sent += len(q)
+		q, total = q[:0], 0
+		release(sent)
+		progress()
+	}
+	defer func() {
+		close(t.stopped)
+		drop()
+	}()
+	gap := func(last byte, next []byte) time.Duration {
+		if !paced() {
+			return 0
+		}
+		if last == '\r' && len(next) > 0 && next[0] == '\n' {
+			return t.CharDelay // CRLF is one Enter
+		}
+		if last == '\r' || last == '\n' {
+			return t.LineDelay
+		}
+		return t.CharDelay
+	}
+	write := func(b []byte) error {
+		if _, err := w.Write(b); err != nil {
+			return fmt.Errorf("typer: %w", err)
+		}
+		return nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(q) > 0 && hold == nil {
+			n := 1
+			if !paced() {
+				n = len(q) // one write, as a plain writer would
+			}
+			chunk := q[:n]
+			if err := write(chunk); err != nil {
+				return err
+			}
+			last := chunk[n-1]
+			q = q[n:]
+			sent += n
+			release(sent)
+			if len(q) == 0 {
+				total = 0
+			}
+			progress()
+			if d := gap(last, q); d > 0 {
+				hold = wait(d)
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case it := <-t.in:
+			if len(q) == 0 {
+				total = 0
+			}
+			q = append(q, it.b...)
+			total += len(it.b)
+			waiters = append(waiters, waiter{sent + len(q), it.done})
+			progress()
+		case b := <-t.urgent:
+			drop()
+			if err := write(b); err != nil {
+				return err
+			}
+			if d := gap(b[len(b)-1], nil); d > 0 {
+				hold = wait(d)
+			}
+		case ack := <-t.clear:
+			drop()
+			close(ack)
+		case <-hold:
+			hold = nil
+		}
+	}
+}

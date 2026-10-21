@@ -56,8 +56,8 @@ func (s *solLink) FitSize(rows, cols int) error {
 	return s.Send([]byte(line + "\r"))
 }
 
-// SizeLine is the command FitSize types. The console types it paced and
-// echo-checked instead of calling FitSize.
+// SizeLine is the command FitSize types. The console sends it through its
+// typing queue instead of calling FitSize.
 func (s *solLink) SizeLine(rows, cols int) (string, bool) {
 	return sttyLine(rows, cols), true
 }
@@ -137,11 +137,12 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	}()
 	tail := &tailBuf{}
 	return &ConsoleTransport{
-		Kind: "sol",
-		Link: &solLink{ptmx: ptmx, cmd: cmd},
-		Out:  io.TeeReader(ptmx, tail),
-		Done: done,
-		Tail: tail.String,
+		Kind:   "sol",
+		Pacing: console.PacingMS(h.CharDelayMS, h.LineDelayMS),
+		Link:   &solLink{ptmx: ptmx, cmd: cmd},
+		Out:    io.TeeReader(ptmx, tail),
+		Done:   done,
+		Tail:   tail.String,
 		Close: func() {
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
@@ -181,6 +182,7 @@ func solConsole(h config.Host, name string, power func() (string, error)) (int, 
 		Out:        tr.Out,
 		Done:       tr.Done,
 		Power:      power,
+		Pacing:     tr.Pacing,
 		Connecting: "connecting to " + name + " via IPMI...",
 	})
 	// The terminal is restored now. Repeat any ipmitool error below the bar's
