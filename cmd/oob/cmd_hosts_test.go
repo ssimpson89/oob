@@ -341,3 +341,73 @@ func TestAddKeyFlagMergeSemantics(t *testing.T) {
 		t.Fatalf("key not cleared: %+v", h)
 	}
 }
+
+func TestEditHostFields(t *testing.T) {
+	cfg := tmpCfg(t)
+	if _, _, err := runOob(t, cfg, "", "add", "node01", "192.0.2.10", "--user", "admin", "--pass", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := runOob(t, cfg, "", "edit", "node01", "--note", "rack 4")
+	if err != nil || !strings.Contains(out, "updated node01 (notes)") {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	out, _, err = runOob(t, cfg, "", "edit", "node01", "--ip", "192.0.2.20", "--notes", "moved")
+	if err != nil || !strings.Contains(out, "updated node01 (ip, notes)") {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	h := mustLoad(t, cfg).Hosts["node01"]
+	if h.Notes != "moved" || h.IP != "192.0.2.20" || h.User != "admin" || h.Pass != "secret" {
+		t.Fatalf("edit clobbered fields: %+v", h)
+	}
+	// edit never creates a host, so a typo can't add a stray entry.
+	if _, _, err := runOob(t, cfg, "", "edit", "nod01", "--note", "x"); err == nil || !strings.Contains(err.Error(), "no such host") {
+		t.Fatalf("edit of a missing host: %v", err)
+	}
+	if _, ok := mustLoad(t, cfg).Hosts["nod01"]; ok {
+		t.Fatal("edit created a host")
+	}
+	// Field flags without a name are an error, not an editor launch.
+	if _, _, err := runOob(t, cfg, "", "edit", "--note", "x"); err == nil || !strings.Contains(err.Error(), "need a host name") {
+		t.Fatalf("edit without name: %v", err)
+	}
+}
+
+func TestHelpGroups(t *testing.T) {
+	root := newRoot()
+	for _, c := range root.Commands() {
+		if c.GroupID == "" {
+			t.Errorf("command %q has no help group", c.Name())
+		}
+	}
+}
+
+func TestEmptyAddressRejected(t *testing.T) {
+	cfg := tmpCfg(t)
+	if _, _, err := runOob(t, cfg, "", "add", "node01", "192.0.2.10", "--user", "admin", "--pass", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"edit", "node01", "--ip", ""},
+		{"add", "node01", "", "--pass", "x"},
+	} {
+		if _, _, err := runOob(t, cfg, "", args...); err == nil {
+			t.Errorf("%v: want an error for an empty address", args)
+		}
+	}
+	if h := mustLoad(t, cfg).Hosts["node01"]; h.IP != "192.0.2.10" || h.Pass != "secret" {
+		t.Fatalf("host changed: %+v", h)
+	}
+}
+
+func TestEditWithGlobalFlagsOpensEditor(t *testing.T) {
+	cfg := tmpCfg(t)
+	if _, _, err := runOob(t, cfg, "", "add", "node01", "192.0.2.10", "--user", "admin", "--pass", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	// runOob always passes -c; with -y too, plain edit must still reach the
+	// editor (here `true`, which exits 0) rather than demand a host name.
+	t.Setenv("VISUAL", "true")
+	if _, _, err := runOob(t, cfg, "", "-y", "edit"); err != nil {
+		t.Fatalf("edit with -c/-y: %v", err)
+	}
+}

@@ -245,6 +245,7 @@ func newRoot() *cobra.Command {
 	})
 	root.AddCommand(bmcCmds()...)
 	root.AddCommand(statusCmd(), lsCmd(), addCmd(), rmCmd(), editCmd(), importCmd(), completionCmd())
+	groupCommands(root)
 	root.SetFlagErrorFunc(flagError)
 	recordCommandNames(root)
 	for _, c := range root.Commands() {
@@ -368,4 +369,36 @@ func argsThen(words []string) func(*cobra.Command, []string, string) ([]string, 
 		}
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
+}
+
+// commandGroups sorts the help into what a command acts on. Commands not
+// listed (help, completion, version) land under "Other".
+var commandGroups = []struct {
+	id, title string
+	cmds      []string
+}{
+	{"connect", "Connect:", []string{"sol", "ssh", "web"}},
+	{"power", "Power and boot:", []string{"power", "status", "boot", "uid", "nmi"}},
+	{"inspect", "BMC info and logs:", []string{"sensors", "sdr", "fru", "sel", "info", "mcreset", "ipmi"}},
+	{"hosts", "Your host list (local, nothing is sent to the BMC):", []string{"ls", "add", "edit", "rm", "import"}},
+	{"other", "Other:", nil},
+}
+
+func groupCommands(root *cobra.Command) {
+	group := map[string]string{}
+	for _, g := range commandGroups {
+		root.AddGroup(&cobra.Group{ID: g.id, Title: g.title})
+		for _, n := range g.cmds {
+			group[n] = g.id
+		}
+	}
+	for _, c := range root.Commands() {
+		if id, ok := group[c.Name()]; ok {
+			c.GroupID = id
+		} else {
+			c.GroupID = "other"
+		}
+	}
+	root.SetHelpCommandGroupID("other")
+	root.SetCompletionCommandGroupID("other")
 }
