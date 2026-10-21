@@ -997,3 +997,49 @@ func TestABreakFromAnyWindowIsReportedToEveryClient(t *testing.T) {
 		t.Error("a BREAK that was refused was reported")
 	}
 }
+
+func TestAFragmentedKeyFromAWindowIsDroppedWholeAtTheHub(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	win := host(t, f, Options{NoLinger: true})
+	win2, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each window's reads fall inside an arrow key. The two windows' pieces
+	// interleave, so a shared buffer would glue one's half to the other's.
+	win.Enqueue([]byte("a\x1bO"))
+	win2.Enqueue([]byte("x"))
+	win.Enqueue([]byte("Ab"))
+	win.Enqueue([]byte("\x1b[1;5"))
+	win2.Enqueue([]byte("y"))
+	win.Enqueue([]byte("Cc"))
+	eventually(t, "typed around the split keys", func() bool { return len(f.got()) == len("axbyc") })
+	got := f.got()
+	if strings.Contains(got, "A") || strings.Contains(got, "C") || strings.Contains(got, "[") {
+		t.Fatalf("half of an arrow key was typed: %q", got)
+	}
+	for _, c := range "abc" { // one window's own typing stays in order
+		if !strings.ContainsRune(got, c) {
+			t.Errorf("%q missing from %q", c, got)
+		}
+	}
+	if strings.Index(got, "a") > strings.Index(got, "b") || strings.Index(got, "b") > strings.Index(got, "c") {
+		t.Errorf("window one's keys reordered: %q", got)
+	}
+}
+
+func TestAnUnfinishedKeyAtTheHubTimesOutAndTypingGoesOn(t *testing.T) {
+	env(t)
+	old := fragWait
+	fragWait = 30 * time.Millisecond
+	t.Cleanup(func() { fragWait = old })
+	f := newFake()
+	f.vsp = true
+	win := host(t, f, Options{NoLinger: true})
+	win.Enqueue([]byte("\x1b[1;5")) // the rest never comes
+	time.Sleep(150 * time.Millisecond)
+	win.Enqueue([]byte("C"))
+	eventually(t, "the next key is typed, not eaten", func() bool { return f.got() == "C" })
+}

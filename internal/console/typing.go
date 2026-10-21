@@ -137,15 +137,19 @@ func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 // typeKeys queues keystrokes. ctrl+c is the exception: it jumps the queue,
 // dropping what was waiting, because nothing typed before an interrupt matters.
 func (k *consoleKeys) typeKeys(b []byte) {
-	b, note := MapInput(k.cs.Link, b)
-	if note != "" && k.noted.CompareAndSwap(false, true) { // once per session
-		k.con.Note(note, false)
-	}
+	b, note := k.filter.Map(k.cs.Link, b)
+	k.showKeysNote(note)
 	if i := bytes.LastIndexByte(b, 0x03); i >= 0 {
 		k.q.Urgent([]byte{0x03})
 		b = b[i+1:]
 	}
 	k.q.Enqueue(b)
+}
+
+func (k *consoleKeys) showKeysNote(note string) {
+	if note != "" && k.noted.CompareAndSwap(false, true) { // once per session
+		k.con.Note(note, false)
+	}
 }
 
 // fitSize makes the remote agree with rows x cols: where that means typing

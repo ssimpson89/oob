@@ -54,7 +54,7 @@ func MapVSPInput(b []byte) (out []byte, note string) {
 		}
 		rest := b[i+1:]
 		switch {
-		case len(rest) == 0 || rest[0] == 0x1b:
+		case len(rest) == 0 || rest[0] == 0x1b || rest[0] == 0x03: // ctrl+c is a key of its own, never part of another
 			out = append(out, 0x1b, 0x1b)
 		case rest[0] == '[':
 			n := csiLen(rest)
@@ -66,7 +66,11 @@ func MapVSPInput(b []byte) (out []byte, note string) {
 			i += n
 		case rest[0] == 'O':
 			note = VSPKeysNote
-			i += min(2, len(rest))
+			if len(rest) > 1 && rest[1] != 0x03 {
+				i += 2
+			} else {
+				i++ // a cut-off ESC O: ctrl+c after it is still typed
+			}
 		default: // Alt-key
 			note = VSPKeysNote
 			i++
@@ -82,12 +86,92 @@ func csiLen(rest []byte) int {
 	n := 1
 	for n < len(rest) {
 		c := rest[n]
+		if c < 0x20 || c == 0x7f { // a control key (ctrl+c) isn't part of it, and must not be eaten
+			break
+		}
 		n++
 		if c >= 0x40 && c <= 0x7e {
 			break
 		}
 	}
 	return n
+}
+
+// fragMax bounds how much of an unfinished escape sequence an InputFilter holds.
+const fragMax = 32
+
+// InputFilter maps one input stream for a link that needs it (see
+// InputMapper), holding back an escape sequence that a read ended in the
+// middle of. A terminal can write an arrow key as ESC O and A, or ESC [ 1 ; 5
+// and C, and the reads can fall between them: mapped one at a time, the first
+// half is dropped as a cut-off sequence and the second half is typed as plain
+// characters. Held until the rest arrives, the sequence is dropped whole. What
+// is held is bounded (fragMax), a control key such as ctrl+c ends it, and
+// Flush, which callers run after a short wait, gives up on it. A lone ESC at
+// the end is a whole key (see MapVSPInput) and is never held. One filter per
+// input stream; it has no lock of its own. A link that needs no mapping is
+// passed through untouched.
+type InputFilter struct {
+	held []byte
+}
+
+// Pending reports whether the start of an escape sequence is being held.
+func (f *InputFilter) Pending() bool { return len(f.held) > 0 }
+
+// Map is MapInput for the stream's next bytes.
+func (f *InputFilter) Map(l Link, b []byte) (out []byte, note string) {
+	m, ok := l.(InputMapper)
+	if !ok {
+		return b, ""
+	}
+	if len(f.held) == 0 && bytes.IndexByte(b, 0x1b) < 0 {
+		return m.MapInput(b)
+	}
+	data := append(f.held, b...)
+	f.held = nil
+	if i := unfinishedEsc(data); i >= 0 {
+		f.held = bytes.Clone(data[i:])
+		data = data[:i]
+	}
+	return m.MapInput(data)
+}
+
+// Flush gives up on a held sequence: it is dropped whole, with the link's
+// note for dropped keys, and the stream goes on from the next byte.
+func (f *InputFilter) Flush(l Link) (out []byte, note string) {
+	data := f.held
+	f.held = nil
+	if len(data) == 0 {
+		return nil, ""
+	}
+	return MapInput(l, data)
+}
+
+// unfinishedEsc is the index in b of an escape sequence that b ends in the
+// middle of (ESC O with nothing after it, ESC [ with no final byte yet), or -1.
+func unfinishedEsc(b []byte) int {
+	i := bytes.LastIndexByte(b, 0x1b)
+	if i < 0 || i+1 >= len(b) {
+		return -1 // none, or a lone ESC
+	}
+	rest := b[i+1:]
+	switch rest[0] {
+	case 'O':
+		if len(rest) == 1 {
+			return i
+		}
+	case '[':
+		if len(rest)+1 > fragMax {
+			return -1
+		}
+		for _, c := range rest[1:] {
+			if c < 0x20 || c > 0x7e || c >= 0x40 { // a control key, or the final byte
+				return -1
+			}
+		}
+		return i
+	}
+	return -1
 }
 
 // StripEsc removes escape sequences from pasted text: pastes have none, so

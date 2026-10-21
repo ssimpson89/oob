@@ -159,3 +159,100 @@ func (f *fakeLink) sentCopy() []byte {
 	defer f.mu.Unlock()
 	return append([]byte(nil), f.sent...)
 }
+
+func TestInputFilterDropsAFragmentedKeyWhole(t *testing.T) {
+	const esc = "\x1b"
+	for _, tc := range []struct {
+		name  string
+		reads []string
+		want  string
+	}{
+		{"ss3 split", []string{esc + "O", "A"}, ""},
+		{"csi split after the params", []string{esc + "[1;5", "C"}, ""},
+		{"csi split after the bracket", []string{esc + "[", "A"}, ""},
+		{"split in three", []string{esc + "[1", ";5", "C"}, ""},
+		{"text around a split key", []string{"a" + esc + "O", "Ab"}, "ab"},
+		{"two split keys", []string{esc + "[1", "A" + esc + "[", "Bc"}, "c"},
+		{"whole keys are as before", []string{esc + "[A", "x" + esc + "OP"}, "x"},
+		{"lone esc is typed at once", []string{esc}, esc + esc},
+		{"esc then text", []string{esc, "x"}, esc + esc + "x"},
+		{"ctrl+c inside a half key still goes", []string{esc + "[1", "\x03"}, "\x03"},
+		{"ctrl+c right after ESC O", []string{esc + "O", "\x03"}, "\x03"},
+		{"plain text", []string{"ls\r"}, "ls\r"},
+		{"focus report", []string{esc + "[", "I"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var f InputFilter
+			l := &vspLink{}
+			var out []byte
+			for _, r := range tc.reads {
+				o, _ := f.Map(l, []byte(r))
+				out = append(out, o...)
+			}
+			if string(out) != tc.want {
+				t.Errorf("typed %q, want %q", out, tc.want)
+			}
+			if f.Pending() {
+				t.Errorf("still holding %q", f.held)
+			}
+		})
+	}
+}
+
+func TestInputFilterHoldsBoundedAndFlushesOnTimeout(t *testing.T) {
+	var f InputFilter
+	l := &vspLink{}
+	if out, _ := f.Map(l, []byte("\x1b[1;5")); len(out) != 0 || !f.Pending() {
+		t.Fatalf("out %q pending %v, want the unfinished key held", out, f.Pending())
+	}
+	// Nothing more comes: it is dropped whole, with the note, and typing goes on.
+	if out, note := f.Flush(l); len(out) != 0 || note != VSPKeysNote || f.Pending() {
+		t.Errorf("flush: %q %q pending %v", out, note, f.Pending())
+	}
+	if out, _ := f.Map(l, []byte("C")); string(out) != "C" {
+		t.Errorf("the byte after a flushed fragment = %q, want it typed", out)
+	}
+	// A "sequence" that never finishes is not held without limit.
+	junk := "\x1b[" + strings.Repeat("1;", 40)
+	if out, _ := f.Map(l, []byte(junk)); len(out) != 0 || f.Pending() {
+		t.Errorf("an over-long unfinished sequence: out %q, pending %v", out, f.Pending())
+	}
+	// A link that needs no mapping is never buffered.
+	var g InputFilter
+	if out, _ := g.Map(&fakeLink{}, []byte("\x1b[1;5")); string(out) != "\x1b[1;5" || g.Pending() {
+		t.Errorf("non-VSP: %q pending %v", out, g.Pending())
+	}
+}
+
+func TestConsoleKeysDropAFragmentedArrowWhole(t *testing.T) {
+	fl := &vspLink{}
+	k, con := vspKeys(t, fl)
+	sent := func() string { fl.mu.Lock(); defer fl.mu.Unlock(); return string(fl.sent) }
+	// A terminal wrote an arrow key as two pieces and the reads fell between them.
+	k.Input([]byte("a\x1bO"))
+	k.Input([]byte("Ab"))
+	k.Input([]byte("\x1b[1;5"))
+	k.Input([]byte("Cd"))
+	for i := 0; i < 200 && sent() != "abd"; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sent(); got != "abd" {
+		t.Fatalf("typed %q, want abd (the halves of an arrow key must not be typed)", got)
+	}
+	if n := barNote(con); n != VSPKeysNote {
+		t.Errorf("bar note = %q", n)
+	}
+	// The rest never comes: the loop's wait fires Flush, and what is held goes.
+	k.Input([]byte("\x1b[1;"))
+	if !k.filter.Pending() {
+		t.Fatal("an unfinished key is not held")
+	}
+	k.Flush()
+	k.Input([]byte("e"))
+	for i := 0; i < 200 && sent() != "abde"; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sent(); got != "abde" {
+		t.Errorf("typed %q, want abde", got)
+	}
+}

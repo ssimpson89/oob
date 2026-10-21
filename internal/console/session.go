@@ -279,7 +279,7 @@ func Run(cs Setup) (int, error) {
 	guard(cleanup, func() {
 		for {
 			var wait <-chan time.Time
-			if keys.parser.Pending() {
+			if keys.parser.Pending() || keys.filter.Pending() {
 				wait = time.After(escWait)
 			}
 			var ok bool
@@ -324,7 +324,8 @@ type consoleKeys struct {
 	ty *typer.Typer // everything typed or pasted goes through it, in order (nil when shared)
 	q  Queue        // ty, or the hub's queue
 
-	noted atomic.Bool // the link's input note was shown
+	noted  atomic.Bool // the link's input note was shown
+	filter InputFilter // holds the start of an escape sequence a read ended in; used from the input loop only
 
 	// lineDirty: the last byte written was neither Enter nor ctrl+c, so the
 	// remote line may hold unsubmitted input. See breakSafe.
@@ -347,7 +348,10 @@ func (k *consoleKeys) Input(b []byte) bool {
 // Flush resolves a held ESC after escWait with no more input.
 func (k *consoleKeys) Flush() bool {
 	fwd, acts := k.parser.Flush()
-	return k.apply(fwd, acts)
+	ok := k.apply(fwd, acts)
+	_, note := k.filter.Flush(k.cs.Link) // what it held is a cut-off key: dropped
+	k.showKeysNote(note)
+	return ok
 }
 
 func (k *consoleKeys) apply(fwd []byte, acts []action) bool {

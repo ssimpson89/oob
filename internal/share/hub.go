@@ -142,6 +142,12 @@ type peer struct {
 	agent bool
 	name  string
 	once  sync.Once
+
+	// A window's typing is one input stream: filter holds the start of an
+	// escape sequence a message ended in; frag gives up on it if the rest
+	// doesn't come. Both are guarded by the hub's mu.
+	filter console.InputFilter
+	frag   *time.Timer
 }
 
 func newHub(tr *console.Transport) *hub {
@@ -425,6 +431,10 @@ func (h *hub) replay(agent, wanted bool) []byte {
 func (h *hub) leave(p *peer) {
 	p.drop()
 	h.mu.Lock()
+	if p.frag != nil {
+		p.frag.Stop()
+		p.frag = nil
+	}
 	if _, ok := h.peers[p]; !ok {
 		h.mu.Unlock()
 		return
@@ -520,7 +530,7 @@ func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
 		h.mu.Unlock()
 		return
 	}
-	b = h.mapUser(b)
+	b = h.mapUser(p, b)
 	if len(b) == 0 {
 		h.mu.Unlock()
 		return
@@ -538,15 +548,41 @@ func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
 	h.enqMu.Unlock()
 }
 
+// fragWait is how long a window's unfinished escape sequence waits for its
+// rest before it is dropped. A variable so tests can shorten it.
+var fragWait = 100 * time.Millisecond
+
 // mapUser fits a window's typing to the link (an iLO VSP reads ESC with the
-// byte after it) and shows the link's note once. Call with mu held.
-func (h *hub) mapUser(b []byte) []byte {
-	out, note := console.MapInput(h.tr.Link, b)
+// byte after it) and shows the link's note once. The window's typing is one
+// stream: an escape sequence split between two messages is held until the
+// rest comes (or fragWait passes) and then dropped whole. Call with mu held.
+func (h *hub) mapUser(p *peer, b []byte) []byte {
+	out, note := p.filter.Map(h.tr.Link, b)
+	h.keysNote(note)
+	if p.frag != nil {
+		p.frag.Stop()
+		p.frag = nil
+	}
+	if p.filter.Pending() {
+		p.frag = time.AfterFunc(fragWait, func() { h.dropFragment(p) })
+	}
+	return out
+}
+
+func (h *hub) keysNote(note string) {
 	if note != "" && !h.keysNoted {
 		h.keysNoted = true
 		h.note(note)
 	}
-	return out
+}
+
+// dropFragment gives up on a window's unfinished escape sequence.
+func (h *hub) dropFragment(p *peer) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, note := p.filter.Flush(h.tr.Link)
+	h.keysNote(note)
+	p.frag = nil
 }
 
 // userClear is the window's x key: drop what is queued to be typed.
