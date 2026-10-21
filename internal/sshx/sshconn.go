@@ -245,13 +245,30 @@ func ConnectOpts(h config.Host, khPath string, banner func(string)) (*ssh.Client
 }
 
 // ConnectTimeout is ConnectOpts with its own limit for the TCP connect and the
-// SSH handshake (the vendor probe uses a short one).
+// SSH handshake.
 func ConnectTimeout(h config.Host, khPath string, banner func(string), timeout time.Duration) (*ssh.Client, error) {
-	cl, err := sshConnectRaw(h, khPath, banner, timeout)
+	return ConnectWith(h, khPath, Options{Banner: banner, Timeout: timeout})
+}
+
+// Options tunes ConnectWith.
+type Options struct {
+	Banner  func(string)  // receives the pre-auth banner after a successful login
+	Timeout time.Duration // TCP connect and handshake limit (0: the default)
+	// NoPrompt keeps the login non-interactive: a key that needs a passphrase
+	// fails with ErrNeedsInput instead of asking on the terminal.
+	NoPrompt bool
+}
+
+// ConnectWith dials the BMC as Connect does, with the given options.
+func ConnectWith(h config.Host, khPath string, o Options) (*ssh.Client, error) {
+	if o.Timeout <= 0 {
+		o.Timeout = connectTimeout
+	}
+	cl, err := sshConnectRaw(h, khPath, o.Banner, o.Timeout, o.NoPrompt)
 	return cl, console.CleanErr(err)
 }
 
-func sshConnectRaw(h config.Host, khPath string, banner func(string), timeout time.Duration) (*ssh.Client, error) {
+func sshConnectRaw(h config.Host, khPath string, banner func(string), timeout time.Duration, noPrompt bool) (*ssh.Client, error) {
 	cb, err := acceptNew(khPath)
 	if err != nil {
 		return nil, err
@@ -263,7 +280,7 @@ func sshConnectRaw(h config.Host, khPath string, banner func(string), timeout ti
 	if stored := storedKeyTypes(khPath, addr); len(stored) > 0 {
 		hostKeys = sshHostKeyAlgs(stored)
 	}
-	auth, closeAuth, err := sshAuthMethods(h)
+	auth, closeAuth, err := sshAuthMethods(h, noPrompt)
 	if err != nil {
 		return nil, err
 	}

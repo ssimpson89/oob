@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,7 +18,9 @@ import (
 
 	"github.com/ssimpson89/oob/internal/app"
 	"github.com/ssimpson89/oob/internal/config"
+	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/detect"
+	"github.com/ssimpson89/oob/internal/sshx"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -27,6 +31,8 @@ type probeBMC struct {
 	exited  atomic.Int32
 	conns   atomic.Int32
 	onShell func() // called when a shell starts, before output
+	stall   bool   // never answer a session channel open
+	reject  string // reject session opens with this message
 }
 
 func startProbeBMC(t *testing.T, banner, out, pass string) *probeBMC {
@@ -76,6 +82,13 @@ func (f *probeBMC) serve(c net.Conn, cfg *ssh.ServerConfig, out string) {
 	}
 	go ssh.DiscardRequests(reqs)
 	for nc := range chans {
+		if f.stall {
+			continue // authenticated, but the session open is never answered
+		}
+		if f.reject != "" {
+			nc.Reject(ssh.Prohibited, f.reject)
+			continue
+		}
 		if nc.ChannelType() != "session" {
 			nc.Reject(ssh.UnknownChannelType, "no")
 			continue
@@ -310,4 +323,84 @@ func waitFor(t *testing.T, ok func() bool, what string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for: %s", what)
+}
+
+func TestProbeStalledSessionIsBounded(t *testing.T) {
+	srv := startProbeBMC(t, "", "", "pw")
+	srv.stall = true
+	p, h := probeEnv(t, "", srv.port)
+	h.Name = "node01"
+	start := time.Now()
+	typ, _, err := probeVendor("node01", h, 2*time.Second, 300*time.Millisecond)
+	if el := time.Since(start); el > 3*time.Second {
+		t.Fatalf("probe took %v", el)
+	}
+	if typ != "" || !console.IsTimeout(err) {
+		t.Fatalf("typ %q err %v, want a timeout", typ, err)
+	}
+	// Through Resolve: generic fallback, nothing saved, quiet (a timeout).
+	out := captureProbeOut(t)
+	swap(t, &probeFn, func(n string, h config.Host, _, _ time.Duration) (string, int, error) {
+		return probeVendor(n, h, 2*time.Second, 300*time.Millisecond)
+	})
+	if got := Resolve("node01", h, 0); got.Type != "" {
+		t.Errorf("type %q", got.Type)
+	}
+	if saved, _ := savedType(t, p); saved != "" || out.Len() != 0 {
+		t.Errorf("saved %q output %q", saved, out.String())
+	}
+}
+
+func TestProbeEncryptedKeyDoesNotPrompt(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(blk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := startProbeBMC(t, "Integrated Lights-Out 7\r\n", "</>hpeiLO-> ", "pw")
+	p, h := probeEnv(t, "", srv.port)
+	h.Key, h.Pass = keyPath, ""
+	out := captureProbeOut(t)
+	start := time.Now()
+	got := Resolve("node01", h, 0)
+	if time.Since(start) > 2*time.Second {
+		t.Error("probe was not prompt")
+	}
+	if got.Type != "" {
+		t.Errorf("type %q", got.Type)
+	}
+	if saved, _ := savedType(t, p); saved != "" {
+		t.Errorf("saved %q", saved)
+	}
+	if out.Len() != 0 {
+		t.Errorf("output %q", out.String())
+	}
+	if srv.conns.Load() != 0 {
+		t.Errorf("connected %d times, want 0", srv.conns.Load())
+	}
+	_, _, err = probeVendor("node01", h, time.Second, time.Second)
+	if !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("err %v, want ErrNeedsInput", err)
+	}
+}
+
+func TestProbeRejectionMessageIsCleaned(t *testing.T) {
+	srv := startProbeBMC(t, "", "", "pw")
+	srv.reject = "busy\x1b]0;pwned\x07\x1b[31m red"
+	_, h := probeEnv(t, "", srv.port)
+	out := captureProbeOut(t)
+	Resolve("node01", h, 0)
+	if !strings.Contains(out.String(), "vendor detection over SSH skipped for node01") {
+		t.Fatalf("no note: %q", out.String())
+	}
+	if strings.ContainsAny(out.String(), "\x1b\x07") {
+		t.Errorf("escape sequence in note: %q", out.String())
+	}
 }

@@ -7,7 +7,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/detect"
 )
@@ -409,5 +411,48 @@ func TestEditWithGlobalFlagsOpensEditor(t *testing.T) {
 	t.Setenv("VISUAL", "true")
 	if _, _, err := runOob(t, cfg, "", "-y", "edit"); err != nil {
 		t.Fatalf("edit with -c/-y: %v", err)
+	}
+}
+
+type fakeStatus struct{ got *time.Duration }
+
+func (f fakeStatus) PowerStatus(d time.Duration) bmc.StatusResult {
+	*f.got = d
+	return bmc.StatusResult{Text: "on"}
+}
+
+func TestPowerStatusPassesOnlyRemainingDeadline(t *testing.T) {
+	var got time.Duration
+	called := false
+	swap(t, &driverFor, func(string, config.Host) interface {
+		PowerStatus(time.Duration) bmc.StatusResult
+	} {
+		called = true
+		return fakeStatus{&got}
+	})
+	swap(t, &resolveHost, func(_ string, h config.Host, _ time.Duration) config.Host { return h })
+	if r := powerStatus("node01", config.Host{IP: "192.0.2.1", Type: "ipmi"}, 100*time.Millisecond); r.Failed || !called {
+		t.Fatalf("result %+v called %v", r, called)
+	}
+	if got <= 0 || got > 100*time.Millisecond {
+		t.Errorf("typed host got %v, want at most 100ms", got)
+	}
+}
+
+func TestPowerStatusExhaustedBudgetTimesOut(t *testing.T) {
+	called := false
+	swap(t, &driverFor, func(string, config.Host) interface {
+		PowerStatus(time.Duration) bmc.StatusResult
+	} {
+		called = true
+		return fakeStatus{new(time.Duration)}
+	})
+	swap(t, &resolveHost, func(_ string, h config.Host, _ time.Duration) config.Host {
+		time.Sleep(60 * time.Millisecond) // the probe used the whole budget
+		return h
+	})
+	r := powerStatus("node01", config.Host{IP: "192.0.2.1"}, 50*time.Millisecond)
+	if called || !r.Failed || !strings.Contains(r.Text, "timed out") {
+		t.Errorf("result %+v, PowerStatus called %v", r, called)
 	}
 }

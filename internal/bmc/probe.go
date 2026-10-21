@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,7 +24,7 @@ import (
 // IPMI; the next run probes again.
 const (
 	probeDialTimeout = 3 * time.Second
-	probeReadTimeout = 5 * time.Second
+	probeReadTimeout = 5 * time.Second // whole post-login phase
 )
 
 // probeFn does the probe; tests replace it.
@@ -55,32 +56,49 @@ func probeVendor(name string, h config.Host, dial, read time.Duration) (string, 
 		return "", 0, err
 	}
 	var banner strings.Builder
-	cl, err := sshx.ConnectTimeout(h, kh, func(s string) { banner.WriteString(s) }, dial)
+	// NoPrompt: the probe runs unasked, possibly on many hosts at once, so it
+	// must never ask for a passphrase.
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{
+		Banner:   func(s string) { banner.WriteString(s) },
+		Timeout:  dial,
+		NoPrompt: true,
+	})
 	if err != nil {
 		return "", 0, err
 	}
 	defer cl.Close()
-	out, err := readFirstOutput(cl, banner.String(), read)
+	// One deadline for everything after the login (session open, pty, shell,
+	// the read and the final write): closing the client unblocks all of them.
+	var expired atomic.Bool
+	watchdog := time.AfterFunc(read, func() {
+		expired.Store(true)
+		cl.Close()
+	})
+	defer watchdog.Stop()
+	out, err := readFirstOutput(cl, banner.String())
 	typ, gen := detect.Classify(banner.String(), out)
 	if typ != "" {
 		return typ, gen, nil
+	}
+	if expired.Load() && err != nil {
+		return "", 0, &console.TimeoutError{Host: name, Via: "SSH", After: read, Cause: err}
 	}
 	return "", 0, err
 }
 
 // readFirstOutput opens a shell and reads until the vendor is clear, the first
-// prompt shows, detect.Window bytes arrived, or read has passed. It then says
-// goodbye and closes the session. A read problem is returned only for the
-// caller to use if nothing was detected.
-func readFirstOutput(cl *ssh.Client, banner string, read time.Duration) (string, error) {
+// prompt shows or detect.Window bytes arrived. It then says goodbye and closes
+// the session. The caller bounds the time by closing cl. A read problem is
+// returned only for the caller to use if nothing was detected.
+func readFirstOutput(cl *ssh.Client, banner string) (string, error) {
 	sess, err := cl.NewSession()
 	if err != nil {
-		return "", err
+		return "", console.CleanErr(err)
 	}
 	defer sess.Close()
 	modes := ssh.TerminalModes{ssh.ECHO: 0, ssh.TTY_OP_ISPEED: 115200, ssh.TTY_OP_OSPEED: 115200}
 	if err := sess.RequestPty("xterm", 24, 80, modes); err != nil {
-		return "", fmt.Errorf("request pty: %w", err)
+		return "", console.CleanErr(fmt.Errorf("request pty: %w", err))
 	}
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
@@ -91,7 +109,7 @@ func readFirstOutput(cl *ssh.Client, banner string, read time.Duration) (string,
 		return "", err
 	}
 	if err := sess.Shell(); err != nil {
-		return "", err
+		return "", console.CleanErr(err)
 	}
 	chunks := make(chan []byte)
 	done := make(chan struct{})
@@ -113,10 +131,7 @@ func readFirstOutput(cl *ssh.Client, banner string, read time.Duration) (string,
 			}
 		}
 	}()
-	timer := time.NewTimer(read)
-	defer timer.Stop()
 	var out []byte
-loop:
 	for {
 		if typ, gen := detect.Classify(banner, string(out)); typ != "" && (typ != detect.TypeILO || gen > 0) {
 			break
@@ -124,15 +139,11 @@ loop:
 		if detect.WindowDone(string(out)) {
 			break
 		}
-		select {
-		case b, ok := <-chunks:
-			if !ok {
-				break loop
-			}
-			out = append(out, b...)
-		case <-timer.C:
-			break loop
+		b, ok := <-chunks // ends when the output ends or the deadline closes cl
+		if !ok {
+			break
 		}
+		out = append(out, b...)
 	}
 	if len(out) > detect.Window {
 		out = out[:detect.Window]
@@ -152,7 +163,8 @@ func probeDisabled() bool {
 func quietProbeError(err error) bool {
 	var te *console.TimeoutError
 	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) ||
-		errors.Is(err, syscall.ENETUNREACH) || errors.As(err, &te) || console.IsTimeout(err)
+		errors.Is(err, syscall.ENETUNREACH) || errors.As(err, &te) || console.IsTimeout(err) ||
+		errors.Is(err, sshx.ErrNeedsInput)
 }
 
 // Resolve returns h with its vendor filled in. For a host with no type it
@@ -176,7 +188,7 @@ func Resolve(name string, h config.Host, budget time.Duration) config.Host {
 	typ, gen, err := probeFn(name, h, dial, read)
 	if err != nil {
 		if !quietProbeError(err) && !app.Quiet() {
-			app.Notef(probeW(), "vendor detection over SSH skipped for %s: %v", name, err)
+			app.Notef(probeW(), "vendor detection over SSH skipped for %s: %v", name, console.CleanErr(err))
 		}
 		return h
 	}

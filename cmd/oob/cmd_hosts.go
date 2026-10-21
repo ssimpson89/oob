@@ -29,12 +29,28 @@ func clampWorkers(w, n int) int {
 	return max(1, min(w, n))
 }
 
+// Seams for tests.
+var (
+	resolveHost = bmc.Resolve
+	driverFor   = func(name string, h config.Host) interface {
+		PowerStatus(time.Duration) bmc.StatusResult
+	} {
+		return bmc.DriverFor(name, h)
+	}
+)
+
 // powerStatus reads one host's power state. An untyped host is probed for its
-// vendor first, quietly and within the same per-host deadline.
+// vendor first, quietly and within the same per-host deadline; the read gets
+// only what is left of it.
 func powerStatus(name string, h config.Host, timeout time.Duration) bmc.StatusResult {
 	start := time.Now()
-	h = bmc.Resolve(name, h, timeout)
-	return bmc.DriverFor(name, h).PowerStatus(max(timeout-time.Since(start), time.Second))
+	h = resolveHost(name, h, timeout)
+	left := timeout - time.Since(start)
+	if left <= 0 {
+		err := &console.TimeoutError{Host: name, Via: "status", After: timeout}
+		return bmc.StatusResult{Text: err.Error(), Failed: true}
+	}
+	return driverFor(name, h).PowerStatus(left)
 }
 
 func statusCmd() *cobra.Command {
