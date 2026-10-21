@@ -133,6 +133,7 @@ type fakeHost struct {
 
 	writes, maxWrite int           // Send calls and the longest one, to see whether a line is typed in one burst
 	sendDelay        time.Duration // each Send takes this long, like a slow serial link
+	vsp              bool          // maps input like an iLO VSP
 	serial           bool          // a serial console: the session paces what it types, by pacing
 	pacing           console.Pacing
 }
@@ -302,8 +303,14 @@ func (f *fakeHost) Disconnect() error {
 
 func (f *fakeHost) Resize(rows, cols int) error  { return nil }
 func (f *fakeHost) FitSize(rows, cols int) error { return nil }
-func (f *fakeHost) SizeIsFree() bool             { return false }
-func (f *fakeHost) Serial() bool                 { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
+func (f *fakeHost) MapInput(b []byte) ([]byte, string) {
+	if !f.vsp {
+		return b, ""
+	}
+	return console.MapVSPInput(b)
+}
+func (f *fakeHost) SizeIsFree() bool { return false }
+func (f *fakeHost) Serial() bool     { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
 
 // finish ends the transport the way a hung-up console does.
 func (f *fakeHost) finish() {

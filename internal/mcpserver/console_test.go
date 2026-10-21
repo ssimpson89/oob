@@ -402,3 +402,40 @@ func TestSendCommandWaitStartsAfterTyping(t *testing.T) {
 		t.Errorf("answer arrived %.1fs after typing began but was missed: %q %v", time.Since(start).Seconds(), out, isErr)
 	}
 }
+
+func TestSendKeysOnAnILOVSP(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) { f.vsp = true }
+	h.connect()
+	f := h.host("node01")
+
+	out, isErr := h.keys("s1", "", "up")
+	if !isErr || !strings.Contains(out, "iLO VSP, which can't pass arrow keys") {
+		t.Fatalf("arrow key: got %q %v, want an error naming the VSP limitation", out, isErr)
+	}
+	out, isErr = h.keys("s1", "", "f1")
+	if !isErr || !strings.Contains(out, "iLO VSP") {
+		t.Fatalf("function key: got %q %v", out, isErr)
+	}
+	if got := f.rawSent(); got != "" {
+		t.Fatalf("refused keys still typed %q", got)
+	}
+
+	if out, isErr = h.keys("s1", "", "esc"); isErr {
+		t.Fatalf("esc: %q", out)
+	}
+	if got := f.rawSent(); got != "\x1b\x1b" {
+		t.Errorf("esc typed %q, want ESC ESC", got)
+	}
+}
+
+func TestSendKeysArrowsAreFineOffVSP(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.keys("s1", "", "up"); isErr {
+		t.Fatalf("got %q", out)
+	}
+	if got := h.host("node01").rawSent(); got != "\x1b[A" {
+		t.Errorf("typed %q", got)
+	}
+}

@@ -285,7 +285,7 @@ func iloPowerCycleFn(name string, h config.Host) func() (string, error) {
 var iloSpec = cliSpec{
 	kind: "vsp", promptKind: "ilo cli", prompt: iloPrompt, resync: true, start: []string{"vsp"},
 	entered: regexp.MustCompile(`(?i)Virtual Serial Port Active`),
-	esc:     []byte{0x1b, '('}, breakMsg: "VSP has no BREAK", label: "iLO CLI",
+	esc:     []byte{0x1b, '('}, breakMsg: "VSP has no BREAK", label: "iLO CLI", vspEsc: true,
 }
 
 // iloDriver prefers Redfish (power and boot) and falls back to the SSH CLI when

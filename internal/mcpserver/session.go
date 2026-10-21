@@ -297,10 +297,29 @@ func (c *session) closeTransport() {
 	c.trOnce.Do(c.tr.Close)
 }
 
+// mapInput fits b to a link that reads ESC with the byte after it (iLO VSP):
+// a lone ESC becomes ESC ESC, and keys the link would drop are refused whole
+// with console.ErrKeysDropped, so the AI tool isn't told it pressed a key that
+// never arrived.
+func (c *session) mapInput(b []byte) ([]byte, error) {
+	out, note := console.MapInput(c.tr.Link, b)
+	if note != "" {
+		return nil, console.ErrKeysDropped
+	}
+	return out, nil
+}
+
 // write types b at the console, within ctx: it queues the bytes and returns
 // when the last one is out. On a serial console that takes a while, since the
 // queue paces them.
 func (c *session) write(ctx context.Context, b []byte) error {
+	if c.sh == nil { // a shared console's hub maps and refuses these itself
+		out, err := c.mapInput(b)
+		if err != nil {
+			return err
+		}
+		b = out
+	}
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
 	before := c.wrote

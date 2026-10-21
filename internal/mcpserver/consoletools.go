@@ -798,6 +798,11 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		lastEsc = st.key == "esc"
 		wire.WriteString(st.text + keyBytes[st.key])
 	}
+	if c.sh == nil {
+		if _, err := c.mapInput([]byte(wire.String())); err != nil {
+			return fail(err) // before asking the user to approve what can't be typed
+		}
+	}
 	if c.onBMC() && (in.Text != "" || slices.Contains(in.Keys, "enter")) {
 		add(whyBMC)
 	}

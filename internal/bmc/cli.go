@@ -344,6 +344,24 @@ func (l *cliLink) Serial() bool {
 	return !l.atPrompt
 }
 
+// MapInput fits what is typed to a console that reads ESC as a two-byte
+// escape (iLO VSP), in the console only: at the BMC's own prompt, on a plain
+// ssh session and on every other vendor the bytes go through as they are.
+// The console's own escape (Toggle, Disconnect) goes through Send, not here,
+// so it is the only way ESC ( is ever sent.
+func (l *cliLink) MapInput(b []byte) ([]byte, string) {
+	if !l.sp.vspEsc || l.plain {
+		return b, ""
+	}
+	l.mu.Lock()
+	at := l.atPrompt
+	l.mu.Unlock()
+	if at {
+		return b, ""
+	}
+	return console.MapVSPInput(b)
+}
+
 func (l *cliLink) SizeIsFree() bool { return l.plain }
 
 // stateLocked returns the bar label for where the session is now. The caller
@@ -449,7 +467,10 @@ type cliSpec struct {
 	start      []string       // commands typed at the prompt; the last one starts the console
 	esc        []byte         // console escape sequence: console -> CLI prompt
 	breakMsg   string
-	label      string // for the progress line
+	// vspEsc: the console reads ESC with the byte after it (iLO VSP), so input
+	// is mapped. See MapInput.
+	vspEsc bool
+	label  string // for the progress line
 }
 
 // consoleStartWait is how long cliOpen waits for a console to say it started.

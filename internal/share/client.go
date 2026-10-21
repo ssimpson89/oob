@@ -421,7 +421,7 @@ func (c *Client) call(ctx context.Context, m msg) (msg, error) {
 		case !ok:
 			return msg{}, ErrClosed
 		case reply.Err != "":
-			for _, e := range []error{ErrPaused, ErrTyping, ErrBusy, errStopped} {
+			for _, e := range []error{ErrPaused, ErrTyping, ErrBusy, errStopped, console.ErrKeysDropped} {
 				if reply.Err == e.Error() {
 					return reply, e
 				}

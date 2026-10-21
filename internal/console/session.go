@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -322,6 +323,8 @@ type consoleKeys struct {
 
 	ty *typer.Typer // everything typed or pasted goes through it, in order (nil when shared)
 	q  Queue        // ty, or the hub's queue
+
+	noted atomic.Bool // the link's input note was shown
 }
 
 func (k *consoleKeys) autoOn() bool {
@@ -372,7 +375,11 @@ func (k *consoleKeys) do(a action) {
 	rows, cols := con.Size()
 	switch a.act {
 	case actPaste:
-		b := pasteBytes(a.text)
+		text := a.text
+		if _, ok := cs.Link.(InputMapper); ok {
+			text = StripEsc(text)
+		}
+		b := pasteBytes(text)
 		k.q.Enqueue(b)
 		con.Mark(fmt.Sprintf("pasted %d bytes", len(b)))
 	case actPasteTooBig:

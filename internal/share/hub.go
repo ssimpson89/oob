@@ -67,6 +67,8 @@ type hub struct {
 
 	wrote atomic.Int64 // bytes the typer has written to the link
 
+	keysNoted bool // the link's input note was shown (guarded by mu)
+
 	enqMu    sync.Mutex
 	enqCount int64   // bytes handed to the typer, as far as is known
 	flight   *flight // the AI tool's write being typed
@@ -480,6 +482,11 @@ func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
 		h.mu.Unlock()
 		return
 	}
+	b = h.mapUser(b)
+	if len(b) == 0 {
+		h.mu.Unlock()
+		return
+	}
 	h.lastKey = h.now()
 	h.trackUser(b)
 	h.mu.Unlock()
@@ -491,6 +498,17 @@ func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
 	h.ty.Urgent(b)
 	h.enqCount = h.wrote.Load() + int64(len(b))
 	h.enqMu.Unlock()
+}
+
+// mapUser fits a window's typing to the link (an iLO VSP reads ESC with the
+// byte after it) and shows the link's note once. Call with mu held.
+func (h *hub) mapUser(b []byte) []byte {
+	out, note := console.MapInput(h.tr.Link, b)
+	if note != "" && !h.keysNoted {
+		h.keysNoted = true
+		h.note(note)
+	}
+	return out
 }
 
 // userClear is the window's x key: drop what is queued to be typed.
@@ -729,6 +747,10 @@ func (h *hub) agentOp(p *peer, m msg) error {
 // agentWrite types the AI tool's bytes and returns once they are out. Only
 // while it has the keyboard, and not once the user has taken it back.
 func (h *hub) agentWrite(p *peer, b []byte) error {
+	b, note := console.MapInput(h.tr.Link, b)
+	if note != "" { // keys the link would drop: type none of it
+		return console.ErrKeysDropped
+	}
 	h.enqMu.Lock()
 	h.mu.Lock()
 	var err error

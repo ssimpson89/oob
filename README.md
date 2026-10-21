@@ -201,6 +201,14 @@ If ipmitool cannot open a session, oob prints a hint (IPMI over LAN may be disab
 under iLO Settings > Access > IPMI/DCMI over LAN, off by default on iLO 7). oob passes `-N 2 -R 2` so
 a dead BMC fails in about 11 seconds instead of 21.
 
+The iLO VSP reads ESC together with the byte after it: `ESC ESC` passes both, `ESC (` returns to the
+iLO CLI, and `ESC` plus anything else is dropped. So an arrow key, function key or Alt-key never
+reaches the server (measured on iLO 7). In the console, oob types the Esc key as `ESC ESC` and drops
+the other escape sequences, with a one-time note on the bar. Arrows work in plain shell with
+`ctrl+p`, `ctrl+n`, `ctrl+b` and `ctrl+f`, and in vim with `h`, `j`, `k` and `l`. An AI tool's
+`send_keys` with an arrow or function key gets an error instead. For full keys, `ssh` to the
+server itself (`oob ssh` reaches the iLO, not the server), or use IPMI SOL if IPMI over LAN is enabled.
+
 ## Dell iDRAC (untested)
 
 `"type": "idrac"`. iDRAC runs SSH exec, so oob runs `racadm` commands over SSH. Any output line

@@ -219,3 +219,57 @@ func TestAwaitConsole(t *testing.T) {
 		t.Errorf("silent console: %v", err)
 	}
 }
+
+func TestCLILinkMapInput(t *testing.T) {
+	arrow := []byte("a\x1b[Ab")
+	lone := []byte("\x1b")
+	for _, tc := range []struct {
+		name     string
+		sp       cliSpec
+		atPrompt bool
+		plain    bool
+		mapped   bool
+	}{
+		{"ilo in the console", iloSpec, false, false, true},
+		{"ilo at the BMC prompt", iloSpec, true, false, false},
+		{"ilo over plain ssh", iloSpec, false, true, false},
+		{"idrac", idracSpec, false, false, false},
+		{"supermicro", smcSpec, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newCLILink(&sshLink{}, tc.sp, tc.atPrompt, tc.plain)
+			out, note := l.MapInput(arrow)
+			if tc.mapped {
+				if string(out) != "ab" || note == "" {
+					t.Errorf("arrow: got %q %q, want it dropped with a note", out, note)
+				}
+				if out, _ := l.MapInput(lone); string(out) != "\x1b\x1b" {
+					t.Errorf("lone ESC: got %q, want ESC ESC", out)
+				}
+				return
+			}
+			if string(out) != string(arrow) || note != "" {
+				t.Errorf("arrow: got %q %q, want it unchanged", out, note)
+			}
+			if out, _ := l.MapInput(lone); string(out) != string(lone) {
+				t.Errorf("lone ESC: got %q, want it unchanged", out)
+			}
+		})
+	}
+}
+
+func TestILOMapInputFollowsToggle(t *testing.T) {
+	l, f := newFakeCLI(iloSpec, false, "hpeiLO-> ")
+	if out, _ := l.MapInput([]byte("\x1b")); string(out) != "\x1b\x1b" {
+		t.Fatalf("in the console: %q", out)
+	}
+	if _, at, err := l.Toggle(); err != nil || !at {
+		t.Fatalf("toggle: %v %v", at, err)
+	}
+	if len(f.sent) != 1 || f.sent[0] != "\x1b(" {
+		t.Fatalf("the console escape sent %q, want ESC ( through the link", f.sent)
+	}
+	if out, _ := l.MapInput([]byte("\x1b")); string(out) != "\x1b" {
+		t.Errorf("at the BMC prompt: %q, want unchanged", out)
+	}
+}

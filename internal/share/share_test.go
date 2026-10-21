@@ -41,6 +41,7 @@ type fakeConsole struct {
 	breaks   int
 	atBMC    bool
 	toggle   bool
+	vsp      bool // maps input like an iLO VSP
 }
 
 func newFake() *fakeConsole {
@@ -69,6 +70,13 @@ func (f *fakeConsole) FitSize(rows, cols int) error     { return nil }
 func (f *fakeConsole) SizeIsFree() bool                 { return false }
 func (f *fakeConsole) Serial() bool                     { return true }
 func (f *fakeConsole) SizeLine(r, c int) (string, bool) { return "stty", true }
+
+func (f *fakeConsole) MapInput(b []byte) ([]byte, string) {
+	if !f.vsp {
+		return b, ""
+	}
+	return console.MapVSPInput(b)
+}
 
 func (f *fakeConsole) got() string {
 	f.mu.Lock()
@@ -669,4 +677,79 @@ func TestBreakGoesThroughTheHubAndClearsTheQueue(t *testing.T) {
 	if n != 1 {
 		t.Errorf("breaks = %d", n)
 	}
+}
+
+func TestVSPInputIsMappedAtTheHub(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	win := host(t, f, Options{NoLinger: true})
+	win2, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A lone ESC is sent as ESC ESC, from either window.
+	win.Enqueue([]byte("\x1b"))
+	win2.Enqueue([]byte("a"))
+	eventually(t, "mapped ESC typed", func() bool { return f.got() == "\x1b\x1ba" })
+
+	// An arrow key is dropped, with one note to the windows; typing around it goes on.
+	win.Enqueue([]byte("b\x1b[Ac\x1b[Ad"))
+	eventually(t, "typed around the arrow keys", func() bool { return f.got() == "\x1b\x1babcd" })
+	notes := 0
+	timeout := time.After(300 * time.Millisecond)
+loop:
+	for {
+		select {
+		case n := <-win2.Notes():
+			if n.Text == console.VSPKeysNote {
+				notes++
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+	if notes != 1 {
+		t.Errorf("window got the VSP note %d times, want once per session", notes)
+	}
+
+	// Focus reports are dropped without a word, and ESC ( is never produced.
+	win.Enqueue([]byte("\x1b[I\x1b[O\x1b(e"))
+	eventually(t, "e typed", func() bool { return f.got() == "\x1b\x1babcde" })
+	if strings.Contains(f.got(), "\x1b(") {
+		t.Errorf("ESC ( reached the link: %q", f.got())
+	}
+}
+
+func TestVSPAgentKeysAreRefusedNotDropped(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	host(t, f, Options{NoLinger: true})
+	ai := agent(t)
+	ctx, _, release, err := ai.Lease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := ai.Type(ctx, []byte("ls\x1b[A")); !errors.Is(err, console.ErrKeysDropped) {
+		t.Errorf("arrow key on a VSP: err = %v, want ErrKeysDropped", err)
+	}
+	if got := f.got(); got != "" {
+		t.Errorf("a refused write typed %q", got)
+	}
+	if err := ai.Type(ctx, []byte("\x1b")); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.got(); got != "\x1b\x1b" {
+		t.Errorf("lone ESC from the AI tool typed %q, want ESC ESC", got)
+	}
+}
+
+func TestNonVSPInputIsUnchangedAtTheHub(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	win.Enqueue([]byte("\x1b\x1b[Ax"))
+	eventually(t, "typed", func() bool { return f.got() == "\x1b\x1b[Ax" })
 }
