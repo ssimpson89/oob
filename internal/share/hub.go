@@ -936,6 +936,9 @@ func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 	switch m.Op {
 	case opSizeLine:
 		h.mu.Unlock()
+		if !local || p.agent { // like resize and fit: a joined window doesn't change the host's console, and typing this line would
+			return nil
+		}
 		if sl, ok := h.tr.Link.(sizeLiner); ok {
 			reply.Text, reply.OK = sl.SizeLine(m.Rows, m.Cols)
 		}

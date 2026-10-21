@@ -1133,3 +1133,33 @@ func TestBadKeyBoundariesAreRefused(t *testing.T) {
 		t.Errorf("typed %q for bad boundaries", f.got())
 	}
 }
+
+func TestOnlyTheOwnerGetsTheSizeLine(t *testing.T) {
+	env(t)
+	f := newFake()
+	owner := host(t, f, Options{NoLinger: true})
+	joined, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sizeLine := func(c *Client) (string, bool) {
+		return c.Transport().Link.(interface {
+			SizeLine(rows, cols int) (string, bool)
+		}).SizeLine(24, 80)
+	}
+	if line, ok := sizeLine(owner); !ok || line != "stty" {
+		t.Errorf("the owner got %q, %v; want the size line", line, ok)
+	}
+	// A joined window would type this line at the host's console, resizing it
+	// for everyone: it gets none, like resize and fit.
+	if line, ok := sizeLine(joined); ok || line != "" {
+		t.Errorf("a joined window got %q, %v; want no size line", line, ok)
+	}
+	if err := joined.Transport().Link.FitSize(24, 80); err != nil {
+		t.Errorf("fit from a joined window: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if f.got() != "" {
+		t.Errorf("a joined window's size typed %q at the console", f.got())
+	}
+}
