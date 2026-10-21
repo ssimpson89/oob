@@ -124,6 +124,10 @@ type fakeHost struct {
 	stuck       bool          // Send blocks, like an SSH channel that stopped taking input, until Close
 	unstick     chan struct{} // closed by Close
 	unstickOnce sync.Once
+
+	writes, maxWrite int  // Send calls and the longest one, to see that a line isn't typed in one burst
+	noEcho           bool // never echoes what is typed
+	dropFirst        bool // loses the first byte of the next Send, as a laggy serial link does
 }
 
 func newFakeHost(t *testing.T, name string) *fakeHost {
@@ -163,7 +167,12 @@ func (f *fakeHost) Send(b []byte) error {
 		f.mu.Unlock()
 		return io.ErrClosedPipe
 	}
+	f.writes++
+	f.maxWrite = max(f.maxWrite, len(b))
 	f.sent = append(f.sent, b...)
+	if f.dropFirst && len(b) > 0 {
+		f.dropFirst, b = false, b[1:]
+	}
 	f.mu.Unlock()
 	for _, c := range b {
 		switch c {
@@ -197,8 +206,11 @@ func (f *fakeHost) Send(b []byte) error {
 			if c >= 0x20 && c < 0x7f {
 				f.mu.Lock()
 				f.buf += string(rune(c))
+				noEcho := f.noEcho
 				f.mu.Unlock()
-				f.emit(string(rune(c)))
+				if !noEcho {
+					f.emit(string(rune(c)))
+				}
 			}
 		}
 	}

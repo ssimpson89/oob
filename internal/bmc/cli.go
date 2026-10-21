@@ -264,7 +264,26 @@ func (l *cliLink) FitSize(rows, cols int) error {
 	if l.plain {
 		return l.sshLink.FitSize(rows, cols)
 	}
-	return l.Send([]byte(fmt.Sprintf("stty rows %d cols %d\r", rows, cols)))
+	return l.Send([]byte(sttyLine(rows, cols) + "\r"))
+}
+
+// SizeLine is the command FitSize types, when it types one: the console
+// types it paced and echo-checked instead of calling FitSize. A plain ssh
+// session sends a window change and types nothing.
+func (l *cliLink) SizeLine(rows, cols int) (string, bool) {
+	if l.plain {
+		return "", false
+	}
+	return sttyLine(rows, cols), true
+}
+
+// Serial reports whether what is typed goes to a serial console (iLO VSP,
+// iDRAC com2, Supermicro SOL), where a paste has to be paced. At the BMC's own
+// CLI prompt it is an ssh session with flow control, so it isn't.
+func (l *cliLink) Serial() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.atPrompt
 }
 
 func (l *cliLink) SizeIsFree() bool { return l.plain }

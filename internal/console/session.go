@@ -207,7 +207,9 @@ func Run(cs Setup) (int, error) {
 					default:
 					}
 					r, c := con.Size()
-					_ = cs.Link.FitSize(RemoteRows(r), c)
+					if err := keys.fitSize(RemoteRows(r), c); err != nil {
+						con.Note(sizeError(err), true)
+					}
 				})
 			}
 		}
@@ -275,6 +277,8 @@ type consoleKeys struct {
 
 	autoMu sync.Mutex // guards auto
 	auto   bool
+
+	ty typer // paced paste and size typing
 }
 
 func (k *consoleKeys) autoOn() bool {
@@ -302,34 +306,67 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 		return false
 	default:
 	}
-	if len(fwd) > 0 {
-		if k.cs.Link.Send(fwd) != nil {
-			return false
+	// Bytes typed before a paste go out before it; those after it are typed
+	// into a running paste and dropped by send.
+	head := fwd
+	for _, a := range acts {
+		if a.act == actPaste {
+			head = fwd[:a.at]
+			break
 		}
+	}
+	if !k.send(head) {
+		return false
 	}
 	k.con.SetMode(k.parser.Mode())
 	for _, a := range acts {
-		k.do(a)
+		if !k.do(a) {
+			return false
+		}
 	}
-	return true
+	return k.send(fwd[len(head):])
 }
 
-// do carries out one action.
-func (k *consoleKeys) do(a action) {
+// send types keystrokes at the remote. During a paste they are dropped with a
+// note on the bar; waiting for a size line to finish is fine. It reports false
+// if the link refused the bytes.
+func (k *consoleKeys) send(b []byte) bool {
+	if len(b) == 0 {
+		return true
+	}
+	if k.busy("typing") {
+		return true
+	}
+	k.ty.wmu.Lock()
+	defer k.ty.wmu.Unlock()
+	return k.cs.Link.Send(b) == nil
+}
+
+// do carries out one action. It reports false if the link refused a paste.
+func (k *consoleKeys) do(a action) bool {
 	cs, con := k.cs, k.con
 	rows, cols := con.Size()
 	switch a.act {
+	case actPaste:
+		return k.pasteText(a.text)
+	case actStop:
+		k.stopPaste()
+	case actRaw:
+		k.toggleRaw()
 	case actSize:
-		if err := cs.Link.FitSize(RemoteRows(rows), cols); err != nil {
-			con.Note("size: "+err.Error(), true)
-			return
+		if k.busy("size") {
+			return true
+		}
+		if err := k.fitSize(RemoteRows(rows), cols); err != nil {
+			con.Note(sizeError(err), true)
+			return true
 		}
 		con.Note(fmt.Sprintf("sent size %dx%d", RemoteRows(rows), cols), false)
 		con.Mark(fmt.Sprintf("size sent: %d rows, %d cols", RemoteRows(rows), cols))
 	case actAuto:
 		if cs.Link.SizeIsFree() {
 			con.Note("ssh follows the window size automatically", false)
-			return
+			return true
 		}
 		k.autoMu.Lock()
 		k.auto = !k.auto
@@ -344,22 +381,31 @@ func (k *consoleKeys) do(a action) {
 	case actLog:
 		con.ToggleLog()
 	case actBreak:
+		if k.busy("key") {
+			return true
+		}
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
-			return
+			return true
 		}
 		con.Note("BREAK sent", false)
 		con.Mark("BREAK sent")
 	case actSysrq:
+		if k.busy("key") {
+			return true
+		}
 		if err := cs.Link.Break(); err != nil {
 			con.Note("break: "+err.Error(), true)
-			return
+			return true
 		}
 		time.Sleep(sysrqGap)
 		_ = cs.Link.Send([]byte{a.arg})
 		con.Note("SysRq "+string(a.arg)+" sent", false)
 		con.Mark("SysRq " + string(a.arg) + " sent")
 	case actBMC:
+		if k.busy("key") {
+			return true
+		}
 		t, ok := cs.Link.(toggler)
 		if !ok {
 			msg := cs.NoToggle
@@ -367,21 +413,24 @@ func (k *consoleKeys) do(a action) {
 				msg = "no BMC prompt on IPMI SOL"
 			}
 			con.Note(msg, false)
-			return
+			return true
 		}
 		kind, at, err := t.Toggle()
 		con.SetKind(kind, at)
 		if err != nil {
 			con.Note("bmc prompt: "+err.Error(), true)
-			return
+			return true
 		}
 		con.Note("now at "+kind, false)
 		con.Mark("switched to " + kind)
 	case actLiteral:
+		if k.busy("key") {
+			return true
+		}
 		_ = cs.Link.Send([]byte{escapeByte})
 	case actPower:
 		if cs.Power == nil {
-			return
+			return true
 		}
 		con.Note("power cycling...", false)
 		con.Mark("power cycle requested")
@@ -402,6 +451,7 @@ func (k *consoleKeys) do(a action) {
 	case actHelp:
 		con.Print(helpText())
 	}
+	return true
 }
 
 // RestoreOnSignal restores the terminal and exits with 128+signal if one of sigs

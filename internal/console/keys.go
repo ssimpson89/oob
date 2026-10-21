@@ -29,13 +29,18 @@ const (
 	actPower
 	actDisconnect
 	actHelp
-	actCancel // left command mode with nothing done (esc, unknown key, n)
+	actCancel // left command mode with nothing done (unknown key, n)
+	actRaw    // toggle raw (unpaced) paste
+	actStop   // stop a paste in progress (x, or esc in command mode)
+	actPaste  // bracketed paste finished: action.text is the pasted text
 )
 
 // action is a parsed key: what to do, plus the SysRq letter.
 type action struct {
-	act act
-	arg byte
+	act  act
+	arg  byte
+	text string // actPaste: what was pasted
+	at   int    // actPaste: how many of the forwarded bytes came before it
 }
 
 // keyMode is where the key parser is.
@@ -68,6 +73,8 @@ var commandKeys = []binding{
 	{"b", actBreak, "break", "Send BREAK", 7, true},
 	{"c", actBMC, "bmc prompt", "Toggle between the host console and the BMC's own CLI prompt (iLO, iDRAC, Supermicro SSH SOL; not IPMI SOL)", 3, true},
 	{"r", actSysrq, "r+key", "SysRq: BREAK, then the next key (r then b reboots a Linux console)", 6, true},
+	{"w", actRaw, "raw paste", "Toggle raw paste: send a paste all at once instead of paced and echo-checked (serial consoles; paced is the default)", 1, false},
+	{"x", actStop, "stop paste", "Stop a paste in progress (esc does the same)", 1, false},
 	{"p", actPower, "power cycle", "Power cycle the machine (asks y/n; ipmitool, or off then on over a second SSH connection on an iLO)", 5, true},
 	{"]", actLiteral, "send ^]", "Send ctrl+] itself", 2, true},
 	{".", actDisconnect, "disconnect", "Disconnect", keepAlways, false},
@@ -100,6 +107,10 @@ const (
 	pasteEnd   = "\x1b[201~"
 )
 
+// pasteChunkMax caps what a paste collects before it is handed over, in case
+// the end marker never comes.
+const pasteChunkMax = 4 << 20
+
 // escWait is how long a held ESC waits for the rest of its sequence before it
 // is taken as a bare key: short enough to feel instant, long enough for a
 // terminal's write to arrive in a second read.
@@ -113,7 +124,8 @@ type keyParser struct {
 	started bool // false until the first byte: the session start counts as a line start
 	midLine bool // the last byte forwarded was not CR or LF
 	tilde   bool // a ~ at line start is held back until the next byte
-	paste   bool // between the paste markers: bytes go to the remote untouched
+	paste   bool // between the paste markers: bytes are collected, not typed
+	pasted  []byte
 	held    []byte
 	skip    int // command mode is skipping an escape sequence: 1 CSI, 2 SS3
 }
@@ -176,7 +188,7 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 			}
 			if n > 0 {
 				if string(b[i:i+n]) == pasteStart {
-					p.paste = true
+					p.paste, p.pasted = true, nil
 					p.skip = 0
 					if p.tilde { // the held ~ was typed before the paste
 						p.tilde = false
@@ -188,16 +200,23 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 						acts = append(acts, action{act: actCancel})
 					}
 				} else {
-					p.paste = false
+					if p.paste && len(p.pasted) > 0 {
+						acts = append(acts, action{act: actPaste, text: string(p.pasted), at: len(fwd)})
+					}
+					p.paste, p.pasted = false, nil
 				}
 				i += n - 1
 				continue
 			}
 		}
 		if p.paste {
-			fwd = append(fwd, c)
+			p.pasted = append(p.pasted, c)
 			p.midLine = c != '\r' && c != '\n'
 			p.started = true
+			if len(p.pasted) >= pasteChunkMax { // no end marker in sight: hand over what there is
+				acts = append(acts, action{act: actPaste, text: string(p.pasted), at: len(fwd)})
+				p.pasted = nil
+			}
 			continue
 		}
 		if p.mode == modeConsole {
@@ -247,8 +266,13 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 				i++ // CSI or SS3: skip to its final byte
 				continue
 			}
+			prev := p.mode
 			p.mode = modeConsole
-			acts = append(acts, action{act: actCancel})
+			if prev == modeCommand {
+				acts = append(acts, action{act: actStop}) // esc: back to the console, and stops a paste
+			} else {
+				acts = append(acts, action{act: actCancel})
+			}
 			continue
 		}
 		switch p.mode {
@@ -257,7 +281,7 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 		case modeSysrq:
 			p.mode = modeConsole
 			if isSysrqKey(c) {
-				acts = append(acts, action{actSysrq, c})
+				acts = append(acts, action{act: actSysrq, arg: c})
 			} else {
 				acts = append(acts, action{act: actCancel})
 			}
@@ -292,6 +316,10 @@ func (p *keyParser) command(c byte) []action {
 		return nil
 	case ']', escapeByte: // ctrl+] twice also sends it, as in telnet
 		return []action{{act: actLiteral}}
+	case 'w':
+		return []action{{act: actRaw}}
+	case 'x':
+		return []action{{act: actStop}}
 	case 'p':
 		p.mode = modeConfirm
 		return nil

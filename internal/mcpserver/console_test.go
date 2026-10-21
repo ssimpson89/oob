@@ -320,3 +320,48 @@ func TestSessionLog(t *testing.T) {
 		t.Errorf("logging should be off by default: %q", out)
 	}
 }
+
+// send_command types each line a few characters ahead of the echo instead of
+// writing it in one burst, so a serial console behind a slow link can't drop
+// part of it.
+func TestSendCommandTypesPacedAndEchoChecked(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	line := "echo " + strings.Repeat("abcdefghij", 10)
+	out, isErr := h.send("s1", line+"\necho two")
+	if isErr || !strings.Contains(out, "sh: echo two: ok") {
+		t.Fatalf("got %q %v", out, isErr)
+	}
+	f := h.host("node01")
+	if got := strings.Join(f.entered(), "|"); got != line+"|echo two" {
+		t.Errorf("host got %q", got)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.maxWrite > 9 {
+		t.Errorf("longest write was %d bytes; a line must be typed a few characters at a time", f.maxWrite)
+	}
+}
+
+func TestSendCommandStopsBeforeEnterWhenTheEchoIsWrong(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	f := h.host("node01")
+	f.mu.Lock()
+	f.dropFirst = true
+	f.mu.Unlock()
+	out, isErr := h.send("s1", "uname -r\necho two")
+	if !isErr || !strings.Contains(out, "Sending stopped at line 1") || !strings.Contains(out, "ctrl+u") {
+		t.Errorf("got %q %v, want a stop with the ctrl+u advice", out, isErr)
+	}
+	if got := f.entered(); len(got) != 0 {
+		t.Errorf("host ran %q; Enter must not be pressed on a line that echoed wrong", got)
+	}
+	// The session is still usable: clear the line, then send again.
+	if out, isErr := h.call("send_keys", map[string]any{"session": "s1", "keys": []string{"ctrl+u"}}); isErr {
+		t.Fatalf("send_keys: %q", out)
+	}
+	if out, isErr := h.send("s1", "echo three"); isErr || !strings.Contains(out, "sh: echo three: ok") {
+		t.Errorf("after the stop: %q %v", out, isErr)
+	}
+}
