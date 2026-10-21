@@ -21,6 +21,12 @@ type Typer struct {
 	// queue goes out at once; delays only separate bytes. Both zero makes
 	// Typer a plain writer.
 	CharDelay, LineDelay time.Duration
+	// EscDelay is the gap after a lone ESC (one not starting an arrow-key or
+	// similar sequence). Programs like vim wait briefly after ESC to see if a
+	// sequence follows; if the next key reaches them in that window, ESC and
+	// the key merge into one "Alt-key" and both are lost. Over a serial
+	// console keys typed apart can arrive bunched, so give ESC room.
+	EscDelay time.Duration
 	// Paced, if set, is asked before each byte; while it says false the
 	// delays are zero. A console that can move between a serial line and an
 	// ssh prompt uses this.
@@ -118,7 +124,7 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		hold    <-chan time.Time // the gap after the last byte, while it runs
 	)
 	paced := func() bool {
-		return (t.CharDelay > 0 || t.LineDelay > 0) && (t.Paced == nil || t.Paced())
+		return (t.CharDelay > 0 || t.LineDelay > 0 || t.EscDelay > 0) && (t.Paced == nil || t.Paced())
 	}
 	progress := func() { // an unpaced write is over before anyone could see it
 		if t.Progress != nil && (len(q) == 0 || paced()) {
@@ -155,6 +161,9 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		}
 		if last == '\r' || last == '\n' {
 			return t.LineDelay
+		}
+		if last == 0x1b && (len(next) == 0 || (next[0] != '[' && next[0] != 'O')) {
+			return max(t.EscDelay, t.CharDelay)
 		}
 		return t.CharDelay
 	}

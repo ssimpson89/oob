@@ -300,3 +300,15 @@ func TestWriteErrorEndsRunAndReleasesEveryone(t *testing.T) {
 	isClosed(t, done)
 	isClosed(t, r.ty.Enqueue([]byte("x")))
 }
+
+func TestLoneEscGetsRoomButSequencesDont(t *testing.T) {
+	r := newRig(t, true, cd, ld)
+	r.ty.EscDelay = 150 * time.Millisecond
+	// ESC then ":" (vim) gets the ESC gap; an arrow key (ESC [ A) does not.
+	isClosed(t, r.ty.Enqueue([]byte("\x1b:\x1b[A")))
+	got := strings.Join(r.stop(), " ")
+	want := `w:"\x1b" d:150ms w:":" d:10ms w:"\x1b" d:10ms w:"[" d:10ms w:"A" d:10ms`
+	if got != want {
+		t.Errorf("log\n got  %s\n want %s", got, want)
+	}
+}

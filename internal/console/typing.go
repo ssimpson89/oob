@@ -35,6 +35,9 @@ type sizeLiner interface {
 const (
 	DefaultCharDelay = 10 * time.Millisecond
 	DefaultLineDelay = 200 * time.Millisecond
+	// DefaultEscDelay keeps a lone ESC apart from the next key, so vim and
+	// readline don't read the two as one Alt-key. See typer.Typer.EscDelay.
+	DefaultEscDelay = 150 * time.Millisecond
 )
 
 // Pacing overrides the default delays for serial links. A nil field keeps the
@@ -58,7 +61,7 @@ func PacingMS(char, line *int) Pacing {
 // NewTyper makes the input queue for a link: paced on a serial link, a plain
 // writer otherwise. Run it with the link's Send as the writer.
 func NewTyper(l Link, p Pacing) *typer.Typer {
-	t := &typer.Typer{CharDelay: DefaultCharDelay, LineDelay: DefaultLineDelay}
+	t := &typer.Typer{CharDelay: DefaultCharDelay, LineDelay: DefaultLineDelay, EscDelay: DefaultEscDelay}
 	if p.Char != nil {
 		t.CharDelay = *p.Char
 	}
