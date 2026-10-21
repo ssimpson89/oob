@@ -240,16 +240,23 @@ func (l *cliLink) Break() error {
 
 // Disconnect leaves the console if it is in it (the console's escape), then
 // sends "exit" to log out. At the CLI prompt it only sends "exit".
+// disconnectPromptWait is how long Disconnect waits for the BMC prompt after
+// the console escape before giving up and hanging up.
+var disconnectPromptWait = 3 * time.Second
+
 func (l *cliLink) Disconnect() error {
 	l.disconnected.Store(true)
 	l.mu.Lock()
 	at := l.atPrompt
 	l.mu.Unlock()
 	if !at {
-		if l.Send(l.sp.esc) != nil {
+		// Only type "exit" once the BMC's own prompt is back. If the escape
+		// didn't take, "exit" would land on the server's console instead (at
+		// a login prompt it becomes a username), so just hang up.
+		l.expect()
+		if l.Send(l.sp.esc) != nil || !l.waitPrompt(disconnectPromptWait) {
 			return l.closeSess()
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
 	if l.Send([]byte("exit\r")) != nil {
 		return l.closeSess()
