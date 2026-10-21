@@ -821,7 +821,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		return fail(err)
 	}
 	defer release()
-	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack+c.typingTime(wire.Len(), 1))
+	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack+c.typingBudget([]byte(wire.String())))
 	defer cancel()
 	if len(in.Keys) > 0 {
 		c.tx.Mark("agent pressed " + strings.Join(in.Keys, ", "))

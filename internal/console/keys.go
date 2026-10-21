@@ -41,7 +41,7 @@ type action struct {
 	act  act
 	arg  byte
 	text string // actPaste: what was pasted
-	at   int    // actPaste: how many of the forwarded bytes came before it
+	at   int    // how many of the forwarded bytes came before it
 }
 
 // keyMode is where the key parser is.
@@ -180,7 +180,17 @@ func (p *keyParser) Feed(b []byte) (fwd []byte, acts []action) {
 }
 
 func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
+	// Every action records how many forwarded bytes precede it, so the caller
+	// can run actions and type bytes in the order the user pressed the keys.
+	stamped := 0
+	stamp := func() {
+		for ; stamped < len(acts); stamped++ {
+			acts[stamped].at = len(fwd)
+		}
+	}
+	defer stamp()
 	for i := 0; i < len(b); i++ {
+		stamp()
 		c := b[i]
 		if c == 0x1b {
 			n, partial := markerAt(b[i:])

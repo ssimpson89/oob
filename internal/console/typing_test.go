@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // All the timing here is virtual: the typing queue's Wait is replaced by one
@@ -534,5 +537,68 @@ func TestTraceLogsBothWaysAndFixesTheMode(t *testing.T) {
 	t.Setenv("OOB_DEBUG_PASTE", "")
 	if tr, err := openTrace(); tr != nil || err != nil {
 		t.Errorf("unset: %v, %v; want no trace", tr, err)
+	}
+}
+
+func TestEnterRawOpensTheTraceBeforeRawMode(t *testing.T) {
+	raw := 0
+	rawFn := func(int) (*term.State, error) { raw++; return &term.State{}, nil }
+	boom := errors.New("trace refused")
+	if _, _, err := enterRaw(0, func() (*trace, error) { return nil, boom }, rawFn); !errors.Is(err, boom) || raw != 0 {
+		t.Errorf("err %v, raw mode entered %d times; want the trace error and no raw mode", err, raw)
+	}
+	if _, st, err := enterRaw(0, func() (*trace, error) { return nil, nil }, rawFn); err != nil || st == nil || raw != 1 {
+		t.Errorf("err %v, state %v, raw %d; want raw mode entered once", err, st, raw)
+	}
+	// A raw-mode failure closes the trace that was already open.
+	f, err := os.CreateTemp(t.TempDir(), "trace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &trace{w: f}
+	_, _, err = enterRaw(0, func() (*trace, error) { return tr, nil }, func(int) (*term.State, error) { return nil, boom })
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, werr := f.Write([]byte("x")); werr == nil {
+		t.Error("trace file still open after raw mode failed")
+	}
+}
+
+func TestKeyAfterCtrlXInTheSameReadIsKept(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	r.paste(strings.Repeat("x", 100))
+	delay := g.held(t)
+	r.k.Input([]byte(string(rune(escapeByte)) + "xz"))
+	delay <- time.Time{}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-g.wrote:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("sent %q, want the queue cleared and then z", g.text())
+		}
+	}
+	if got := g.text(); got != "xz" {
+		t.Errorf("sent %q, want xz", got)
+	}
+}
+
+func TestCtrlXClearsEvenIfPendingIsStale(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	r.k.ty.Progress = nil // the count never catches up, as if Enqueue had not reported yet
+	r.paste(strings.Repeat("x", 100))
+	delay := g.held(t)
+	if r.con.Pending() != 0 {
+		t.Fatalf("pending %d, want the stale count 0", r.con.Pending())
+	}
+	r.k.Input([]byte(string(rune(escapeByte)) + "x"))
+	delay <- time.Time{}
+	r.k.Input([]byte("z"))
+	<-g.wrote
+	<-g.wrote
+	if got := g.text(); got != "xz" {
+		t.Errorf("sent %q, want the queue cleared even though pending read 0", got)
 	}
 }

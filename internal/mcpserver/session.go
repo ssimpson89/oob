@@ -8,6 +8,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -57,6 +58,7 @@ type session struct {
 	ty     *typer.Typer
 	stopTy context.CancelFunc
 	txErr  error // guarded by mu
+	wrote  int   // bytes the link has taken, ever; guarded by mu
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -116,11 +118,13 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 func (c *session) runTyper(ctx context.Context, tr *bmc.ConsoleTransport) {
 	_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
 		err := tr.Link.Send(b)
+		c.mu.Lock()
 		if err != nil {
-			c.mu.Lock()
 			c.txErr = err
-			c.mu.Unlock()
+		} else {
+			c.wrote += len(b)
 		}
+		c.mu.Unlock()
 		return len(b), err
 	}))
 }
@@ -290,6 +294,7 @@ func (c *session) closeTransport() {
 func (c *session) write(ctx context.Context, b []byte) error {
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
+	before := c.wrote
 	c.mu.Unlock()
 	err := c.guarded(ctx, func() error {
 		if c.sh != nil { // the hub's one typer paces it, with the lease and typing checks
@@ -304,15 +309,32 @@ func (c *session) write(ctx context.Context, b []byte) error {
 		}
 		return shareError(err)
 	}
+	if c.sh != nil { // the hub reports bytes it dropped as errors
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	switch {
+	// The queue closes its waiters for dropped bytes too, such as when the
+	// remote hangs up during pacing, so count what the link took.
+	switch got := c.wrote - before; {
 	case c.txErr != nil:
 		return c.txErr
+	case got < len(b) && c.ended:
+		return fmt.Errorf("%s, and only %d of %d bytes were typed. Disconnect and connect again", c.endMsg, got, len(b))
 	case c.closed:
 		return errors.New("the session was closed before everything was typed")
+	case got < len(b):
+		return fmt.Errorf("only %d of %d bytes were typed before sending stopped", got, len(b))
 	}
 	return nil
+}
+
+// typingBudget is the typing time for a wire payload: a LineDelay for each
+// CR or LF in it, a CharDelay for each byte, and one more LineDelay for an
+// Enter still pending from an earlier call.
+func (c *session) typingBudget(wire []byte) time.Duration {
+	lines := bytes.Count(wire, []byte{'\r'}) + bytes.Count(wire, []byte{'\n'})
+	return c.typingTime(len(wire), lines+1)
 }
 
 // typingTime is how long the queue takes to type n bytes in lines lines, so a

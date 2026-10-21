@@ -766,6 +766,9 @@ func (h *hub) agentWrite(p *peer, b []byte) error {
 	if h.txErr != nil { // the typer stopped, and dropped the bytes
 		return h.txErr
 	}
+	if h.closed { // the console ended, and the typer dropped what was left
+		return ErrClosed
+	}
 	if h.flight == f {
 		h.flight = nil
 	}
