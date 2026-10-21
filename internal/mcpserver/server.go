@@ -96,7 +96,7 @@ const (
 	defaultMaxSessions = 8
 
 	statusWorkers = 16
-	statusMaxRows = 500
+	statusMaxRows = 500 // the most hosts one status or list_hosts page may ask for
 
 	// What one BMC result returns at most (bytes); the rest is cut.
 	bmcTextMax = 48 << 10

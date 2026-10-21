@@ -2,6 +2,9 @@ package mcpserver
 
 import (
 	"encoding/json"
+	"fmt"
+	"github.com/ssimpson89/oob/internal/bmc"
+	"github.com/ssimpson89/oob/internal/config"
 	"strings"
 	"testing"
 	"time"
@@ -444,6 +447,139 @@ func TestBreakIsRefusedWithStagedInput(t *testing.T) {
 		}
 		if f.breaks != 1 {
 			t.Errorf("breaks = %d after clearing the line", f.breaks)
+		}
+	}
+}
+
+func bigConfig(h *harness, n int) {
+	pad := strings.Repeat("padding ", 40)
+	for i := range n {
+		h.cfg.Hosts[fmt.Sprintf("big%04d", i)] = config.Host{IP: fmt.Sprintf("192.0.2.%d", i%250+1), Type: "ipmi", Notes: pad, Tags: []string{"bulk"}}
+	}
+}
+
+// resultSizes is the size of a result's text and of its structured form.
+func resultSizes(t *testing.T, res *mcp.CallToolResult) (int, int) {
+	t.Helper()
+	var n int
+	for _, c := range res.Content {
+		n += len(c.(*mcp.TextContent).Text)
+	}
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n, len(b)
+}
+
+// 4340519376: list_hosts and status keep both the text and the structured
+// result under a budget, and page through what is left.
+func TestLongListsArePagedAndBounded(t *testing.T) {
+	h := start(t, Options{}, "")
+	bigConfig(h, 600)
+	for name := range h.cfg.Hosts {
+		if strings.HasPrefix(name, "big") {
+			h.statuses[name] = bmc.StatusResult{Text: strings.Repeat("ERROR: connection refused by the BMC. ", 20), Failed: true}
+		}
+	}
+	for _, tool := range []string{"list_hosts", "status"} {
+		arg := map[string]string{"list_hosts": "filter", "status": "selector"}[tool]
+		seen := map[string]int{}
+		offset, pages := 0, 0
+		for {
+			args := map[string]any{arg: "big*", "limit": 500}
+			if offset > 0 {
+				args["offset"] = offset
+			}
+			res := h.result(tool, args)
+			if res.IsError {
+				t.Fatalf("%s offset %d: %+v", tool, offset, res.Content)
+			}
+			txt, structured := resultSizes(t, res)
+			if txt > resultMax || structured > resultMax || txt+structured > 2*pageBudget+4096 {
+				t.Errorf("%s offset %d: text %d bytes, structured %d bytes", tool, offset, txt, structured)
+			}
+			b, _ := json.Marshal(res.StructuredContent)
+			var page struct {
+				Hosts      []struct{ Name string }
+				Total      int
+				Offset     int
+				Truncated  bool
+				NextOffset int `json:"next_offset"`
+			}
+			if err := json.Unmarshal(b, &page); err != nil {
+				t.Fatal(err)
+			}
+			if page.Total != 600 || page.Offset != offset || len(page.Hosts) == 0 {
+				t.Fatalf("%s: page %+v (offset %d)", tool, page, offset)
+			}
+			for _, r := range page.Hosts {
+				seen[r.Name]++
+			}
+			pages++
+			if !page.Truncated {
+				if page.NextOffset != 0 || offset+len(page.Hosts) != 600 {
+					t.Errorf("%s: last page %+v", tool, page)
+				}
+				break
+			}
+			if page.NextOffset != offset+len(page.Hosts) {
+				t.Errorf("%s: next_offset %d after %d hosts from %d", tool, page.NextOffset, len(page.Hosts), offset)
+			}
+			if !strings.Contains(res.Content[0].(*mcp.TextContent).Text, fmt.Sprintf("offset=%d", page.NextOffset)) {
+				t.Errorf("%s: the text doesn't say how to get the next page", tool)
+			}
+			offset = page.NextOffset
+			if pages > 100 {
+				t.Fatal("paging never ends")
+			}
+		}
+		if pages < 2 || len(seen) != 600 {
+			t.Errorf("%s: %d pages covered %d hosts", tool, pages, len(seen))
+		}
+		for name, n := range seen {
+			if n != 1 {
+				t.Errorf("%s: %s appeared %d times", tool, name, n)
+			}
+		}
+	}
+	for _, tool := range []string{"list_hosts", "status"} {
+		for _, args := range []map[string]any{{"limit": -1}, {"offset": -1}, {"limit": 501}, {"offset": 100000}} {
+			if out, isErr := h.call(tool, args); !isErr {
+				t.Errorf("%s %v was accepted: %.80q", tool, args, out)
+			}
+		}
+	}
+	// A small result is whole, with nothing to page.
+	res := h.result("list_hosts", map[string]any{"filter": "node*"})
+	b, _ := json.Marshal(res.StructuredContent)
+	if !strings.Contains(string(b), `"truncated":false`) || strings.Contains(string(b), "next_offset") {
+		t.Errorf("a short list says %s", b)
+	}
+}
+
+// 4340519413: names and addresses from the host file are cleaned in the
+// structured result too, for both tools.
+func TestStructuredOutputIsSanitized(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.cfg.Hosts["evil\x1b[31mhost\x1b]0;title\x07"] = config.Host{IP: "192.0.2.50\x1b[2J\r\nx", Type: "ipmi\x1b[0m", Notes: "n\x1b[1mote", Tags: []string{"t\x1b[0mag"}}
+	h.statuses["evil\x1b[31mhost\x1b]0;title\x07"] = bmc.StatusResult{Text: "on\x1b[31m"}
+	for _, tool := range []string{"list_hosts", "status"} {
+		arg := map[string]string{"list_hosts": "filter", "status": "selector"}[tool]
+		res := h.result(tool, map[string]any{arg: "evil*"})
+		b, _ := json.Marshal(res.StructuredContent)
+		for _, bad := range []string{`\u001b`, `\u0007`, `\u001B`, "title", `\r`, `\n`} {
+			if strings.Contains(string(b), bad) {
+				t.Errorf("%s: structured output has %q: %s", tool, bad, b)
+			}
+		}
+		if !strings.Contains(string(b), "evilhost") {
+			t.Errorf("%s: host missing from %s", tool, b)
+		}
+		for _, c := range res.Content {
+			if txt := c.(*mcp.TextContent).Text; strings.ContainsAny(txt, "\x1b\x07") {
+				t.Errorf("%s: text has controls: %q", tool, txt)
+			}
 		}
 	}
 }

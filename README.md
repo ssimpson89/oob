@@ -278,8 +278,8 @@ Host tools, which take host names from `list_hosts`:
 
 | Tool | What it does |
 | --- | --- |
-| `list_hosts` | Name, BMC address, type, tags and notes. Never passwords, keys or key paths |
-| `power_status`, `status` | Power state of one host, or of many at once (glob, text or `tag:x`) |
+| `list_hosts` | Name, BMC address, type, tags and notes. Never passwords, keys or key paths. Long lists come in pages (`limit`, `offset`, `next_offset`) |
+| `power_status`, `status` | Power state of one host, or of many at once (glob, text or `tag:x`; paged like `list_hosts`) |
 | `sel_list`, `sensors`, `bmc_info` | Event log (newest entries when it is long), sensor readings, BMC identity |
 | `power`, `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset` | Change state. Always asks you first |
 
