@@ -343,6 +343,11 @@ func (f *fakeHost) transport() *bmc.ConsoleTransport {
 		tr.Kind = "vsp"
 		tr.Toggle = func() (string, bool, error) {
 			f.mu.Lock()
+			if f.stuck {
+				f.mu.Unlock()
+				<-f.unstick
+				return "", false, io.ErrClosedPipe
+			}
 			f.atBMC = !f.atBMC
 			at := f.atBMC
 			f.mu.Unlock()

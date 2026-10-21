@@ -2,8 +2,10 @@ package mcpserver
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGuardCatchesRebootLikeCommands(t *testing.T) {
@@ -290,5 +292,90 @@ func TestEscapeToTheBMCNeedsApproval(t *testing.T) {
 	h.keys("s1", "", "ctrl+u") // the ESC is no longer the last byte sent
 	if out, isErr := h.call("send_keys", map[string]any{"session": "s1", "text": "(", "keys": []string{"esc"}}); isErr {
 		t.Errorf("( then ESC isn't the escape: %q", out)
+	}
+}
+
+// 4340888964: ctrl+d on a nonempty Readline line deletes a character; the
+// line after it can't be read, so the next Enter needs approval.
+func TestCtrlDOnANonemptyLineNeedsApprovalAtEnter(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.keys("s1", "xreboot"); isErr {
+		t.Fatalf("%q", out)
+	}
+	if out, isErr := h.keys("s1", "", "ctrl+a", "ctrl+d"); isErr {
+		t.Fatalf("%q", out)
+	}
+	before := h.host("node01").rawSent()
+	if out, isErr := h.keys("s1", "", "enter"); !isErr || !strings.Contains(out, "can't ask") {
+		t.Errorf("Enter after ctrl+a, ctrl+d should need approval: %q %v", out, isErr)
+	}
+	if h.host("node01").rawSent() != before {
+		t.Error("the Enter was sent")
+	}
+}
+
+// The user is shown the target and the command with anything invisible or
+// reordering written out, so a bidi override or escape can't disguise them.
+func TestApprovalShowsHiddenCharactersEscaped(t *testing.T) {
+	h := start(t, Options{}, "decline")
+	h.connect()
+	h.keys("s1", "reboot\u202e", "enter")
+	asked := h.askedAll()
+	if asked == "" {
+		t.Fatal("nothing was asked")
+	}
+	if strings.ContainsRune(asked, '\u202e') || !strings.Contains(asked, `reboot\u202e`) {
+		t.Errorf("send_keys text not shown escaped: %q", asked)
+	}
+	if len(h.host("node01").entered()) != 0 {
+		t.Error("ran without approval")
+	}
+}
+
+func TestVisibleEscapesWhatCanDisguiseText(t *testing.T) {
+	in := "node01\u202e (192.0.2.1)\x1b[2J\x00\u200b\u00a0\xff\nreboot\ttab \u00e9 \ufffd"
+	got := visible(in)
+	for _, r := range got {
+		if r != '\n' && !strconv.IsPrint(r) {
+			t.Errorf("unprintable %U left in %q", r, got)
+		}
+	}
+	for _, want := range []string{`\u202e`, `\x1b`, `\x00`, `\u200b`, `\u00a0`, `\xff`, `\t`, "\nreboot", "\u00e9", "\ufffd"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q lacks %q", got, want)
+		}
+	}
+	if visible("plain text (192.0.2.1): uname -r") != "plain text (192.0.2.1): uname -r" {
+		t.Error("ordinary text changed")
+	}
+	// The approval target is escaped too.
+	if l := (target{name: "node01\u202e", addr: "192.0.2.1"}).label(); strings.ContainsRune(visible(l), '\u202e') {
+		t.Error("label not escaped")
+	}
+}
+
+// A BMC prompt switch that never completes can't hold the session or outlast the call.
+func TestStuckBMCPromptEndsAndForgetsTheSession(t *testing.T) {
+	old := bmcPromptTimeout
+	bmcPromptTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { bmcPromptTimeout = old })
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) { f.toggle = true }
+	h.connect()
+	f := h.host("node01")
+	f.setStuck()
+	began := time.Now()
+	out, isErr := h.call("bmc_prompt", map[string]any{"session": "s1", "to": "bmc"})
+	if time.Since(began) > 8*time.Second {
+		t.Errorf("bmc_prompt took %s", time.Since(began))
+	}
+	if !isErr || !strings.Contains(out, "stopped accepting input") {
+		t.Errorf("bmc_prompt: %q %v", out, isErr)
+	}
+	eventually(t, "the transport is closed", f.isClosed)
+	out, isErr = h.call("read_output", map[string]any{"session": "s1"})
+	if !isErr || !strings.Contains(out, "closed") {
+		t.Errorf("the session wasn't forgotten: %q %v", out, isErr)
 	}
 }

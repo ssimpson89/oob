@@ -851,6 +851,9 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 	return text(false, c.output()), nil, nil
 }
 
+// bmcPromptTimeout bounds one switch between the console and the BMC prompt.
+var bmcPromptTimeout = 30 * time.Second
+
 func (s *server) bmcPrompt(ctx context.Context, _ *mcp.CallToolRequest, in bmcPromptIn) (*mcp.CallToolResult, any, error) {
 	c, err := s.session(in.Session)
 	if err != nil {
@@ -872,10 +875,24 @@ func (s *server) bmcPrompt(ctx context.Context, _ *mcp.CallToolRequest, in bmcPr
 	if c.onBMC() == want {
 		return text(false, "The session is already at the "+in.To+"."), nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, bmcPromptTimeout)
 	defer cancel()
 	changed := c.changes()
-	kind, at, err := c.tr.Toggle()
+	// Toggle writes to the console, so like every other write it can't be
+	// allowed to block forever while holding the send lock.
+	var kind string
+	var at bool
+	err = c.guarded(ctx, func() error {
+		var e error
+		kind, at, e = c.tr.Toggle()
+		return e
+	})
+	if err != nil {
+		if errors.Is(err, errStuck) {
+			s.stuck(c, err) // kind and at may still be written by the stuck call: don't read them
+			return fail("couldn't switch: ", err)
+		}
+	}
 	c.mu.Lock()
 	c.kind, c.atBMC = kind, at
 	c.mu.Unlock()

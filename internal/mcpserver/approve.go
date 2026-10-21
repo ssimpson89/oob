@@ -14,7 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -71,10 +73,10 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 			return nil, errors.New("refused, so nothing was done: that approval has expired or was for a different call; call again to ask the user")
 		}
 		if r, ok := req.Params.InputResponses[approvalID].(*mcp.ElicitResult); ok && r.Action == "accept" && r.Content["allow"] == true {
-			dev.note("user approved: " + what)
+			dev.note("user approved: " + visible(what))
 			return nil, nil
 		}
-		dev.note("user refused: " + what)
+		dev.note("user refused: " + visible(what))
 		return nil, errors.New("the user refused, so nothing was done. Don't do it another way; ask the user how they want to go on")
 	}
 
@@ -91,7 +93,7 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 	s.asked[state] = call
 	return &mcp.CallToolResult{
 		InputRequests: mcp.InputRequestMap{approvalID: &mcp.ElicitParams{
-			Message: fmt.Sprintf("An AI agent wants to do this on %s:\n\n%s\n\nIt %s.", dev.label(), what, why),
+			Message: fmt.Sprintf("An AI agent wants to do this on %s:\n\n%s\n\nIt %s.", visible(dev.label()), visible(what), why),
 			RequestedSchema: &jsonschema.Schema{
 				Type: "object",
 				Properties: map[string]*jsonschema.Schema{
@@ -102,6 +104,31 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 		}},
 		RequestState: state,
 	}, nil
+}
+
+// visible makes s safe to show a person who is deciding whether to allow it:
+// any character that doesn't print as itself (control characters, escape
+// sequences, bidirectional overrides such as U+202E, zero-width and other
+// invisible or non-ASCII space characters, invalid UTF-8) is written as a
+// Go-style escape (\u202e, \x1b), so nothing can hide or reorder what the
+// text says. Line breaks are kept, since the text may be several lines. The
+// approval itself is still matched on the raw text.
+func visible(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteRune(r)
+		case r == utf8.RuneError && !strings.HasPrefix(s[i:], string(utf8.RuneError)):
+			fmt.Fprintf(&b, "\\x%02x", s[i]) // an invalid byte, not a real U+FFFD
+		case strconv.IsPrint(r):
+			b.WriteRune(r)
+		default:
+			q := strconv.QuoteRune(r) // 'x' with the quotes
+			b.WriteString(q[1 : len(q)-1])
+		}
+	}
+	return b.String()
 }
 
 // callKey identifies a call by its tool and arguments, with the arguments
