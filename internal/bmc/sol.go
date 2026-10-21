@@ -52,8 +52,21 @@ func (s *solLink) Resize(rows, cols int) error {
 }
 
 func (s *solLink) FitSize(rows, cols int) error {
-	return s.Send([]byte(fmt.Sprintf("stty rows %d cols %d\r", rows, cols)))
+	line, _ := s.SizeLine(rows, cols)
+	return s.Send([]byte(line + "\r"))
 }
+
+// SizeLine is the command FitSize types. The console types it paced and
+// echo-checked instead of calling FitSize.
+func (s *solLink) SizeLine(rows, cols int) (string, bool) {
+	return sttyLine(rows, cols), true
+}
+
+// Serial reports that SOL is a serial line: a paste has to be paced.
+func (s *solLink) Serial() bool { return true }
+
+// sttyLine is the command that tells a remote shell its window size.
+func sttyLine(rows, cols int) string { return fmt.Sprintf("stty rows %d cols %d", rows, cols) }
 
 func (s *solLink) SizeIsFree() bool { return false }
 

@@ -240,12 +240,26 @@ Press `ctrl+]`, then one key. Everything else you type goes to the machine.
 | `b` | Send BREAK |
 | `c` | Toggle between the host console and the BMC's own CLI prompt without disconnecting (iLO `ESC (` and `vsp`, iDRAC `ctrl+\` and `console com2`, Supermicro SSH SOL `ESC (` (unverified) and `cd /system1/sol1`, `start`). The bar label shows where you are (`vsp` or `ilo cli`, `com2` or `idrac cli`, `sol` or `smash`). On `oob ssh` to an iLO, iDRAC or Supermicro host you start at the prompt, and `c` starts the console. IPMI SOL has no BMC prompt, so `c` only shows a note. `~.` works from either state |
 | `r` then a letter | SysRq: BREAK, then the letter (for example `r` `b` reboots a Linux console) |
+| `w` | Toggle raw paste for this session (shown as `[raw paste]` on the bar). Default is paced |
+| `x` | Stop a paste in progress (`esc` does the same) |
 | `p` | Power cycle with confirmation (`y` to go ahead) |
 | `]` | Send `ctrl+]` itself |
 | `.` | Disconnect |
 | `?` | Show every key |
 | `esc` | Back to the console |
 | `~.` | At the start of a line (ssh style): disconnect. `~~` sends one `~`; `~` plus anything else is sent as typed. Inside an outer ssh session, type `~~.` because the outer ssh eats the first `~` |
+
+Pasting into a serial console (IPMI SOL, iLO VSP, iDRAC `com2`, Supermicro SOL) is paced. A serial line
+can't take a whole paste at once, and over a laggy link the BMC's buffer overflows and drops characters. oob
+types each pasted line a few characters ahead of the echo, presses Enter only when the echoed line matches
+what it typed, waits for the prompt (or for quiet) before the next line, and stops at the first error message
+or question from the device. Tabs become spaces. A paste with no newline is typed and left at the prompt. The bar shows
+`pasting 3/12` and, if the paste stops, why. `ctrl+] x` (or `ctrl+] esc`) cancels it. Keystrokes you type
+during a paste are dropped with a note on the bar, because a held Enter would run half a pasted line. The `s`
+size line goes through the same echo check, so a dropped first byte can't turn `stty` into `tty`. If the remote
+doesn't echo (a program with echo off), the paste stops before Enter; `ctrl+] w` switches to raw paste, which
+writes the paste in one go as before. Plain `oob ssh` sessions and the BMC's own CLI prompt have flow
+control and are never paced. The MCP server's `send_command` types each line the same way.
 
 Logs go to `~/.local/state/oob/logs/<name>-<timestamp>.log` (or under `$XDG_STATE_HOME`), with
 escape sequences removed, readable only by you. oob handles `~.` itself, and ipmitool's own escape is remapped so only oob interprets `~`. Use `oob sol --raw <name>` for the plain `ipmitool` behavior.

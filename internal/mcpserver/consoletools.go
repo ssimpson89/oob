@@ -18,6 +18,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/paste"
 )
 
 const (
@@ -602,6 +603,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		c.tx.Mark("agent typed: " + l)
 		if err := c.runLine(ctx, l, wait); err != nil {
 			s.stuck(c, err)
+			var se *paste.StopError
+			if errors.As(err, &se) {
+				return fail(c.output(), "Sending stopped at line "+strconv.Itoa(i+1)+": "+se.Reason+". Part of the line may be typed at the prompt: "+
+					"clear it with send_keys keys [\"ctrl+c\"] before sending anything else. Lines not sent: "+strconv.Itoa(len(lines)-i))
+			}
 			return fail(c.output(), "Sending stopped: "+err.Error())
 		}
 		if err := ctx.Err(); err != nil {
@@ -619,11 +625,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 // runLine types a line and waits for the console to answer: until it is quiet
 // at a prompt or a question, or wait passes.
 func (c *session) runLine(ctx context.Context, l string, wait time.Duration) error {
-	deadline := time.Now().Add(wait)
 	changed := c.changes()
-	if err := c.write(ctx, []byte(l+"\r")); err != nil {
+	if err := c.typeLine(ctx, l); err != nil {
 		return err
 	}
+	deadline := time.Now().Add(wait) // typing a line paced takes a while; wait_seconds is for the answer
 	for {
 		c.settle(ctx, changed, time.Until(deadline), false)
 		if ctx.Err() != nil || !time.Now().Before(deadline) {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ssimpson89/oob/internal/app"
+	"github.com/ssimpson89/oob/internal/paste"
 )
 
 // Minimum terminal height for the bar: the bar row plus a few usable rows.
@@ -58,6 +59,7 @@ type console struct {
 
 	st   barState
 	hist *history
+	taps paste.Hub // copies of the remote output for a paste pacer
 	log  *logWriter
 	logs []string
 	note *time.Timer
@@ -185,6 +187,7 @@ func (c *console) Output(b []byte) {
 		return
 	}
 	_, _ = c.out.Write(b)
+	c.taps.Feed(b)
 	if c.sticky {
 		c.sticky, c.st.note = false, ""
 		c.dirty = true
@@ -264,18 +267,56 @@ func (c *console) Note(msg string, isErr bool) {
 	c.noteLocked(msg, isErr)
 }
 
-func (c *console) noteLocked(msg string, isErr bool) {
+func (c *console) noteLocked(msg string, isErr bool) { c.noteTTLLocked(msg, isErr, noteTTL) }
+
+// NoteFor is Note with its own time on the bar, for messages worth reading
+// twice, such as why a paste stopped.
+func (c *console) NoteFor(msg string, isErr bool, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.noteTTLLocked(msg, isErr, ttl)
+}
+
+func (c *console) noteTTLLocked(msg string, isErr bool, ttl time.Duration) {
 	if c.note != nil {
 		c.note.Stop()
 	}
 	c.st.note, c.st.noteErr = CleanRemoteLine(msg), isErr
-	c.note = time.AfterFunc(noteTTL, func() {
+	c.note = time.AfterFunc(ttl, func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.st.note = ""
 		c.repaint()
 	})
 	c.repaint()
+}
+
+// SetPaste shows paste progress on the bar: line at of n. n == 0 clears it.
+func (c *console) SetPaste(at, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.st.pasteAt != at || c.st.pasteN != n {
+		c.st.pasteAt, c.st.pasteN = at, n
+		c.repaint()
+	}
+}
+
+// SetRaw shows whether pastes go out raw.
+func (c *console) SetRaw(on bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.st.raw = on
+	c.repaint()
+}
+
+// Tap starts a copy of the remote's output and returns it with the cursor
+// line as it is at that moment, taken together so no output is missed or
+// counted twice.
+func (c *console) Tap() (rx <-chan []byte, untap func(), cursor string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rx, untap = c.taps.Tap()
+	return rx, untap, c.hist.Partial()
 }
 
 // Sticky shows msg on the bar until the remote first outputs something.

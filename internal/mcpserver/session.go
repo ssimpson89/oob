@@ -20,6 +20,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/paste"
 )
 
 const (
@@ -47,6 +48,7 @@ type session struct {
 	typ  string
 	tr   *bmc.ConsoleTransport
 	tx   *console.Transcript
+	taps paste.Hub // copies of the console output for the pacer that types a line
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -118,11 +120,15 @@ func (c *session) drain() {
 
 // feed records console output and follows the cursor.
 func (c *session) feed(b []byte) {
-	before := c.tx.Count()
-	c.tx.Feed(b)
-	completed := c.tx.Count() - before
+	// One critical section for the transcript and the taps, so a pacer that
+	// starts a tap and reads the cursor line together neither misses output
+	// nor sees it twice.
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	before := c.tx.Count()
+	c.tx.Feed(b)
+	c.taps.Feed(b)
+	completed := c.tx.Count() - before
 	if c.tr.Observe != nil {
 		kind, at, _ := c.tr.Observe(b)
 		c.kind, c.atBMC = kind, at
@@ -256,6 +262,26 @@ func (c *session) write(ctx context.Context, b []byte) error {
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
 	c.mu.Unlock()
 	return c.guarded(ctx, func() error { return c.tr.Link.Send(b) })
+}
+
+// typeLine types l and presses Enter, a few characters ahead of the console's
+// echo and only when the whole line has echoed, so a serial console behind a
+// slow link can't drop part of it. It doesn't wait for the answer: runLine does
+// that. A *paste.StopError means the echo never matched and Enter wasn't
+// pressed, which leaves the session usable.
+func (c *session) typeLine(ctx context.Context, l string) error {
+	c.mu.Lock()
+	rx, untap := c.taps.Tap()
+	cursor := c.tx.Partial()
+	c.mu.Unlock()
+	defer untap()
+	p := &paste.Pacer{
+		Write:  func(b []byte) error { return c.write(ctx, b) },
+		Rx:     rx,
+		Baud:   115200,
+		Prompt: cursor,
+	}
+	return p.Type(ctx, l+"\r")
 }
 
 // unread returns what the console printed since output was last returned,

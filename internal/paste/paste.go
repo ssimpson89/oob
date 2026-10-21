@@ -1,0 +1,578 @@
+// Copyright (c) 2026 ssimpson89. MIT License. See THIRD_PARTY.md.
+//
+// Copied from bauddy (internal/paste/paste.go), with the termtext import repointed.
+
+// Package paste sends multi-line pastes to a serial device without
+// overrunning it. Each line is typed a few characters ahead of the echo, and
+// Enter is pressed only when the device shows the whole line correctly. The
+// pacer then waits for the prompt (or for quiet, if no prompt is known) and
+// stops at the first error or question.
+package paste
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/ssimpson89/oob/internal/termtext"
+)
+
+// Lines splits pasted text into lines to send. Each ends in \r (Enter),
+// except a final line with no newline, which is left at the prompt. Tabs
+// become spaces, because a CLI treats Tab as "complete this word".
+func Lines(text string) []string {
+	text = strings.NewReplacer("\r\n", "\n", "\r", "\n", "\t", " ").Replace(text)
+	lines := strings.SplitAfter(text, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for i, l := range lines {
+		body := strings.Map(func(r rune) rune {
+			if r < ' ' || r == 0x7f {
+				return -1 // other control characters would act, not type
+			}
+			return r
+		}, l)
+		if strings.HasSuffix(l, "\n") {
+			body += "\r"
+		}
+		lines[i] = body
+	}
+	return lines
+}
+
+// dangerous matches commands, as Commands returns them, that can reboot a
+// device or erase or replace its configuration or software.
+var dangerous = regexp.MustCompile(`^((reload|write erase|erase|format|delete|factory-?reset|reboot|poweroff|halt|` +
+	`mkfs\S*|wipefs|(tel)?init [06]|request system (reboot|halt|power-off|zeroize|software add)|` +
+	`request vmhost (reboot|halt|power-off)|request (restart|shutdown) system|request platform software package install|` +
+	`load (override|factory-default)|configure (replace|factory-default)|crypto key zeroize|` +
+	`boot (system|nxos|kickstart)|install (all|add|activate)|redundancy force-switchover|system switchover|` +
+	`/?system (reset-configuration|reboot|shutdown)|systemctl( -\S+)* (reboot|poweroff|halt|kexec)|` +
+	`shutdown (now|-[hrp]|\+)|rm -(rf|fr)|racadm (serveraction|racresetcfg))\b|` +
+	`clear config|copy \S+ (nvram:)?start|execute (factory|reboot|shutdown|restore|formatlogdisk|erase-disk)|` +
+	`dd .*of=/dev/|ipmitool .*(chassis power (off|cycle|reset)|mc reset)|` +
+	`!(!|-?\d+|\??[\w./-]+)$)`) // shell history recall (!!, !-1, !reb): no telling what it runs
+
+// abbreviated lists dangerous commands as IOS-style CLIs accept them, with
+// each word shortened to no less than its minimum ("rel" is reload, "wr er"
+// is write erase). "*" stands for any word.
+var abbreviated = [][]struct {
+	word string
+	min  int
+}{
+	{{"reload", 3}},
+	{{"erase", 3}},
+	{{"delete", 3}},
+	{{"format", 4}},
+	{{"write", 2}, {"erase", 2}},
+	{{"copy", 3}, {"*", 1}, {"startup-config", 2}},
+	{{"configure", 4}, {"replace", 3}},
+	{{"boot", 4}, {"system", 3}},
+	{{"request", 3}, {"system", 3}, {"reboot", 3}},
+	{{"execute", 3}, {"reboot", 3}},
+}
+
+var (
+	// chain splits shell command chains and substitutions.
+	chain = regexp.MustCompile("&&|\\|\\||[;|`]|\\$\\(")
+	// assignment sets a shell variable for the command after it.
+	assignment = regexp.MustCompile(`^[a-z_][a-z0-9_]*=`)
+	// wrappers run the command that follows them: do (IOS, from config
+	// mode), run (Junos, VyOS), sudo and the like. Not sh, which is show
+	// on Cisco-style CLIs.
+	wrappers = map[string]bool{"do": true, "run": true, "sudo": true, "doas": true, "su": true, "exec": true,
+		"command": true, "nohup": true, "time": true, "bash": true, "env": true, "eval": true, "xargs": true,
+		"busybox": true}
+)
+
+// screenPrograms are pagers and full-screen programs, which wait for keys
+// with no prompt: on a serial console less shows just the file's name.
+var screenPrograms = map[string]bool{"less": true, "more": true, "most": true, "man": true, "vi": true,
+	"vim": true, "view": true, "nano": true, "top": true, "htop": true}
+
+// fullScreen reports whether line runs one, as sudo less, /usr/bin/less or
+// dmesg | less too.
+func fullScreen(line string) bool {
+	for _, c := range Commands(line) {
+		name, _, _ := strings.Cut(c, " ")
+		if screenPrograms[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// Commands splits a line into the commands it runs, in lower case with
+// single spaces: a shell chain is split up, and wrappers (sudo -u root),
+// quotes (bash -c 'reboot') and paths (/sbin/reboot) are removed.
+func Commands(line string) []string {
+	var cmds []string
+	for _, part := range chain.Split(strings.ToLower(line), -1) {
+		w := strings.Fields(part)
+		for len(w) > 0 {
+			if assignment.MatchString(w[0]) { // MODE=x reboot, env A=1 reboot
+				w = w[1:]
+				continue
+			}
+			if !wrappers[strings.Trim(w[0], `'"\`)] {
+				break
+			}
+			w = w[1:]
+			for len(w) > 0 && strings.HasPrefix(w[0], "-") { // the wrapper's options
+				if (w[0] == "-u" || w[0] == "-g") && len(w) > 1 {
+					w = w[1:] // and the user or group after it
+				}
+				w = w[1:]
+			}
+		}
+		if len(w) == 0 {
+			continue
+		}
+		w[0] = strings.Trim(w[0], `'"\`)
+		if i := strings.LastIndex(w[0], "/"); i > 0 {
+			w[0] = w[0][i+1:]
+		}
+		cmds = append(cmds, strings.Trim(strings.Join(w, " "), `'"`))
+	}
+	return cmds
+}
+
+// Dangerous reports whether line runs a command that can reboot a device or
+// erase or replace its configuration, spelled out or abbreviated.
+func Dangerous(line string) bool {
+	for _, cmd := range Commands(line) {
+		if dangerousCommand(cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+func dangerousCommand(cmd string) bool {
+	words := strings.Fields(cmd)
+	if len(words) == 2 && words[1] == "cancel" && abbreviates(words[0], "reload", 3) {
+		return false // undoes "reload in 10"
+	}
+	if dangerous.MatchString(cmd) {
+		return true
+	}
+next:
+	for _, c := range abbreviated {
+		if len(words) < len(c) {
+			continue
+		}
+		for i, w := range c {
+			if w.word != "*" && !abbreviates(words[i], w.word, w.min) {
+				continue next
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// abbreviates reports whether typed is word, shortened to no less than min.
+func abbreviates(typed, word string, min int) bool {
+	return len(typed) >= min && strings.HasPrefix(word, typed)
+}
+
+// Risky reports why a paste deserves a confirmation, or "" if it doesn't:
+// a dangerous command first, then a ?, then sheer length.
+func Risky(lines []string) string {
+	for i, l := range lines {
+		if Dangerous(l) {
+			return fmt.Sprintf("line %d: %s", i+1, strings.TrimSpace(l))
+		}
+	}
+	for i, l := range lines {
+		if strings.Contains(l, "?") {
+			return fmt.Sprintf("line %d has a ?, which Cisco treats as a request for help", i+1)
+		}
+	}
+	if len(lines) >= 10 {
+		return fmt.Sprintf("%d lines", len(lines))
+	}
+	return ""
+}
+
+// StopError explains why a paste stopped early.
+type StopError struct {
+	Line      int    // 1-based line that triggered the stop
+	Text      string // the line that was sent
+	Reason    string // what the device said, or why oob stopped
+	Unentered bool   // the line was typed but Enter wasn't pressed: it's still at the prompt
+}
+
+func (e *StopError) Error() string {
+	return fmt.Sprintf("line %d (%s): %s", e.Line, e.Text, e.Reason)
+}
+
+func stop(format string, a ...any) error { return &StopError{Reason: fmt.Sprintf(format, a...)} }
+
+var (
+	// devErr matches error messages from common CLIs.
+	devErr = regexp.MustCompile(`(?i)^\s*%\s*(invalid|incomplete|ambiguous|unknown|error|bad)|^\s*invalid input|` +
+		`syntax error|unknown command|command not found|command fail|unknown action|command parse error|` +
+		`bad command name|no such item|^\s*failure:|^\s*error:`)
+	// question matches prompts that would take the next pasted line as an answer.
+	question = regexp.MustCompile(`(?i)\[confirm\]|\[y(es)?/n(o)?\]|\(y(es)?/n(o)?\)|\[yes,\s*no\]|` +
+		`-+\s*more\s*-+|---\(more.*\)---|-- \[q quit|\[[^\]]*\]\?\s*$|\?\s*\[[^\]]*\]\s*$|press any key|` +
+		`^:\s*$|\(end\)\s*$`) // less: its prompt after the first page, and at the end
+	// promptChanger matches commands after which the prompt starts differently.
+	promptChanger = regexp.MustCompile(`(?i)^\s*(hostname|su|sudo|exit|logout|ssh|telnet)\b`)
+	// login matches username and password prompts, which count as ready.
+	login = regexp.MustCompile(`(?i)(username|login|password|passphrase|passcode)(\s+(as|for)\b[^\n:]{0,40})?\s*:\s*$`) // "[sudo] password for x:", "login as:"
+	// password matches the prompts whose answer is not echoed. It takes the same
+	// qualifiers as login: "[sudo] password for alice:", "Enter passphrase for
+	// key 'id_ed25519':".
+	password = regexp.MustCompile(`(?i)(password|passphrase|passcode)(\s+(as|for)\b[^\n:]{0,40})?\s*:\s*$`)
+	// textInput matches devices announcing free-text input (IOS and EOS
+	// banners, Junos load terminal), where no prompt appears between lines.
+	textInput = regexp.MustCompile(`End with the character '(.+)'|Type '(\w+)' on its own line|\[Type \^D at a new line to end input\]`)
+)
+
+const (
+	window     = 8                      // characters typed ahead of the echo: half a 16-byte UART FIFO
+	echoWait   = 2 * time.Second        // no echo progress for this long: stop without pressing Enter
+	quietWait  = 300 * time.Millisecond // no prompt known: this much silence means ready
+	screenWait = 1 * time.Second        // a full-screen program: this much silence means it's waiting for keys
+	silentWait = 1 * time.Second        // no prompt known and no reply at all: move on
+	textWait   = 150 * time.Millisecond // free-text input: silence between lines
+	promptWait = 60 * time.Second       // a prompt is expected but hasn't come back: stop
+	tick       = 5 * time.Millisecond
+	blindChunk = 8                      // password: bytes per write, with no echo to pace by
+	blindGap   = 100 * time.Millisecond // password: pause between writes, long enough for a slow UART to drain 8 bytes
+)
+
+// Pacer sends lines to a device.
+type Pacer struct {
+	Write  func([]byte) error // sends bytes to the device
+	Rx     <-chan []byte      // device output; open the tap before Run so no echo is missed
+	Baud   int                // line rate, for timing
+	Prompt string             // the device's current line when the paste starts
+}
+
+// Run sends lines, calling progress(i) before line i (counting from 0). It
+// returns nil when every line was sent, a *StopError if the device objected
+// or asked a question, ctx's error if stopped, or Write's error.
+func (p *Pacer) Run(ctx context.Context, lines []string, progress func(int)) error {
+	r := &run{Pacer: p}
+	r.screen.Feed([]byte(p.Prompt))
+	r.learn(r.screen.Partial())
+	for i, line := range lines {
+		progress(i)
+		if err := r.line(ctx, line); err != nil {
+			var se *StopError
+			if errors.As(err, &se) {
+				se.Line, se.Text = i+1, strings.TrimSuffix(line, "\r")
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+type run struct {
+	*Pacer
+	screen      termtext.Cleaner
+	promptKnown bool   // this device shows prompts
+	host        string // leading text of the prompt, e.g. "Switch" or "user@sw1"
+	textEnd     string // while the device takes free text, the text that ends it
+	typeOnly    bool   // Type: track the echo only, leave errors and questions to the caller
+}
+
+// lineSend is the progress of one line.
+type lineSend struct {
+	body, want string // the text to type, and the text the screen must show (the same, matched exactly)
+	enter      bool
+	mismatch   bool      // the device shows something other than what was typed
+	start      string    // the cursor line before typing, usually the prompt
+	blind      bool      // at a password prompt: expect no echo
+	sent       int       // bytes of body written
+	lastSend   time.Time // when the last write went out, for pacing a password
+	matched    int       // bytes of want the device shows
+	lastEcho   time.Time
+	entered    bool
+	fullScreen bool // the line runs a pager or full-screen program
+	newLine    bool // a line ended since Enter
+	atPrompt   bool
+}
+
+func (r *run) line(ctx context.Context, line string) error {
+	ls := r.begin(line)
+	if err := r.typeLine(ctx, ls); err != nil || !ls.enter {
+		return err
+	}
+	return r.awaitPrompt(ctx, ls)
+}
+
+// begin sets up the progress of one line from the screen as it is now.
+func (r *run) begin(line string) *lineSend {
+	body := strings.TrimSuffix(line, "\r")
+	start := r.screen.Partial()
+	ls := &lineSend{
+		body: body, want: body, enter: len(body) < len(line),
+		start: start, blind: password.MatchString(start), lastEcho: time.Now(),
+	}
+	ls.fullScreen = fullScreen(body)
+	if r.textEnd != "" && strings.Contains(body, r.textEnd) {
+		r.textEnd = "" // this line ends the free text; expect a prompt again
+	}
+	if promptChanger.MatchString(ls.want) {
+		r.host = "" // the prompt is about to change: new host name or user
+	}
+	return ls
+}
+
+// Type types one line, echo-checked like Run does, and presses Enter if line
+// ends in \r. It returns as soon as Enter is sent: it doesn't wait for the
+// prompt and doesn't read the device's output for errors or questions, so
+// the caller can do that itself. It returns a *StopError if the device
+// didn't echo the line (Enter wasn't pressed), ctx's error if stopped, or
+// Write's error.
+func (p *Pacer) Type(ctx context.Context, line string) error {
+	r := &run{Pacer: p, typeOnly: true}
+	r.screen.Feed([]byte(p.Prompt))
+	r.learn(r.screen.Partial())
+	err := r.typeLine(ctx, r.begin(line))
+	var se *StopError
+	if errors.As(err, &se) {
+		se.Line, se.Text = 1, strings.TrimSuffix(line, "\r")
+	}
+	return err
+}
+
+// typeLine types ls ahead of its echo, then presses Enter once the device
+// shows the whole line.
+func (r *run) typeLine(ctx context.Context, ls *lineSend) error {
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		end := ls.sent
+		if ls.blind {
+			// No echo to pace by: a few bytes at a time on a timer, so a slow
+			// UART can't drop part of a password.
+			if time.Since(ls.lastSend) >= blindGap {
+				end = min(ls.sent+blindChunk, len(ls.body))
+			}
+		} else {
+			for end < len(ls.body) && end-ls.matched < window {
+				end++
+			}
+		}
+		if end > ls.sent {
+			if err := r.send(ctx, ls.body[ls.sent:end]); err != nil {
+				return err
+			}
+			ls.sent, ls.lastSend = end, time.Now()
+		}
+		if ls.sent == len(ls.body) && (ls.blind && time.Since(ls.lastSend) >= blindGap || !ls.blind && ls.matched == len(ls.want)) {
+			if !ls.enter {
+				return nil
+			}
+			ls.entered = true
+			return r.send(ctx, "\r")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case b := <-r.Rx:
+			if err := r.recv(b, ls); err != nil {
+				return err
+			}
+		case now := <-t.C:
+			if ls.blind || now.Sub(ls.lastEcho) < echoWait { // blind: nothing is expected to echo
+				continue
+			}
+			reason := "the device didn't echo the whole line, so Enter wasn't pressed (characters may have been dropped)"
+			switch {
+			case ls.mismatch:
+				reason = "the device echoed something other than what was typed, so Enter wasn't pressed (characters may have been dropped)"
+			case ls.matched == 0:
+				reason = "the device isn't echoing, so Enter wasn't pressed"
+			}
+			return &StopError{Reason: reason, Unentered: true}
+		}
+	}
+}
+
+// send writes s unless the paste has been stopped.
+func (r *run) send(ctx context.Context, s string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.Write([]byte(s))
+}
+
+// track updates ls.matched from what the device's cursor line shows now.
+// The typed text visible there is a stretch of the line ending at the echo
+// point: all of it after the prompt, the tail after IOS's "$" scroll marker,
+// or what was typed since a syslog message interrupted the echo. Reading the
+// line itself, rather than counting echoed characters, means redraws and
+// unrelated output can't make the echo look further along than it is, and a
+// dropped character stalls it.
+func (r *run) track(ls *lineSend) {
+	t := r.screen.Partial()
+	if ls.start != "" && strings.HasPrefix(t, ls.start) {
+		// The line still begins with the prompt, so what follows must be the
+		// start of what was typed. A dropped first byte ("tty" for "stty")
+		// leaves a tail that would pass the end-point search below, which is
+		// only for lines that scrolled or were interrupted.
+		after := t[len(ls.start):]
+		switch {
+		case strings.HasPrefix(ls.want, after):
+			ls.mismatch = false
+			if len(after) > ls.matched {
+				ls.matched, ls.lastEcho = len(after), time.Now()
+			}
+			return
+		case strings.HasPrefix(after, "$"): // IOS scrolled the line: "prompt$tail"
+			t = after[1:]
+		default:
+			ls.mismatch = after != ""
+			return
+		}
+	}
+	if t == "" {
+		return
+	}
+	// Find the first end point b, no earlier than the echo so far, where the
+	// line typed up to b ends with what the screen shows. Never moving
+	// backwards means a redraw can't undo progress. The text before the
+	// stretch shown must already be verified (at most ls.matched bytes), so
+	// until something has matched, the screen has to show the line from its
+	// very first byte: a dropped first byte can't pass as an echo, whether the
+	// cursor line was empty to begin with or a syslog message cleared it.
+	for b := max(ls.matched, len(t)); b <= len(ls.want) && b-len(t) <= ls.matched; b++ {
+		if ls.want[b-len(t):b] == t {
+			ls.mismatch = false
+			if b > ls.matched {
+				ls.matched, ls.lastEcho = b, time.Now()
+			}
+			return
+		}
+	}
+	ls.mismatch = true
+}
+
+// awaitPrompt waits after Enter until the device is ready for the next line.
+func (r *run) awaitPrompt(ctx context.Context, ls *lineSend) error {
+	settle := 30*time.Millisecond + 4*time.Second*10/time.Duration(max(r.Baud, 1200)) // 4 byte-times of 10 bits
+	enteredAt := time.Now()
+	lastRx, replied := enteredAt, false
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case b := <-r.Rx:
+			lastRx, replied = time.Now(), true
+			if err := r.recv(b, ls); err != nil {
+				return err
+			}
+		case now := <-t.C:
+			idle := now.Sub(lastRx)
+			if idle < settle {
+				continue
+			}
+			partial := r.screen.Partial()
+			switch { // a question beats a prompt; timeouts come last
+			case question.MatchString(partial):
+				return stop("device is asking: %s", strings.TrimSpace(partial))
+			case ls.atPrompt:
+				return nil
+			case r.textEnd != "" && idle >= textWait:
+				return nil
+			case ls.fullScreen && replied && idle >= screenWait:
+				return stop("device is showing a full-screen program, waiting for keys")
+			case r.promptKnown:
+				if now.Sub(enteredAt) >= promptWait {
+					return stop("no prompt after %s", promptWait)
+				}
+			case ls.fullScreen: // its screen going quiet isn't a prompt; wait for screenWait, or give up
+				if now.Sub(enteredAt) >= promptWait {
+					return stop("no prompt after %s", promptWait)
+				}
+			case replied && idle >= quietWait, !replied && now.Sub(enteredAt) >= silentWait:
+				return nil
+			}
+		}
+	}
+}
+
+// recv processes device output: echo progress, errors, free-text mode and
+// whether the prompt is back.
+func (r *run) recv(b []byte, ls *lineSend) error {
+	done := r.screen.Feed(b)
+	if !ls.entered {
+		r.track(ls)
+	}
+	for _, l := range strings.Split(strings.TrimSuffix(string(done), "\n"), "\n") {
+		if l == "" || r.typeOnly {
+			continue
+		}
+		if ls.entered {
+			ls.newLine = true
+		}
+		if ls.start != "" && strings.HasPrefix(l, ls.start) {
+			continue // our own echoed line, which may contain anything
+		}
+		if devErr.MatchString(l) {
+			if !ls.entered {
+				return stop("after the previous line: %s", strings.TrimSpace(l))
+			}
+			return stop("%s", strings.TrimSpace(l))
+		}
+		if m := textInput.FindStringSubmatch(l); m != nil {
+			r.textEnd = m[1] + m[2]
+			if r.textEnd == "" {
+				r.textEnd = "\x04" // Junos: Ctrl-D on its own line ends the input
+			}
+		}
+	}
+	if !ls.entered {
+		return nil
+	}
+	switch partial := r.screen.Partial(); {
+	case ls.newLine && r.isPrompt(partial):
+		ls.atPrompt = true
+		r.learn(partial)
+	default: // anything else, an empty cursor line included, is not a prompt
+		ls.atPrompt = false
+	}
+	return nil
+}
+
+// AtLogin reports whether line, the cursor line, asks for a username or
+// password.
+func AtLogin(line string) bool { return login.MatchString(line) }
+
+// isPrompt reports whether s, the cursor line, is the device waiting for
+// input: a login or password prompt, or a short line ending in # > $ or %
+// that starts like the prompts seen so far (so "45%" progress doesn't count).
+func (r *run) isPrompt(s string) bool {
+	s = strings.TrimRight(s, " ")
+	if login.MatchString(s) {
+		return true
+	}
+	if s == "" || len(s) > 120 || !strings.ContainsAny(s[len(s)-1:], "#>$%") {
+		return false
+	}
+	return r.host == "" || strings.HasPrefix(s, r.host)
+}
+
+// learn records a prompt's shape, e.g. "Switch(config-if)#" -> "Switch".
+func (r *run) learn(s string) {
+	if !r.isPrompt(s) || login.MatchString(s) {
+		return
+	}
+	r.promptKnown = true
+	if i := strings.IndexAny(s, "(:#>$% "); i >= 0 {
+		r.host = s[:i]
+	}
+}

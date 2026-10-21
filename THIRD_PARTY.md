@@ -12,6 +12,10 @@ The MCP server (`oob mcp`) is adapted from bauddy's `internal/mcpserver`: the ap
 elicitation (`internal/mcpserver/approve.go`), the list of commands that need approval and the prompt and
 typed-text tracking behind it (`risk.go`, from `internal/paste` and `guard.go`), and the console session
 model, read position and output shaping (`session.go`). Those files carry a header pointing here.
+The paste pacer (`internal/paste`, with its tests and the `internal/simdev` serial-device simulator they use)
+and the plain-text cleaner it needs (`internal/termtext`, shared with `internal/console`) are copied from
+bauddy's `internal/paste`, `internal/simdev` and `internal/termtext`, with `Pacer.Type` and `Hub` added.
+Those files carry a header pointing here.
 bauddy is by the same author and under the same license as oob (see LICENSE), so this
 notice is for provenance rather than a separate obligation.
 

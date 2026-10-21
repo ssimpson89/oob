@@ -105,6 +105,10 @@ type barState struct {
 	atPrompt bool
 	note     string
 	noteErr  bool
+	// pasteN is the lines in the paste being typed, 0 for none; pasteAt is the
+	// line it is on.
+	pasteAt, pasteN int
+	raw             bool // pastes go out unpaced
 }
 
 // commandLayouts builds the command-mode bar: all hints first, then one fewer
@@ -120,6 +124,10 @@ func commandLayouts(st barState) []layout {
 			keys[i].short = "console"
 		case keys[i].act == actAuto && st.auto:
 			keys[i].short = "auto-size off"
+		case keys[i].act == actRaw && st.raw:
+			keys[i].short = "paced paste"
+		case keys[i].act == actStop && st.pasteN == 0:
+			keys[i].short = ""
 		}
 	}
 	dropped := 0
@@ -187,21 +195,44 @@ func barLine(st barState, w int) string {
 	if st.logging {
 		log = []seg{{"  [log]", false}}
 	}
-	var note []seg
-	if st.note != "" {
+	var raw []seg
+	if st.raw {
+		raw = []seg{{"  [raw paste]", false}}
+	}
+	var note, noteShort []seg
+	switch {
+	case st.pasteN > 0:
+		progress := "  pasting " + strconv.Itoa(st.pasteAt) + "/" + strconv.Itoa(st.pasteN)
+		note = []seg{{progress, true}, {" (" + shortKey("ctrl+]") + " x stops)", false}}
+		noteShort = []seg{{progress, true}}
+	case st.note != "":
 		note = []seg{{"  " + st.note, st.noteErr}}
+		noteShort = note
 	}
 	keys := []seg{{shortKey("ctrl+]"), true}, {" keys ", false}}
 	quit := slices.Concat([]seg{{"~.", true}, {" quit  ", false}}, keys)
-	return fitLine(styleNormal, w, []layout{
-		{slices.Concat(name, log, note), quit},
-		{slices.Concat(name, log), quit},
-		{slices.Concat(name, log, note), keys},
-		{slices.Concat(name, log), keys},
-		{slices.Concat([]seg{{" " + st.host, true}}, log), keys},
-		{slices.Concat([]seg{{" " + st.host, true}}), keys},
-		{keys, nil},
-	})
+	layouts := []layout{
+		{slices.Concat(name, log, raw, note), quit},
+		{slices.Concat(name, log, raw, noteShort), quit},
+		{slices.Concat(name, log, raw, note), keys},
+		{slices.Concat(name, log, raw, noteShort), keys},
+	}
+	if st.pasteN > 0 { // the progress outranks the rest of the bar
+		layouts = append(layouts,
+			layout{slices.Concat([]seg{{" " + st.host, true}}, noteShort), keys},
+			layout{noteShort, keys},
+		)
+	}
+	layouts = append(layouts,
+		layout{slices.Concat(name, log, raw), quit},
+		layout{slices.Concat(name, log, raw), keys},
+		layout{slices.Concat(name, log), keys},
+		layout{slices.Concat([]seg{{" " + st.host, true}}, log, noteShort), keys},
+		layout{slices.Concat([]seg{{" " + st.host, true}}, log), keys},
+		layout{slices.Concat([]seg{{" " + st.host, true}}), keys},
+		layout{keys, nil},
+	)
+	return fitLine(styleNormal, w, layouts)
 }
 
 // escTracker follows the escape sequences in a stream of remote output across
