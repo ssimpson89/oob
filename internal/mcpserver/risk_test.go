@@ -1,6 +1,9 @@
 package mcpserver
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRiskFlagsRebootAndWipeLikeCommands(t *testing.T) {
 	for _, l := range []string{
@@ -108,5 +111,36 @@ func TestCtrlDOnlyClearsAnEmptyLine(t *testing.T) {
 	edited.add("", "ctrl+d", 1)
 	if _, unknown := edited.pending(1); !unknown {
 		t.Error("ctrl+d after an unmodelled edit cleared the unknown state")
+	}
+}
+
+// 4341047464: path-qualified wrappers and nested wrappers are seen through.
+func TestRiskSeesPathQualifiedWrappers(t *testing.T) {
+	for _, l := range []string{"/usr/bin/sudo reboot", "/usr/bin/env /sbin/reboot", "sudo /usr/bin/nohup /sbin/shutdown -h now",
+		"/usr/bin/sudo -u root /usr/bin/env A=/x/y /sbin/reboot"} {
+		if risk(l) == "" {
+			t.Errorf("risk(%q) = none", l)
+		}
+	}
+	if risk("/usr/bin/sudo /usr/bin/ls /etc") != "" {
+		t.Error("a path-qualified ls was flagged")
+	}
+}
+
+// 4341047517: a literal ? stays in the tracked text so backspaces hit what was sent.
+func TestQuestionMarkIsTracked(t *testing.T) {
+	var ty typing
+	ty.add("rebootx?", "backspace", 1)
+	ty.add("", "backspace", 1)
+	if p, _ := ty.pending(1); p != "reboot" {
+		t.Errorf("pending = %q", p)
+	}
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.keys("s1", "rebootx?", "backspace", "backspace", "enter"); !isErr || !strings.Contains(out, "approval") {
+		t.Errorf("rebootx? bs bs enter: %q %v", out, isErr)
+	}
+	if got := h.host("node01").entered(); len(got) != 0 {
+		t.Errorf("entered %q", got)
 	}
 }

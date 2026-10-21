@@ -64,6 +64,15 @@ var (
 		"busybox": true}
 )
 
+// baseName strips quotes and any directory from an executable word.
+func baseName(w string) string {
+	w = strings.Trim(w, `'"\`)
+	if i := strings.LastIndex(w, "/"); i > 0 {
+		w = w[i+1:]
+	}
+	return w
+}
+
 // splitCommands splits a line into the commands it runs, in lower case with
 // single spaces: a shell chain is split up, and wrappers (sudo -u root),
 // quotes (bash -c 'reboot') and paths (/sbin/reboot) are removed.
@@ -76,7 +85,8 @@ func splitCommands(line string) []string {
 				w = w[1:]
 				continue
 			}
-			if !wrappers[strings.Trim(w[0], `'"\`)] {
+			w[0] = baseName(w[0]) // /usr/bin/sudo, /sbin/reboot
+			if !wrappers[w[0]] {
 				break
 			}
 			w = w[1:]
@@ -89,10 +99,6 @@ func splitCommands(line string) []string {
 		}
 		if len(w) == 0 {
 			continue
-		}
-		w[0] = strings.Trim(w[0], `'"\`)
-		if i := strings.LastIndex(w[0], "/"); i > 0 {
-			w[0] = w[0][i+1:]
 		}
 		cmds = append(cmds, strings.Trim(strings.Join(w, " "), `'"`))
 	}
@@ -298,7 +304,7 @@ func (t *typing) add(text, key string, prompts int) {
 	if t.at != prompts {
 		*t = typing{at: prompts}
 	}
-	t.text += strings.ReplaceAll(text, "?", "")
+	t.text += text
 	switch key {
 	case "space":
 		t.text += " "
@@ -306,8 +312,15 @@ func (t *typing) add(text, key string, prompts int) {
 		if _, n := utf8.DecodeLastRuneInString(t.text); n > 0 {
 			t.text = t.text[:len(t.text)-n]
 		}
-	case "enter", "ctrl+u", "ctrl+c", "ctrl+z":
+	case "enter", "ctrl+c", "ctrl+z":
 		*t = typing{at: prompts}
+	case "ctrl+u":
+		// Readline's ctrl+u deletes only what is before the cursor. It clears the
+		// line only when the cursor is known to be at the end, so an unknown
+		// line (after cursor movement or an unmodelled edit) stays unknown.
+		if !t.unknown {
+			*t = typing{at: prompts}
+		}
 	case "ctrl+d":
 		// On an empty line it is EOF (a logout or a shell exit); on a line with
 		// text Readline deletes the character under the cursor, which edits the
@@ -322,7 +335,7 @@ func (t *typing) add(text, key string, prompts int) {
 		// Any other key (tab, up, down, home, end, delete, left, right, esc,
 		// ctrl+a/e/k/w/y/p/n/r/h/...) can move, change or replace the line, which
 		// the server doesn't follow. The line stays unknown until it is cleared
-		// (ctrl+u, ctrl+c, enter) or a new prompt appears.
+		// (ctrl+c, enter) or a new prompt appears.
 		if !paintKeys[key] {
 			t.unknown = true
 		}

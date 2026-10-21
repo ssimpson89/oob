@@ -118,8 +118,12 @@ func TestEditingKeysMakeTheLineUnknown(t *testing.T) {
 			t.Errorf("%s left the line known", k)
 		}
 		ty.add("", "ctrl+u", 1)
+		if _, unknown := ty.pending(1); !unknown {
+			t.Errorf("ctrl+u after %s cleared the unknown line", k)
+		}
+		ty.add("", "ctrl+c", 1)
 		if text, unknown := ty.pending(1); unknown || text != "" {
-			t.Errorf("ctrl+u after %s left %q %v", k, text, unknown)
+			t.Errorf("ctrl+c after %s left %q %v", k, text, unknown)
 		}
 	}
 	var ty typing
@@ -143,10 +147,10 @@ func TestEnterAfterAnEditingKeyNeedsApproval(t *testing.T) {
 		if got := h.host("node01").entered(); len(got) != 0 {
 			t.Errorf("%s then enter entered %q", k, got)
 		}
-		// Cleared with ctrl+u, enter goes through.
-		h.keys("s1", "", "ctrl+u")
+		// Cleared with ctrl+c, enter goes through.
+		h.keys("s1", "", "ctrl+c")
 		if out, isErr := h.keys("s1", "", "enter"); isErr {
-			t.Errorf("%s, ctrl+u, enter: %q", k, out)
+			t.Errorf("%s, ctrl+c, enter: %q", k, out)
 		}
 		// Within one batch.
 		h = start(t, Options{}, "")
@@ -438,10 +442,10 @@ func TestBreakIsRefusedWithStagedInput(t *testing.T) {
 		staged(h)
 		out, isErr := h.call("send_break", map[string]any{"session": "s1"})
 		f := h.host("node01")
-		if !isErr || !strings.Contains(out, "ctrl+u") || f.breaks != 0 || len(f.entered()) != 0 || h.askedAll() != "" {
+		if !isErr || !strings.Contains(out, "ctrl+c") || f.breaks != 0 || len(f.entered()) != 0 || h.askedAll() != "" {
 			t.Errorf("break over staged input: %q %v breaks=%d entered=%q asked=%q", out, isErr, f.breaks, f.entered(), h.askedAll())
 		}
-		h.keys("s1", "", "ctrl+u")
+		h.keys("s1", "", "ctrl+c")
 		if out, isErr := h.call("send_break", map[string]any{"session": "s1"}); isErr {
 			t.Errorf("break after clearing the line: %q", out)
 		}
@@ -581,5 +585,18 @@ func TestStructuredOutputIsSanitized(t *testing.T) {
 				t.Errorf("%s: text has controls: %q", tool, txt)
 			}
 		}
+	}
+}
+
+// 4341047556: ctrl+u only deletes before the cursor, so after the cursor moved
+// it must not clear the line.
+func TestCtrlUAfterCursorMoveDoesNotClear(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.keys("s1", "xreboot", "ctrl+a", "ctrl+d", "ctrl+u", "enter"); !isErr || !strings.Contains(out, "approval") {
+		t.Errorf("xreboot, ctrl+a, ctrl+d, ctrl+u, enter: %q %v", out, isErr)
+	}
+	if got := h.host("node01").entered(); len(got) != 0 {
+		t.Errorf("entered %q", got)
 	}
 }

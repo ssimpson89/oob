@@ -555,7 +555,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	c.mu.Unlock()
 	if typed != "" && !answering {
 		return fail(fmt.Sprintf("the prompt already has %q typed after it, so nothing was sent. Clear it with send_keys "+
-			"keys [\"ctrl+u\"], or finish it with send_keys", typed))
+			"keys [\"ctrl+c\"], or finish it with send_keys", typed))
 	}
 
 	var shownLines, whys []string
@@ -825,7 +825,7 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 	}
 	if typed := c.staged(); typed != "" {
 		return fail(fmt.Sprintf("nothing was sent: the prompt has %q typed after it, and the BREAK is sent after a carriage return "+
-			"that would run it. Clear the line with send_keys keys [\"ctrl+u\"], then call send_break again", typed))
+			"that would run it. Clear the line with send_keys keys [\"ctrl+c\"], then call send_break again", typed))
 	}
 	if res, err := s.approve(req, c.target(), "send a serial BREAK to the console of "+c.host, []string{whyBreak}); res != nil || err != nil {
 		if err != nil {
