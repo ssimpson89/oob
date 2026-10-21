@@ -123,6 +123,7 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 			}
 			_ = ptmx.Close()
 		},
+		Release: func() { _, _ = ipmiOutput(h, ipmiQuickTimeout, "sol", "deactivate") },
 	}, nil
 }
 

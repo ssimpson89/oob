@@ -117,10 +117,17 @@ type fakeHost struct {
 	toggle   bool   // behaves like iLO/iDRAC: has a BMC prompt
 	atBMC    bool
 	respond  func(f *fakeHost, cmd string) bool // true if it handled the command
+
+	disconnects int           // calls of the link's Disconnect, which types an escape at the console
+	released    bool          // transport Release ran
+	closedFirst bool          // ... and the transport had been closed by then
+	stuck       bool          // Send blocks, like an SSH channel that stopped taking input, until Close
+	unstick     chan struct{} // closed by Close
+	unstickOnce sync.Once
 }
 
 func newFakeHost(t *testing.T, name string) *fakeHost {
-	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
+	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), unstick: make(chan struct{}), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
 	f.pr, f.pw = io.Pipe()
 	go func() {
 		for b := range f.outq {
@@ -147,6 +154,11 @@ func (f *fakeHost) emit(s string) {
 
 func (f *fakeHost) Send(b []byte) error {
 	f.mu.Lock()
+	if f.stuck {
+		f.mu.Unlock()
+		<-f.unstick
+		return io.ErrClosedPipe
+	}
 	if f.closed || f.ended {
 		f.mu.Unlock()
 		return io.ErrClosedPipe
@@ -257,6 +269,9 @@ func (f *fakeHost) Break() error {
 }
 
 func (f *fakeHost) Disconnect() error {
+	f.mu.Lock()
+	f.disconnects++
+	f.mu.Unlock()
 	f.emit("[SOL Session closed]\r\n")
 	f.finish()
 	return nil
@@ -288,6 +303,14 @@ func (f *fakeHost) Close() {
 	f.mu.Unlock()
 	f.pw.Close()
 	f.pr.Close()
+	f.finish() // a real transport ends when it is closed
+	f.unstickOnce.Do(func() { close(f.unstick) })
+}
+
+func (f *fakeHost) setStuck() {
+	f.mu.Lock()
+	f.stuck = true
+	f.mu.Unlock()
 }
 
 func (f *fakeHost) isClosed() bool {
@@ -310,6 +333,11 @@ func (f *fakeHost) rawSent() string {
 
 func (f *fakeHost) transport() *bmc.ConsoleTransport {
 	tr := &bmc.ConsoleTransport{Kind: "sol", Link: f, Out: f.pr, Done: f.done, Close: f.Close, Tail: func() string { return "" }}
+	tr.Release = func() {
+		f.mu.Lock()
+		f.released, f.closedFirst = true, f.closed
+		f.mu.Unlock()
+	}
 	if f.toggle {
 		tr.Kind = "vsp"
 		tr.Toggle = func() (string, bool, error) {

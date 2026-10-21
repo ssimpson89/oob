@@ -223,6 +223,20 @@ func (s *server) closeIdle() {
 	s.mu.Unlock()
 	for _, c := range idle {
 		s.forget(c, "closed after being idle for "+s.opt.IdleTimeout.String())
+		go func() {
+			c.close()
+			// A tool that found the session before it was forgotten is waiting
+			// for the send lock. Let it go on: it sees a closed session.
+			c.sendMu.Unlock()
+		}()
+	}
+}
+
+// stuck forgets a session whose transport was closed because a write didn't
+// complete in time.
+func (s *server) stuck(c *session, err error) {
+	if errors.Is(err, errStuck) {
+		s.forget(c, "closed because the console stopped accepting input")
 		go c.close()
 	}
 }
@@ -509,7 +523,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	if err != nil {
 		return fail(err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(len(lines))*wait+10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(len(lines))*wait+toolSlack)
 	defer cancel()
 
 	at := c.line()
@@ -562,6 +576,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	for i, l := range lines {
 		c.tx.Mark("agent typed: " + l)
 		if err := c.runLine(ctx, l, wait); err != nil {
+			s.stuck(c, err)
 			return fail(c.output(), "Sending stopped: "+err.Error())
 		}
 		if err := ctx.Err(); err != nil {
@@ -581,7 +596,7 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 func (c *session) runLine(ctx context.Context, l string, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	changed := c.changes()
-	if err := c.write([]byte(l + "\r")); err != nil {
+	if err := c.write(ctx, []byte(l+"\r")); err != nil {
 		return err
 	}
 	for {
@@ -727,13 +742,14 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		c.mu.Unlock()
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, wait+10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack)
 	defer cancel()
 	if len(in.Keys) > 0 {
 		c.tx.Mark("agent pressed " + strings.Join(in.Keys, ", "))
 	}
 	changed := c.changes()
-	if err := c.write([]byte(wire.String())); err != nil {
+	if err := c.write(ctx, []byte(wire.String())); err != nil {
+		s.stuck(c, err)
 		return fail(err)
 	}
 	c.mu.Lock()
@@ -767,10 +783,11 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 		}
 		return res, nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, keysWait+10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, keysWait+toolSlack)
 	defer cancel()
 	changed := c.changes()
-	if err := c.tr.Link.Break(); err != nil {
+	if err := c.guarded(ctx, c.tr.Link.Break); err != nil {
+		s.stuck(c, err)
 		return fail("the BREAK wasn't sent: ", err)
 	}
 	c.mu.Lock()

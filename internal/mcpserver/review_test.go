@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -163,5 +164,184 @@ func TestEnterAfterAnEditingKeyNeedsApproval(t *testing.T) {
 	}
 	if got := h.host("node01").entered(); len(got) != 0 {
 		t.Errorf("send_command entered %q", got)
+	}
+}
+
+// 4340519210: echo, output and an identical prompt in one chunk still count as
+// a new prompt, so an approval expires however the output was chunked.
+func TestPromptCountDoesNotDependOnChunking(t *testing.T) {
+	prompt := "[root@node01 ~]# "
+	run := "uname -r\r\n5.14.0-test\r\n" + prompt
+	counts := func(chunks ...string) int {
+		h := start(t, Options{}, "")
+		h.connect()
+		c, err := h.srv.session("s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.mu.Lock()
+		before := c.prompts
+		c.mu.Unlock()
+		for _, ch := range chunks {
+			c.feed([]byte(ch))
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.prompts - before
+	}
+	whole := counts(run)
+	var bytewise []string
+	for _, r := range run {
+		bytewise = append(bytewise, string(r))
+	}
+	if whole != 1 {
+		t.Errorf("one chunk counted %d prompts, want 1", whole)
+	}
+	if got := counts(bytewise...); got != 1 {
+		t.Errorf("byte by byte counted %d prompts, want 1", got)
+	}
+	if got := counts("uname -r\r\n5.14.0-test\r\n", prompt); got != 1 {
+		t.Errorf("split before the prompt counted %d, want 1", got)
+	}
+}
+
+// And the approval for an answer is gone once the command that raised the
+// question has finished, even when the next prompt is identical.
+func TestAnswerApprovalExpiresWithTheNextPrompt(t *testing.T) {
+	h := start(t, Options{}, "accept")
+	h.connect()
+	c, _ := h.srv.session("s1")
+	c.mu.Lock()
+	c.answersAt = c.prompts
+	c.mu.Unlock()
+	c.feed([]byte("dnf remove foo\r\nDone.\r\n[root@node01 ~]# "))
+	c.mu.Lock()
+	expired := c.answersAt != c.prompts
+	c.mu.Unlock()
+	if !expired {
+		t.Error("the approval survived a finished command whose prompt was identical")
+	}
+}
+
+func eventually(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatalf("never happened: %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// 4340518996 (closeIdle): a tool that got the session before it was forgotten
+// and waits for the send lock is let go, and sees the session is closed.
+func TestIdleCloseReleasesWaitingTools(t *testing.T) {
+	h := start(t, Options{IdleTimeout: 150 * time.Millisecond}, "")
+	h.connect()
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan error, 1)
+	go func() {
+		// The tool found the session just before the sweep forgot it, and now
+		// asks for the send lock.
+		eventually(t, "the sweep forgets the session", func() bool {
+			h.srv.mu.Lock()
+			defer h.srv.mu.Unlock()
+			return len(h.srv.sessions) == 0
+		})
+		c.sendMu.Lock()
+		defer c.sendMu.Unlock()
+		got <- c.canSend()
+	}()
+	select {
+	case err := <-got:
+		if err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Errorf("a tool that waited through the idle close got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a tool waiting for the send lock was never released")
+	}
+}
+
+// 4340519263: a write that never completes can't hold the session or outlast the call.
+func TestStuckWriteEndsWithTheCall(t *testing.T) {
+	old := toolSlack
+	toolSlack = 100 * time.Millisecond
+	t.Cleanup(func() { toolSlack = old })
+	for _, tool := range []string{"send_command", "send_keys"} {
+		h := start(t, Options{}, "")
+		h.connect()
+		f := h.host("node01")
+		f.setStuck()
+		args := map[string]any{"session": "s1", "wait_seconds": 0.05}
+		if tool == "send_command" {
+			args["line"] = "uname -r"
+		} else {
+			args["text"] = "y"
+		}
+		start := time.Now()
+		out, isErr := h.call(tool, args)
+		if time.Since(start) > 8*time.Second {
+			t.Errorf("%s took %s", tool, time.Since(start))
+		}
+		if !isErr || !strings.Contains(out, "stopped accepting input") {
+			t.Errorf("%s: %q %v", tool, out, isErr)
+		}
+		eventually(t, "the transport is closed", f.isClosed)
+		if got := f.rawSent(); got != "" {
+			t.Errorf("%s: a late write landed: %q", tool, got)
+		}
+		out, isErr = h.call("read_output", map[string]any{"session": "s1"})
+		if !isErr || !strings.Contains(out, "closed") {
+			t.Errorf("%s: the session wasn't forgotten: %q %v", tool, out, isErr)
+		}
+		c := h.srv.sessions // forgotten sessions leave the table
+		h.srv.mu.Lock()
+		n := len(c)
+		h.srv.mu.Unlock()
+		if n != 0 {
+			t.Errorf("%s: %d sessions left", tool, n)
+		}
+	}
+}
+
+// 4340519300: closing a session types nothing at the console, so staged input
+// isn't submitted by an idle timeout, a disconnect or shutdown.
+func TestClosingNeverTypesAtTheConsole(t *testing.T) {
+	for _, how := range []string{"disconnect", "idle", "shutdown"} {
+		h := start(t, Options{IdleTimeout: 200 * time.Millisecond}, "")
+		h.connect()
+		f := h.host("node01")
+		if out, isErr := h.keys("s1", "uname -r"); isErr {
+			t.Fatalf("%s: %q", how, out)
+		}
+		switch how {
+		case "disconnect":
+			h.call("disconnect", map[string]any{"session": "s1"})
+		case "idle":
+			eventually(t, "idle close", f.isClosed)
+		case "shutdown":
+			h.srv.closeAll()
+		}
+		eventually(t, how+": closed", f.isClosed)
+		eventually(t, how+": released", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.released })
+		f.mu.Lock()
+		disc, first := f.disconnects, f.closedFirst
+		f.mu.Unlock()
+		if got := f.rawSent(); got != "uname -r" {
+			t.Errorf("%s: the console was sent %q, want only the staged text", how, got)
+		}
+		if got := f.entered(); len(got) != 0 {
+			t.Errorf("%s: staged input was run: %q", how, got)
+		}
+		if disc != 0 {
+			t.Errorf("%s: Disconnect (which types an escape) was called %d times", how, disc)
+		}
+		if !first {
+			t.Errorf("%s: the transport wasn't closed before Release", how)
+		}
 	}
 }

@@ -30,6 +30,11 @@ type ConsoleTransport struct {
 	// Close tears the transport down and releases everything. Safe to call
 	// after the session ended.
 	Close func()
+	// Release, if set, ends the session at the BMC's end after Close, without
+	// typing anything at the console (IPMI SOL: ipmitool sol deactivate, since
+	// killing the client leaves the BMC holding the session). It can take a
+	// while; callers bound their wait.
+	Release func()
 }
 
 // OpenConsoleOptions are the inputs of Driver.OpenConsole.

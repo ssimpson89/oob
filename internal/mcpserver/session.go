@@ -9,6 +9,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -74,6 +75,7 @@ type session struct {
 	result  console.Result
 	drained chan struct{} // closed once the output reader has finished
 	once    sync.Once
+	trOnce  sync.Once // the transport is torn down once
 }
 
 // newSession starts recording tr's output.
@@ -116,17 +118,23 @@ func (c *session) drain() {
 
 // feed records console output and follows the cursor.
 func (c *session) feed(b []byte) {
+	before := c.tx.Count()
 	c.tx.Feed(b)
+	completed := c.tx.Count() - before
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.tr.Observe != nil {
 		kind, at, _ := c.tr.Observe(b)
 		c.kind, c.atBMC = kind, at
 	}
-	if cursor := c.tx.Partial(); cursor != c.cursorWas {
+	// A chunk can carry the echo, the output and the next prompt together, so a
+	// prompt identical to the last one looks like no change. A line completed
+	// within the chunk and a prompt after it is a prompt appearing, however the
+	// output was cut into chunks.
+	if cursor := c.tx.Partial(); cursor != c.cursorWas || (completed > 0 && looksLikePrompt(cursor)) {
 		c.cursorWas = cursor
 		// Typed text ending in # (reboot #) extends the prompt; it isn't a new one.
-		extends := c.prompt != "" && len(cursor) > len(c.prompt) && strings.HasPrefix(cursor, c.prompt)
+		extends := completed == 0 && c.prompt != "" && len(cursor) > len(c.prompt) && strings.HasPrefix(cursor, c.prompt)
 		if looksLikePrompt(cursor) && !extends {
 			c.prompt = cursor
 			c.prompts++
@@ -193,18 +201,61 @@ func (c *session) line() line {
 func (c *session) canSend() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("session %s is closed, so nothing was sent; call connect again", c.id)
+	}
 	if c.ended {
 		return fmt.Errorf("%s, so nothing was sent. Disconnect and connect again", c.endMsg)
 	}
 	return nil
 }
 
-// write types b at the console.
-func (c *session) write(b []byte) error {
+// errStuck means a write to the console didn't complete before the call's time
+// ran out, so the session was torn down.
+var errStuck = errors.New("the console stopped accepting input before the call's time ran out, so the session was closed " +
+	"(part of what was typed may have reached the console). Connect again")
+
+// toolSlack is the time a send tool has beyond its waits for the console to
+// take what it types. A variable so tests can shorten it.
+var toolSlack = 10 * time.Second
+
+// guarded runs fn, a write to the console, so that it can't outlast ctx. A transport
+// that stops taking input (an SSH channel with a closed window) would block
+// the write for good, and with it the session's send lock. When ctx ends first
+// the transport is closed, which fails the write, and guarded waits a moment for it
+// to be gone so nothing lands after the tool has returned. The session is
+// dead then; the caller forgets it.
+func (c *session) guarded(ctx context.Context, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+	}
+	c.closeTransport()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+	return errStuck
+}
+
+// closeTransport tears the transport down, once. It types nothing at the
+// console.
+func (c *session) closeTransport() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.trOnce.Do(c.tr.Close)
+}
+
+// write types b at the console, within ctx.
+func (c *session) write(ctx context.Context, b []byte) error {
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
 	c.mu.Unlock()
-	return c.tr.Link.Send(b)
+	return c.guarded(ctx, func() error { return c.tr.Link.Send(b) })
 }
 
 // unread returns what the console printed since output was last returned,
@@ -379,28 +430,26 @@ func (c *session) target() target {
 	return target{name: c.host, addr: c.addr, typ: c.typ, mark: c.tx.Mark}
 }
 
-// close ends the session: it asks the console to disconnect, gives it a moment,
-// then tears the transport down and closes the log. Safe to call twice.
+// close ends the session and closes the log. Safe to call twice. It never
+// types at the console: the console's own disconnect sequence starts with a
+// carriage return, which would run whatever is on the line, so the transport
+// is closed instead (an SSH channel hangs up; for SOL the ipmitool client is
+// stopped and then the session is deactivated at the BMC).
 func (c *session) close() {
 	c.once.Do(func() {
-		c.mu.Lock()
-		c.closed = true
-		c.mu.Unlock()
 		c.tx.Mark("session closed")
-		disc := make(chan struct{})
-		go func() {
-			defer close(disc)
-			_ = c.tr.Link.Disconnect()
-		}()
-		select {
-		case <-c.doneC:
-		case <-time.After(3 * time.Second):
+		c.closeTransport()
+		if c.tr.Release != nil {
+			rel := make(chan struct{})
+			go func() {
+				defer close(rel)
+				c.tr.Release()
+			}()
+			select {
+			case <-rel:
+			case <-time.After(5 * time.Second):
+			}
 		}
-		select {
-		case <-disc:
-		case <-time.After(time.Second):
-		}
-		c.tr.Close()
 		select {
 		case <-c.drained:
 		case <-time.After(3 * time.Second):
