@@ -75,6 +75,17 @@ func TestKeyParser(t *testing.T) {
 		{"stray end marker stripped", []string{"a\x1b[201~b"}, "ab", nil, modeConsole},
 		{"paste during command mode cancels it", []string{esc + "\x1b[200~s\x1b[201~"}, "", []action{{act: actCancel}, {act: actPaste, text: "s"}}, modeConsole},
 		{"forwarding resumes", []string{esc + "s" + "ok"}, "ok", []action{{act: actSize}}, modeConsole},
+		{"focus in forwarded intact", []string{"\x1b[I"}, "\x1b[I", nil, modeConsole},
+		{"focus out forwarded intact", []string{"\x1b[O"}, "\x1b[O", nil, modeConsole},
+		{"focus report doesn't end line start", []string{"\r\x1b[O~."}, "\r\x1b[O", []action{{act: actDisconnect}}, modeConsole},
+		{"focus report at session start keeps line start", []string{"\x1b[I~."}, "\x1b[I", []action{{act: actDisconnect}}, modeConsole},
+		{"focus report split across reads", []string{"\r\x1b", "[O~."}, "\r\x1b[O", []action{{act: actDisconnect}}, modeConsole},
+		{"focus report between text", []string{"ab\x1b[Ocd"}, "ab\x1b[Ocd", nil, modeConsole},
+		{"focus report mid-line leaves ~ literal", []string{"a\x1b[O~."}, "a\x1b[O~.", nil, modeConsole},
+		{"focus report after a held ~ keeps order", []string{"\r~\x1b[O."}, "\r~\x1b[O.", nil, modeConsole},
+		{"focus report in command mode swallowed", []string{esc + "\x1b[Os"}, "", []action{{act: actSize}}, modeConsole},
+		{"SS3 key forwarded intact", []string{"\x1bOP", "\x1bOA"}, "\x1bOP\x1bOA", nil, modeConsole},
+		{"SS3 split across reads forwarded in order", []string{"\x1b", "OP"}, "\x1bOP", nil, modeConsole},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

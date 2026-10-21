@@ -228,6 +228,19 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 			if !p.started {
 				p.started = true
 			}
+			if c == 0x1b && i+2 < len(b) && b[i+1] == '[' && (b[i+2] == 'I' || b[i+2] == 'O') {
+				// A terminal's focus report (ESC [ I, ESC [ O, sent once a program
+				// has turned on ?1004h, such as vim). It isn't typing: forward it
+				// whole, and don't let it end the line start that ~. needs.
+				if p.tilde { // a held ~ was typed before it
+					p.tilde = false
+					fwd = append(fwd, '~')
+					p.midLine = true
+				}
+				fwd = append(fwd, b[i:i+3]...)
+				i += 2
+				continue
+			}
 			if p.tilde {
 				// ssh-style escapes: ~. disconnects, ~~ sends one ~, ~x sends both.
 				p.tilde = false
