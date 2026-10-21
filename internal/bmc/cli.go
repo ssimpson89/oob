@@ -375,25 +375,23 @@ type cliSpec struct {
 	label      string // for the progress line
 }
 
-// cliConsole opens the CLI, starts the console and hands over to the bar.
-func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, error)) (int, error) {
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
+// cliOpen opens the CLI over SSH, starts the console and returns it as a
+// console transport. It needs no terminal of its own: rows and cols are the
+// size the remote is told. Both the console bar and a headless front end use it.
+func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTransport, error) {
+	s, sess, stdin, err := cliDial(name, h, sp, rows, cols)
 	if err != nil {
-		return 1, err
+		return nil, err
 	}
-	app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
-	s, sess, stdin, err := cliDial(name, h, sp, console.RemoteRows(rows), w)
-	if err != nil {
-		return 1, err
-	}
-	defer s.Close()
 	for i, c := range sp.start {
 		if err := s.Send(c + "\r"); err != nil {
-			return 1, err
+			s.Close()
+			return nil, err
 		}
 		if i < len(sp.start)-1 {
 			if _, err := s.expectPrompt(cliCmdTimeout); err != nil {
-				return 1, err
+				s.Close()
+				return nil, err
 			}
 		}
 	}
@@ -408,9 +406,27 @@ func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, er
 		code, err := sshx.ExitStatus(err, true)
 		done <- console.Result{Code: code, Err: err}
 	}()
+	return &ConsoleTransport{
+		Kind: sp.kind, Link: l, Out: newSkipEcho(s, sp.start[len(sp.start)-1]), Done: done,
+		Toggle: l.Toggle, Observe: l.Observe, Close: s.Close,
+	}, nil
+}
+
+// cliConsole opens the CLI, starts the console and hands over to the bar.
+func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, error)) (int, error) {
+	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return 1, err
+	}
+	app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
+	tr, err := cliOpen(name, h, sp, console.RemoteRows(rows), w)
+	if err != nil {
+		return 1, err
+	}
+	defer tr.Close()
 	return console.Run(console.Setup{
 		Host: name, Kind: sp.kind,
-		Link: l, Out: newSkipEcho(s, sp.start[len(sp.start)-1]), Done: done,
+		Link: tr.Link, Out: tr.Out, Done: tr.Done,
 		Power: power,
 	})
 }

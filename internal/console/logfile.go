@@ -110,6 +110,11 @@ func logPath(host string, now time.Time) (string, error) {
 	return filepath.Join(d, "logs", logName(host, now)), nil
 }
 
+// joinLogDir is where a log for host started at now goes under dir.
+func joinLogDir(dir, host string, now time.Time) string {
+	return filepath.Join(dir, logName(host, now))
+}
+
 // uniqueLogPath returns path, or path with -2, -3... before the extension if a
 // file is already there (a log restarted within the same second).
 func uniqueLogPath(path string) string {

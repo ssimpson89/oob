@@ -109,7 +109,7 @@ func (d *idracDriver) racadmPrint(args ...string) error {
 		return err
 	}
 	if s := strings.TrimSpace(console.CleanRemote(out)); s != "" {
-		fmt.Println(s)
+		fmt.Fprintln(Stdout(), s)
 	}
 	return nil
 }
@@ -141,11 +141,11 @@ func (d *idracDriver) Power(act string) error {
 	}
 	if act == "status" {
 		if st, ok := idracPowerState(out); ok {
-			fmt.Println("Chassis Power is " + st)
+			fmt.Fprintln(Stdout(), "Chassis Power is "+st)
 			return nil
 		}
 	}
-	fmt.Println(strings.TrimSpace(console.CleanRemote(out)))
+	fmt.Fprintln(Stdout(), strings.TrimSpace(console.CleanRemote(out)))
 	return nil
 }
 
@@ -182,10 +182,10 @@ func (d *idracDriver) Boot(dev string, legacy, persistent bool) error {
 		return fmt.Errorf("step 1 was applied (iDRAC.ServerBoot.BootOnce is now %s) but setting FirstBootDevice to PXE failed: %w", once, d.unknownOnTimeout(err))
 	}
 	if persistent {
-		fmt.Println("PXE is now the first boot device for every boot (applies on next boot)")
+		fmt.Fprintln(Stdout(), "PXE is now the first boot device for every boot (applies on next boot)")
 		return nil
 	}
-	fmt.Println("PXE set for the next boot only (applies on next boot)")
+	fmt.Fprintln(Stdout(), "PXE set for the next boot only (applies on next boot)")
 	return nil
 }
 
@@ -230,7 +230,7 @@ func (d *idracDriver) MCReset(kind string) error {
 		return d.unknownOnTimeout(err)
 	}
 	if s := strings.TrimSpace(console.CleanRemote(out)); s != "" {
-		fmt.Println(s)
+		fmt.Fprintln(Stdout(), s)
 	}
 	return nil
 }
@@ -251,6 +251,11 @@ func (d *idracDriver) Console(o SOLOptions) error {
 var idracSpec = cliSpec{
 	kind: "com2", promptKind: "idrac cli", prompt: idracPrompt, resync: true, start: []string{"console com2"},
 	esc: []byte{0x1c}, breakMsg: "the iDRAC serial console has no BREAK", label: "iDRAC",
+}
+
+func (d *idracDriver) OpenConsole(o OpenConsoleOptions) (*ConsoleTransport, error) {
+	untestedNote(detect.VendorName(detect.TypeIDRAC))
+	return cliOpen(d.name, d.h, idracSpec, o.Rows, o.Cols)
 }
 
 // ConsolePower power cycles with a separate racadm call (its own SSH

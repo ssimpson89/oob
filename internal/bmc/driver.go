@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,10 @@ type Driver interface {
 	MCReset(kind string) error
 	// Console opens the serial console.
 	Console(o SOLOptions) error
+	// OpenConsole starts the serial console without a terminal (no bar, no
+	// raw mode) and returns the transport; the caller owns it and must Close
+	// it. Console runs the same setup under the bar.
+	OpenConsole(o OpenConsoleOptions) (*ConsoleTransport, error)
 	// ConsolePower is the console's p key: a power cycle over a second connection.
 	ConsolePower() func() (string, error)
 }
@@ -173,6 +178,40 @@ func (d *ipmiDriver) Console(o SOLOptions) error {
 	}
 	fmt.Fprintln(os.Stderr, "Connecting to SOL on "+d.name+". Disconnect with ~. (tilde, dot) at the start of a line (~~. inside an outer ssh session).")
 	return app.Code(RunIPMI(d.h, "sol", "activate"))
+}
+
+// OpenConsole starts IPMI SOL. With Force a stale session is cleared first.
+func (d *ipmiDriver) OpenConsole(o OpenConsoleOptions) (*ConsoleTransport, error) {
+	if o.Force {
+		if out, err := ipmiOutput(d.h, ipmiQuickTimeout, "sol", "deactivate"); err != nil && !isExitError(err) {
+			return nil, fmt.Errorf("sol deactivate: %w: %s", err, console.CleanRemoteLine(out))
+		}
+	}
+	return openSOL(d.h, o.Rows, o.Cols)
+}
+
+// ipmiQuickTimeout bounds the short ipmitool calls made while opening a console.
+const ipmiQuickTimeout = 20 * time.Second
+
+// ipmiRunQuiet is one ipmitool attempt whose output is collected, not shown.
+// A non-zero exit is a result (code), not an error.
+func ipmiRunQuiet(h config.Host, timeout time.Duration, args ...string) ipmiRun {
+	out, err := ipmiOutput(h, timeout, args...)
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return ipmiRun{0, out, nil}
+	case errors.As(err, &ee):
+		return ipmiRun{exitCodeOf(ee), out, nil}
+	}
+	return ipmiRun{1, out, err}
+}
+
+// isExitError reports whether err is ipmitool exiting non-zero (as opposed to
+// failing to run at all).
+func isExitError(err error) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee)
 }
 
 func (d *ipmiDriver) ConsolePower() func() (string, error) { return powerCycleFn(d.name, d.h) }

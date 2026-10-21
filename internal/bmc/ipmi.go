@@ -196,16 +196,16 @@ func RunIPMI(h config.Host, args ...string) (int, error) {
 // sanitized on its way to the terminal (FRU, SEL and sensor text comes from
 // the BMC), except for `sol activate`, which is a console and stays raw.
 func runIpmiTail(h config.Host, quiet bool, args ...string) (int, string, error) {
-	cmd, err := ipmiCmd(context.Background(), h, args...)
+	cmd, err := ipmiCmd(runCtx(), h, args...)
 	if err != nil {
 		return 1, "", err
 	}
 	app.Progressf("connecting to %s via IPMI...", hostLabel(h, h.IP))
 	var tail tailBuf
-	var out io.Writer = os.Stdout
-	var errw io.Writer = io.MultiWriter(os.Stderr, &tail)
+	var out io.Writer = Stdout()
+	var errw io.Writer = io.MultiWriter(stderrW(), &tail)
 	if !isSolActivate(args) {
-		so, se := console.NewSanitizeWriter(os.Stdout), console.NewSanitizeWriter(os.Stderr)
+		so, se := console.NewSanitizeWriter(Stdout()), console.NewSanitizeWriter(stderrW())
 		defer so.Flush()
 		defer se.Flush()
 		out, errw = so, io.MultiWriter(se, &tail)
@@ -213,10 +213,13 @@ func runIpmiTail(h config.Host, quiet bool, args ...string) (int, string, error)
 	if quiet {
 		errw = &tail
 	}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, out, errw
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdinR(), out, errw
+	if capturing.Load() != nil {
+		cmd.WaitDelay = 2 * time.Second // a killed ipmitool's children must not hold the pipes open
+	}
 	err = cmd.Run()
 	if hint := ipmiHint(tail.String(), h); hint != "" && !quiet {
-		fmt.Fprintln(os.Stderr, hint)
+		fmt.Fprintln(stderrW(), hint)
 	}
 	if err != nil {
 		var ee *exec.ExitError

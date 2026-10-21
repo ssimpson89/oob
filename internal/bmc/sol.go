@@ -85,23 +85,18 @@ func ipmiPowerOutcome(name, out string, err error) (string, error) {
 	return out, nil
 }
 
-// solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
-// exit code.
-func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
+// openSOL starts `ipmitool sol activate` under a PTY of the given size and
+// returns it as a console transport. It needs no terminal of its own, so both
+// the console bar and a headless front end use it.
+func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	cmd, err := ipmiCmd(context.Background(), h, "-e", string([]byte{solEscape}), "sol", "activate")
 	if err != nil {
-		return 1, err
+		return nil, err
 	}
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
 	if err != nil {
-		return 1, err
+		return nil, fmt.Errorf("start ipmitool: %w", err)
 	}
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(console.RemoteRows(rows)), Cols: uint16(w)})
-	if err != nil {
-		return 1, fmt.Errorf("start ipmitool: %w", err)
-	}
-	defer ptmx.Close()
-
 	done := make(chan console.Result, 1)
 	go func() {
 		err := cmd.Wait()
@@ -115,19 +110,46 @@ func solConsole(h config.Host, name string, power func() (string, error)) (int, 
 			done <- console.Result{Code: 1, Err: err}
 		}
 	}()
-	var tail tailBuf
+	tail := &tailBuf{}
+	return &ConsoleTransport{
+		Kind: "sol",
+		Link: &solLink{ptmx: ptmx, cmd: cmd},
+		Out:  io.TeeReader(ptmx, tail),
+		Done: done,
+		Tail: tail.String,
+		Close: func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = ptmx.Close()
+		},
+	}, nil
+}
+
+// solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
+// exit code.
+func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
+	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return 1, err
+	}
+	tr, err := openSOL(h, console.RemoteRows(rows), w)
+	if err != nil {
+		return 1, err
+	}
+	defer tr.Close()
 	code, err := console.Run(console.Setup{
 		Host: name, Kind: "sol",
-		Link:       &solLink{ptmx: ptmx, cmd: cmd},
-		Out:        io.TeeReader(ptmx, &tail),
-		Done:       done,
+		Link:       tr.Link,
+		Out:        tr.Out,
+		Done:       tr.Done,
 		Power:      power,
 		Connecting: "connecting to " + name + " via IPMI...",
 	})
 	// The terminal is restored now. Repeat any ipmitool error below the bar's
 	// old row so it is still on screen after the console is torn down.
 	if code != 0 {
-		reportIpmiFailure(tail.String(), h)
+		reportIpmiFailure(tr.Tail(), h)
 	}
 	return code, err
 }
