@@ -241,9 +241,9 @@ func TestStateChangingToolsAlwaysAsk(t *testing.T) {
 		says   string
 	}{
 		{"client can't ask", "", false, "can't ask for it"},
-		{"user declines", "decline", false, "the user refused"},
-		{"user cancels", "cancel", false, "the user refused"},
-		{"user accepts without ticking", "unticked", false, "the user refused"},
+		{"user declines", "decline", false, "the user declined"},
+		{"user cancels", "cancel", false, "the approval prompt was dismissed"},
+		{"user accepts without ticking", "unticked", false, "without \"Allow it\" ticked"},
 		{"user approves", "accept", true, ""},
 	} {
 		t.Run(mode.name, func(t *testing.T) {

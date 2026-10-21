@@ -11,7 +11,6 @@ package mcpserver
 import (
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -64,27 +63,26 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 	// to another.
 	call += "\x00" + dev.name + "\x00" + dev.addr + "\x00" + dev.typ + "\x00" + what
 
+	slices.Sort(whys)
+	why := strings.Join(slices.Compact(whys), "; it ")
+
 	s.askMu.Lock()
 	defer s.askMu.Unlock()
 	if state := req.Params.RequestState; state != "" {
 		asked, ok := s.asked[state]
 		delete(s.asked, state)
 		if !ok || asked != call {
-			return nil, errors.New("refused, so nothing was done: that approval has expired or was for a different call; call again to ask the user")
+			return nil, fmt.Errorf("refused, so nothing was done: that approval has expired or was for a different call; call again to ask the user "+
+				"(it needs approval because it %s)", why)
 		}
-		if r, ok := req.Params.InputResponses[approvalID].(*mcp.ElicitResult); ok && r.Action == "accept" && r.Content["allow"] == true {
-			dev.note("user approved: " + visible(what))
-			return nil, nil
-		}
-		dev.note("user refused: " + visible(what))
-		return nil, errors.New("the user refused, so nothing was done. Don't do it another way; ask the user how they want to go on")
+		return nil, s.answered(req.Params.InputResponses[approvalID], dev, what, why)
 	}
 
-	slices.Sort(whys)
-	why := strings.Join(slices.Compact(whys), "; it ")
 	if e := req.ClientCapabilities(); e == nil || e.Elicitation == nil || (e.Elicitation.Form == nil && e.Elicitation.URL != nil) {
+		dev.note("needs approval, client can't ask (it " + why + "): " + visible(what))
 		return nil, fmt.Errorf("refused, so nothing was done: this needs the user's approval, since it %s, and this MCP "+
-			"client can't ask for it. Tell the user what you wanted to do and why; they can run it themselves with the oob command line", why)
+			"client can't ask for it (it doesn't offer MCP elicitation). Tell the user what you wanted to do and why; "+
+			"they can run it themselves with the oob command line", why)
 	}
 	if len(s.asked) >= askedMax {
 		clear(s.asked) // calls the client never repeated
@@ -142,4 +140,39 @@ func callKey(p *mcp.CallToolParamsRaw) (string, error) {
 	}
 	b, err := json.Marshal(args)
 	return p.Name + "\x00" + string(b), err
+}
+
+// answered turns the client's answer to the approval request into nil (go
+// ahead) or the error to give the model. The answers are told apart so the
+// model, and through it the user, isn't told the user refused when they were
+// never asked: a client may not show the prompt, or may answer it by itself.
+// why is what made the call need approval, so it can be named.
+func (s *server) answered(resp mcp.InputResponse, dev target, what, why string) error {
+	r, ok := resp.(*mcp.ElicitResult)
+	if !ok || r == nil {
+		dev.note("no answer to the approval request came back (it " + why + "): " + visible(what))
+		return fmt.Errorf("no answer to the approval request came back from the client (it may not show these prompts), so nothing "+
+			"was done. The call needed approval because it %s. Tell the user what you wanted to do; they can approve it through a "+
+			"client that supports MCP elicitation, or run it with the oob command line", why)
+	}
+	switch {
+	case r.Action == "accept" && r.Content["allow"] == true:
+		dev.note("user approved: " + visible(what))
+		return nil
+	case r.Action == "accept":
+		dev.note("approval accepted without Allow it ticked (it " + why + "): " + visible(what))
+		return fmt.Errorf("the approval prompt was answered without \"Allow it\" ticked, so nothing was done (the call needed approval "+
+			"because it %s). Don't do it another way; ask the user how they want to go on", why)
+	case r.Action == "decline":
+		dev.note("user declined (it " + why + "): " + visible(what))
+		return fmt.Errorf("the user declined, so nothing was done (the call needed approval because it %s). Don't do it another way; "+
+			"ask the user how they want to go on", why)
+	case r.Action == "cancel":
+		dev.note("approval dismissed (it " + why + "): " + visible(what))
+		return fmt.Errorf("the approval prompt was dismissed without an answer, so nothing was done (the call needed approval because it %s). "+
+			"Ask the user whether they want it done", why)
+	}
+	dev.note("approval answered with " + strconv.Quote(r.Action) + " (it " + why + "): " + visible(what))
+	return fmt.Errorf("the approval prompt came back with an unexpected answer (%q), so nothing was done (the call needed approval "+
+		"because it %s). Ask the user how they want to go on", r.Action, why)
 }

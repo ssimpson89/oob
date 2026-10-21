@@ -85,6 +85,9 @@ func (d *fakeDriver) OpenConsole(o bmc.OpenConsoleOptions) (*bmc.ConsoleTranspor
 		return nil, d.h.openErr
 	}
 	fh := newFakeHost(d.h.t, d.name)
+	if d.h.initial != nil {
+		fh = newFakeHostShowing(d.h.t, d.name, *d.h.initial)
+	}
 	if d.h.setup != nil {
 		d.h.setup(fh)
 	}
@@ -132,6 +135,13 @@ type fakeHost struct {
 }
 
 func newFakeHost(t *testing.T, name string) *fakeHost {
+	return newFakeHostShowing(t, name, "[root@"+name+" ~]# ")
+}
+
+// newFakeHostShowing is a host whose console starts by printing initial: a
+// banner with no prompt after it, as a console opened on a quiet serial port
+// looks.
+func newFakeHostShowing(t *testing.T, name, initial string) *fakeHost {
 	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), unstick: make(chan struct{}), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
 	f.pr, f.pw = io.Pipe()
 	go func() {
@@ -141,7 +151,7 @@ func newFakeHost(t *testing.T, name string) *fakeHost {
 			}
 		}
 	}()
-	f.emit(f.prompt)
+	f.emit(initial)
 	return f
 }
 
@@ -394,6 +404,7 @@ type harness struct {
 	asked   []string // the approval questions the user saw
 	setup   func(*fakeHost)
 	openErr error
+	initial *string // what a console prints when it opens, if not a prompt
 
 	mu       sync.Mutex
 	calls    []string

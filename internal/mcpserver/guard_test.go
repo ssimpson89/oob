@@ -19,7 +19,7 @@ func TestGuardCatchesRebootLikeCommands(t *testing.T) {
 			answer string
 			runs   bool
 			says   string
-		}{{"", false, "can't ask"}, {"decline", false, "the user refused"}, {"accept", true, ""}} {
+		}{{"", false, "can't ask"}, {"decline", false, "the user declined"}, {"accept", true, ""}} {
 			h := start(t, Options{}, mode.answer)
 			h.connect()
 			out, _ := h.send("s1", line)
@@ -195,7 +195,7 @@ func TestSendBreak(t *testing.T) {
 		answer string
 		sends  bool
 		says   string
-	}{{"", false, "can't ask"}, {"decline", false, "refused"}, {"accept", true, "BREAK"}} {
+	}{{"", false, "can't ask"}, {"decline", false, "the user declined"}, {"accept", true, "BREAK"}} {
 		h := start(t, Options{}, c.answer)
 		h.connect()
 		out, isErr := h.call("send_break", map[string]any{"session": "s1"})
