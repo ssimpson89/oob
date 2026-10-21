@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/ssimpson89/oob/internal/app"
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
@@ -209,137 +210,176 @@ func promptPassword() (string, error) {
 	return string(b), nil
 }
 
+// hostFields holds the per-host flags shared by add and edit <name>.
+type hostFields struct {
+	h         config.Host
+	tags      []string
+	passStdin bool
+}
+
+func (hf *hostFields) bind(f *pflag.FlagSet) {
+	f.StringVar(&hf.h.User, "user", "", "BMC user (default from defaults block)")
+	f.StringVar(&hf.h.Pass, "pass", "", "BMC password (visible in shell history; prefer the prompt or --pass-stdin)")
+	f.BoolVar(&hf.passStdin, "pass-stdin", false, "read the BMC password from one line of stdin")
+	f.StringVar(&hf.h.Key, "key", "", "SSH private key file (used instead of the ssh-agent; the BMC needs the public key; IPMI/Redfish still need the password; \"\" clears it)")
+	f.IntVar(&hf.h.Port, "port", 0, "SSH port")
+	f.StringVar(&hf.h.Cipher, "cipher", "", "ipmitool lanplus cipher suite, e.g. 17 or 3")
+	f.StringVar(&hf.h.Notes, "notes", "", "free-form notes (also --note)")
+	f.StringVar(&hf.h.Type, "type", "", "BMC type: "+strings.Join(validTypes(), ", ")+` ("ilo": HPE iLO, Redfish and SSH CLI; "idrac" and "supermicro" are untested; "ipmi" pins generic IPMI); default: generic, and the vendor is auto-detected over SSH on first use`)
+	f.StringSliceVar(&hf.tags, "tag", nil, "tag (repeatable; replaces existing tags)")
+	f.SetNormalizeFunc(func(_ *pflag.FlagSet, name string) pflag.NormalizedName {
+		if name == "note" {
+			name = "notes"
+		}
+		return pflag.NormalizedName(name)
+	})
+}
+
+// apply adds or updates host name, changing only the flags that were passed.
+// ipSet says whether an address was given at all, so an explicitly empty one
+// (say, a script variable that expanded to nothing) is rejected, not ignored. With mustExist (edit <name>) a missing host is an
+// error instead of being created, so a typo can't add a stray entry.
+func (hf *hostFields) apply(cmd *cobra.Command, name, ip string, ipSet, mustExist bool) error {
+	fl, h := cmd.Flags(), hf.h
+	if err := validHostName(name); err != nil {
+		return err
+	}
+	if !detect.ValidType(h.Type) {
+		return fmt.Errorf("unknown --type %q (valid: %s)", h.Type, strings.Join(validTypes(), ", "))
+	}
+	if fl.Changed("port") {
+		if err := validPort(h.Port); err != nil {
+			return err
+		}
+	}
+	if ipSet && !validIPOrHost(ip) {
+		return fmt.Errorf("ip %q is not an IP address or hostname", ip)
+	}
+	if hf.passStdin && fl.Changed("pass") {
+		return errors.New("use only one of --pass and --pass-stdin")
+	}
+	noHost := fmt.Errorf("no such host %q (exact name required; use %s add to create it)", name, AppName)
+	// Read once up front: it prints the "creating" and permission notes,
+	// and decides whether a password prompt is needed. The prompt must
+	// not happen under the config lock, so the change itself is applied
+	// afterwards by UpdateConfig on a fresh read.
+	var c *config.Config
+	var err error
+	if mustExist {
+		_, c, err = load()
+	} else {
+		_, c, err = loadCreate(cmd.ErrOrStderr())
+	}
+	if err != nil {
+		return err
+	}
+	cur, exists := c.Hosts[name]
+	if mustExist && !exists {
+		return noHost
+	}
+	if !exists && !ipSet {
+		return fmt.Errorf("new host %q needs an ip: usage: %s add <name> <ip>", name, AppName)
+	}
+	var pw string
+	var havePW bool
+	switch {
+	case hf.passStdin:
+		if pw, err = readPassStdin(cmd.InOrStdin()); err != nil {
+			return err
+		}
+		havePW = true
+	case fl.Changed("pass"):
+		pw, havePW = h.Pass, true
+	case !mustExist && cur.Pass == "" && c.Defaults.Pass == "" && !hasKey(fl.Changed("key"), h.Key, cur.Key, c.Defaults.Key):
+		if pw, err = promptPassword(); err != nil {
+			return err
+		}
+		havePW = true
+	}
+	var changed []string
+	set := func(label string) { changed = append(changed, label) }
+	err = config.UpdateConfig(func(c *config.Config) error {
+		changed = nil
+		cur, exists = c.Hosts[name]
+		if mustExist && !exists {
+			return noHost
+		}
+		if !exists && !ipSet {
+			return fmt.Errorf("new host %q needs an ip: usage: %s add <name> <ip>", name, AppName)
+		}
+		if ipSet {
+			cur.IP = ip
+			set("ip")
+		}
+		if fl.Changed("user") {
+			cur.User = h.User
+			set("user")
+		}
+		if fl.Changed("port") {
+			cur.Port = h.Port
+			set("port")
+		}
+		if fl.Changed("key") {
+			cur.Key = h.Key
+			set("key")
+		}
+		if fl.Changed("cipher") {
+			cur.Cipher = h.Cipher
+			set("cipher")
+		}
+		if fl.Changed("notes") {
+			cur.Notes = h.Notes
+			set("notes")
+		}
+		if fl.Changed("type") {
+			cur.Type = h.Type
+			set("type")
+		}
+		if fl.Changed("tag") {
+			cur.Tags = hf.tags
+			set("tags")
+		}
+		if havePW {
+			cur.Pass = pw
+			set("pass")
+		}
+		c.Hosts[name] = cur
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !exists {
+		fmt.Fprintf(cmd.OutOrStdout(), "added %s\n", name)
+	} else if len(changed) == 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "updated %s (no changes)\n", name)
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(), "updated %s (%s)\n", name, strings.Join(changed, ", "))
+	}
+	return nil
+}
+
 func addCmd() *cobra.Command {
-	var h config.Host
-	var tags []string
-	var passStdin bool
+	var hf hostFields
 	c := &cobra.Command{
-		Use: "add <name> [ip]", Short: "Add a host, or update only the fields you pass on an existing one",
+		Use: "add <name> [ip]", Short: "Add a host (or update one: only the fields you pass change)",
 		Long: "Add a host. The ip is required for a new host.\n" +
 			"On an existing host only the fields you pass are changed (a stored password is\n" +
 			"kept unless --pass or --pass-stdin is given; --tag replaces the tag list).\n" +
 			"For a new host without --pass/--pass-stdin and no default password, the password is\n" +
 			"prompted for (needs a terminal), unless the host has a key: SSH then uses the key, but IPMI\n" +
-			"and Redfish need a password, so add one with --pass-stdin if you use them.",
+			"and Redfish need a password, so add one with --pass-stdin if you use them.\n" +
+			"To change an existing host without any risk of creating one, use `" + AppName + " edit <name>`.",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fl := cmd.Flags()
-			name := args[0]
-			if err := validHostName(name); err != nil {
-				return err
+			ip := ""
+			if len(args) == 2 {
+				ip = args[1]
 			}
-			if !detect.ValidType(h.Type) {
-				return fmt.Errorf("unknown --type %q (valid: %s)", h.Type, strings.Join(validTypes(), ", "))
-			}
-			if fl.Changed("port") {
-				if err := validPort(h.Port); err != nil {
-					return err
-				}
-			}
-			if len(args) == 2 && !validIPOrHost(args[1]) {
-				return fmt.Errorf("ip %q is not an IP address or hostname", args[1])
-			}
-			if passStdin && fl.Changed("pass") {
-				return errors.New("use only one of --pass and --pass-stdin")
-			}
-			// Read once up front: it prints the "creating" and permission notes,
-			// and decides whether a password prompt is needed. The prompt must
-			// not happen under the config lock, so the change itself is applied
-			// afterwards by UpdateConfig on a fresh read.
-			_, c, err := loadCreate(cmd.ErrOrStderr())
-			if err != nil {
-				return err
-			}
-			cur, exists := c.Hosts[name]
-			if !exists && len(args) < 2 {
-				return fmt.Errorf("new host %q needs an ip: usage: %s add <name> <ip>", name, AppName)
-			}
-			var pw string
-			var havePW bool
-			switch {
-			case passStdin:
-				if pw, err = readPassStdin(cmd.InOrStdin()); err != nil {
-					return err
-				}
-				havePW = true
-			case fl.Changed("pass"):
-				pw, havePW = h.Pass, true
-			case cur.Pass == "" && c.Defaults.Pass == "" && !hasKey(fl.Changed("key"), h.Key, cur.Key, c.Defaults.Key):
-				if pw, err = promptPassword(); err != nil {
-					return err
-				}
-				havePW = true
-			}
-			var changed []string
-			set := func(label string) { changed = append(changed, label) }
-			err = config.UpdateConfig(func(c *config.Config) error {
-				changed = nil
-				cur, exists = c.Hosts[name]
-				if !exists && len(args) < 2 {
-					return fmt.Errorf("new host %q needs an ip: usage: %s add <name> <ip>", name, AppName)
-				}
-				if len(args) == 2 {
-					cur.IP = args[1]
-					set("ip")
-				}
-				if fl.Changed("user") {
-					cur.User = h.User
-					set("user")
-				}
-				if fl.Changed("port") {
-					cur.Port = h.Port
-					set("port")
-				}
-				if fl.Changed("key") {
-					cur.Key = h.Key
-					set("key")
-				}
-				if fl.Changed("cipher") {
-					cur.Cipher = h.Cipher
-					set("cipher")
-				}
-				if fl.Changed("notes") {
-					cur.Notes = h.Notes
-					set("notes")
-				}
-				if fl.Changed("type") {
-					cur.Type = h.Type
-					set("type")
-				}
-				if fl.Changed("tag") {
-					cur.Tags = tags
-					set("tags")
-				}
-				if havePW {
-					cur.Pass = pw
-					set("pass")
-				}
-				c.Hosts[name] = cur
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-			if !exists {
-				fmt.Fprintf(cmd.OutOrStdout(), "added %s\n", name)
-			} else if len(changed) == 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "updated %s (no changes)\n", name)
-			} else {
-				fmt.Fprintf(cmd.OutOrStdout(), "updated %s (%s)\n", name, strings.Join(changed, ", "))
-			}
-			return nil
+			return hf.apply(cmd, args[0], ip, len(args) == 2, false)
 		},
 	}
-	f := c.Flags()
-	f.StringVar(&h.User, "user", "", "BMC user (default from defaults block)")
-	f.StringVar(&h.Pass, "pass", "", "BMC password (visible in shell history; prefer the prompt or --pass-stdin)")
-	f.BoolVar(&passStdin, "pass-stdin", false, "read the BMC password from one line of stdin")
-	f.StringVar(&h.Key, "key", "", "SSH private key file (used instead of the ssh-agent; the BMC needs the public key; IPMI/Redfish still need the password; \"\" clears it)")
-	f.IntVar(&h.Port, "port", 0, "SSH port")
-	f.StringVar(&h.Cipher, "cipher", "", "ipmitool lanplus cipher suite, e.g. 17 or 3")
-	f.StringVar(&h.Notes, "notes", "", "free-form notes")
-	f.StringVar(&h.Type, "type", "", "BMC type: "+strings.Join(validTypes(), ", ")+` ("ilo": HPE iLO, Redfish and SSH CLI; "idrac" and "supermicro" are untested; "ipmi" pins generic IPMI); default: generic, and the vendor is auto-detected over SSH on first use`)
-	f.StringSliceVar(&tags, "tag", nil, "tag (repeatable; replaces existing tags)")
+	hf.bind(c.Flags())
 	return c
 }
 
@@ -374,38 +414,66 @@ func rmCmd() *cobra.Command {
 }
 
 func editCmd() *cobra.Command {
-	return &cobra.Command{
-		Use: "edit", Short: "Open the config in $VISUAL or $EDITOR (falls back to vi)",
+	var hf hostFields
+	var ip string
+	c := &cobra.Command{
+		Use:   "edit [name]",
+		Short: "Change a host's fields (e.g. edit node01 --note \"rack 4\"), or open the config file",
+		Long: "With a host name, change only the fields you pass on that existing host:\n" +
+			"  " + AppName + " edit node01 --note \"rack 4, PSU swapped\"\n" +
+			"  " + AppName + " edit node01 --ip 192.0.2.20 --tag lab --tag gpu\n" +
+			"The host must already exist (use " + AppName + " add to create one).\n\n" +
+			"With no name, open the whole config in $VISUAL or $EDITOR (falls back to vi).",
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: hostCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, c, err := load()
-			if err != nil {
-				return err
+			if len(args) == 1 {
+				return hf.apply(cmd, args[0], ip, cmd.Flags().Changed("ip"), true)
 			}
-			if _, err := os.Stat(p); err != nil {
-				if err := c.Save(p); err != nil {
-					return err
-				}
+			// Only this command's own flags count: global ones like -c and -y
+			// still mean "open the editor".
+			changed := false
+			cmd.LocalNonPersistentFlags().VisitAll(func(f *pflag.Flag) { changed = changed || f.Changed })
+			if changed {
+				return fmt.Errorf("field flags need a host name: usage: %s edit <name> --note ...", AppName)
 			}
-			ed := os.Getenv("VISUAL")
-			if ed == "" {
-				ed = os.Getenv("EDITOR")
-			}
-			if strings.TrimSpace(ed) == "" {
-				ed = "vi"
-				fmt.Fprintln(cmd.ErrOrStderr(), "using vi (set EDITOR to change)")
-			}
-			parts := strings.Fields(ed)
-			ec := exec.Command(parts[0], append(parts[1:], p)...)
-			ec.Stdin, ec.Stdout, ec.Stderr = os.Stdin, os.Stdout, os.Stderr
-			if err := ec.Run(); err != nil {
-				return err
-			}
-			if _, err := config.LoadConfig(p, nil); err != nil {
-				return fmt.Errorf("config is now invalid: %w", err)
-			}
-			return nil
+			return openEditor(cmd)
 		},
 	}
+	hf.bind(c.Flags())
+	c.Flags().StringVar(&ip, "ip", "", "BMC IP address or hostname")
+	return c
+}
+
+// openEditor opens the config file in the user's editor and checks it still parses.
+func openEditor(cmd *cobra.Command) error {
+	p, c, err := load()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(p); err != nil {
+		if err := c.Save(p); err != nil {
+			return err
+		}
+	}
+	ed := os.Getenv("VISUAL")
+	if ed == "" {
+		ed = os.Getenv("EDITOR")
+	}
+	if strings.TrimSpace(ed) == "" {
+		ed = "vi"
+		fmt.Fprintln(cmd.ErrOrStderr(), "using vi (set EDITOR to change)")
+	}
+	parts := strings.Fields(ed)
+	ec := exec.Command(parts[0], append(parts[1:], p)...)
+	ec.Stdin, ec.Stdout, ec.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := ec.Run(); err != nil {
+		return err
+	}
+	if _, err := config.LoadConfig(p, nil); err != nil {
+		return fmt.Errorf("config is now invalid: %w", err)
+	}
+	return nil
 }
 
 func importCmd() *cobra.Command {
