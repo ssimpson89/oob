@@ -253,8 +253,8 @@ Pasting into a serial console (IPMI SOL, iLO VSP, iDRAC `com2`, Supermicro SOL) 
 can't take a whole paste at once, and over a laggy link the BMC's buffer overflows and drops characters. oob
 types each pasted line a few characters ahead of the echo, presses Enter only when the echoed line matches
 what it typed, waits for the prompt before the next line (a continuation prompt such as `> `, `... ` or `-> `
-counts, and so does output going quiet for a moment at a line with text, so a heredoc can't stall it), and stops
-at the first error message or question from the device. In a full-screen program such as vim, whose echo can't be
+counts, and so does a prompt-shaped line (ending in `>`, `$`, `#` and the like) once output has been quiet for a second, so a heredoc can't stall it), and stops
+at the first error message or question from the device. In a full-screen program such as vim (alternate screen on, or a cursor-addressed echo), whose echo can't be
 read, lines go out in small timed writes instead. A device that says nothing at all after Enter for 5 seconds
 stops the paste with a reason on the bar. Tabs become spaces. A paste with no newline is typed and left at the prompt. The bar shows
 `pasting 3/12` and, if the paste stops, why. `ctrl+] x` (or `ctrl+] esc`) cancels it. The first key

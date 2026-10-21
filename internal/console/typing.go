@@ -136,7 +136,10 @@ func (k *consoleKeys) pacer() (p *paste.Pacer, untap func()) {
 		FullScreen: k.con.taps.FullScreen(),
 	}
 	if path := os.Getenv(traceEnv); path != "" {
-		if tr, err := paste.OpenTrace(path); err == nil {
+		tr, err := paste.OpenTrace(path)
+		if err != nil {
+			k.con.Note("paste trace not written: "+err.Error(), true)
+		} else {
 			p.Trace = tr
 			stopTap := untap
 			return p, func() { stopTap(); tr.Close() }

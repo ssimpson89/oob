@@ -24,6 +24,10 @@ func OpenTrace(path string) (*Trace, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := f.Chmod(0o600); err != nil { // an older file may be world-readable
+		f.Close()
+		return nil, err
+	}
 	t := &Trace{f: f, start: time.Now()}
 	t.line("--", "paste trace opened")
 	return t, nil

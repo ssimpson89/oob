@@ -207,6 +207,7 @@ type StopError struct {
 	Line      int    // 1-based line that triggered the stop
 	Text      string // the line that was sent
 	Reason    string // what the device said, or why oob stopped
+	Blind     bool   // the line went to a password prompt: its text is never shown
 	Unentered bool   // the line was typed but Enter wasn't pressed: it's still at the prompt
 }
 
@@ -254,8 +255,9 @@ const (
 	blindChunk = 8                      // password: bytes per write, with no echo to pace by
 	blindGap   = 100 * time.Millisecond // password: pause between writes, long enough for a slow UART to drain 8 bytes
 	screenGap  = 50 * time.Millisecond  // full-screen program: pause between 8-byte writes, while it redraws
-	settleMin  = 300 * time.Millisecond // output quiet for this long after Enter, at a line with text: the device is waiting for input
+	settleMin  = 300 * time.Millisecond // full-screen program: output quiet for this long means it is waiting for the next line
 	settleMax  = 500 * time.Millisecond // the settle time grows with the echo latency, up to this
+	guessMin   = 1 * time.Second        // output quiet for this long at a prompt-shaped line we don't know: ready
 	stallWait  = 5 * time.Second        // after Enter the device said nothing at all for this long: stop
 )
 
@@ -272,6 +274,8 @@ type Pacer struct {
 	// Stall is how long the device may say nothing at all after Enter before
 	// the paste stops; zero means 5 seconds.
 	Stall time.Duration
+	// PromptWait bounds the wait for a prompt after Enter; zero means a minute.
+	PromptWait time.Duration
 	// Trace, if set, logs bytes sent and received and the pacer's decisions.
 	Trace *Trace
 }
@@ -280,10 +284,11 @@ type Pacer struct {
 // returns nil when every line was sent, a *StopError if the device objected
 // or asked a question, ctx's error if stopped, or Write's error.
 func (p *Pacer) Run(ctx context.Context, lines []string, progress func(int)) error {
-	r := &run{Pacer: p, degraded: p.FullScreen}
+	r := &run{Pacer: p}
+	r.scr.on = p.FullScreen
 	r.screen.Feed([]byte(p.Prompt))
 	r.learn(r.screen.Partial())
-	r.note("start: %d lines, prompt %q, known %v, full-screen %v", len(lines), p.Prompt, r.promptKnown, r.degraded)
+	r.note("start: %d lines, prompt %q, known %v, full-screen %v", len(lines), p.Prompt, r.promptKnown, r.scr.on)
 	for i, line := range lines {
 		progress(i)
 		r.lineNo = i + 1
@@ -291,6 +296,9 @@ func (p *Pacer) Run(ctx context.Context, lines []string, progress func(int)) err
 			var se *StopError
 			if errors.As(err, &se) {
 				se.Line, se.Text = i+1, strings.TrimSuffix(line, "\r")
+				if r.blindLine {
+					se.Text, se.Blind = "<redacted>", true
+				}
 			}
 			r.note("stop: %v", err)
 			return err
@@ -307,7 +315,8 @@ type run struct {
 	host        string        // leading text of the prompt, e.g. "Switch" or "user@sw1"
 	textEnd     string        // while the device takes free text, the text that ends it
 	typeOnly    bool          // Type: track the echo only, leave errors and questions to the caller
-	degraded    bool          // a full-screen program: echo can't be read, so lines go out in timed writes
+	scr         screenTracker // whether the alternate screen is on (vim and the like)
+	blindLine   bool          // the line being sent goes to a password prompt
 	echoLat     time.Duration // the longest delay seen between typing a line and its first echo
 	lineNo      int           // the line being sent, counting from 1, for the trace
 	tail        []byte        // the end of the last output, in case an escape sequence is split
@@ -330,7 +339,13 @@ type lineSend struct {
 	atPrompt   bool
 	firstSend  time.Time // when the line's first byte went out
 	latDone    bool      // the echo latency has been measured
+	addr       bool      // cursor addressing showed up while typing: this line's echo can't be read
 }
+
+// screenMode reports that the echo of ls can't be read: the alternate screen
+// is on, or the echo came back cursor-addressed. It holds for one line, or
+// until the alternate screen is left; output after Enter never sets it.
+func (r *run) screenMode(ls *lineSend) bool { return r.scr.on || ls.addr }
 
 func (r *run) line(ctx context.Context, line string) error {
 	ls := r.begin(line)
@@ -349,6 +364,8 @@ func (r *run) begin(line string) *lineSend {
 		start: start, blind: password.MatchString(start), lastEcho: time.Now(),
 	}
 	ls.fullScreen = fullScreen(body)
+	r.blindLine = ls.blind
+	r.tail = r.tail[:0]
 	if r.textEnd != "" && strings.Contains(body, r.textEnd) {
 		r.textEnd = "" // this line ends the free text; expect a prompt again
 	}
@@ -365,13 +382,17 @@ func (r *run) begin(line string) *lineSend {
 // didn't echo the line (Enter wasn't pressed), ctx's error if stopped, or
 // Write's error.
 func (p *Pacer) Type(ctx context.Context, line string) error {
-	r := &run{Pacer: p, typeOnly: true, degraded: p.FullScreen}
+	r := &run{Pacer: p, typeOnly: true}
+	r.scr.on = p.FullScreen
 	r.screen.Feed([]byte(p.Prompt))
 	r.learn(r.screen.Partial())
 	err := r.typeLine(ctx, r.begin(line))
 	var se *StopError
 	if errors.As(err, &se) {
 		se.Line, se.Text = 1, strings.TrimSuffix(line, "\r")
+		if r.blindLine {
+			se.Text, se.Blind = "<redacted>", true
+		}
 	}
 	return err
 }
@@ -384,7 +405,7 @@ func (r *run) typeLine(ctx context.Context, ls *lineSend) error {
 	for {
 		// Timed mode: no echo to pace by (a password, or a full-screen program
 		// whose echo is cursor-addressed), so a few bytes at a time on a timer.
-		timed, gap := ls.blind || r.degraded, blindGap
+		timed, gap := ls.blind || r.screenMode(ls), blindGap
 		if !ls.blind {
 			gap = screenGap
 		}
@@ -422,7 +443,7 @@ func (r *run) typeLine(ctx context.Context, ls *lineSend) error {
 				return err
 			}
 		case now := <-t.C:
-			if ls.blind || r.degraded || now.Sub(ls.lastEcho) < echoWait { // timed: nothing is expected to echo readably
+			if ls.blind || r.screenMode(ls) || now.Sub(ls.lastEcho) < echoWait { // timed: nothing is expected to echo readably
 				continue
 			}
 			reason := "the device didn't echo the whole line, so Enter wasn't pressed (characters may have been dropped)"
@@ -461,10 +482,40 @@ func (r *run) stall() time.Duration {
 	return stallWait
 }
 
-// settleWait is how long output must be quiet before a line with text on the
-// cursor line counts as a prompt: the shortest wait the echo latency allows.
+// settleWait is how long a full-screen program's output must be quiet before
+// the next line goes: 300ms, longer if the echo is slow.
 func (r *run) settleWait() time.Duration {
 	return min(max(3*r.echoLat, settleMin), settleMax)
+}
+
+// guessWait is how long output must be quiet at a line that looks like a
+// prompt, though it isn't one we know, before it counts as ready: a second,
+// longer if the echo is slow. Slower than settleWait, because a command that
+// prints a partial line and pauses is common and typing ahead into it is not
+// harmless.
+func (r *run) guessWait() time.Duration {
+	return min(max(3*r.echoLat, guessMin), 2*guessMin)
+}
+
+// promptWait is how long a prompt may take after Enter.
+func (r *run) promptWait() time.Duration {
+	if r.PromptWait > 0 {
+		return r.PromptWait
+	}
+	return promptWait
+}
+
+var (
+	// promptShaped is a short line ending the way prompts do.
+	promptShaped = regexp.MustCompile(`[>:$#%)\]] ?$`)
+	// progressLine is a command's progress, which ends like a prompt at times.
+	progressLine = regexp.MustCompile(`\d\s*%|\.\.\.`)
+)
+
+// promptLike reports whether the cursor line, after a newline that followed
+// Enter, looks like a prompt waiting for input.
+func promptLike(ls *lineSend, partial string) bool {
+	return ls.newLine && len(partial) <= 40 && promptShaped.MatchString(partial) && !progressLine.MatchString(partial)
 }
 
 // track updates ls.matched from what the device's cursor line shows now.
@@ -540,50 +591,65 @@ func (r *run) awaitPrompt(ctx context.Context, ls *lineSend) error {
 				continue
 			}
 			partial := r.screen.Partial()
-			quiet := r.settleWait()
+			screen := r.screenMode(ls)
+			since := now.Sub(enteredAt)
 			switch { // a question beats a prompt; timeouts come last
-			case question.MatchString(partial):
+			case !screen && question.MatchString(partial):
 				return stop("device is asking: %s", strings.TrimSpace(partial))
 			case ls.atPrompt:
 				r.note("prompt %q", partial)
+				if r.host != "" && strings.HasPrefix(partial, r.host) {
+					r.scr.on = false // the shell's own prompt is back, so no program owns the screen
+				}
 				return nil
 			case r.textEnd != "" && idle >= textWait:
 				return nil
 			case ls.fullScreen && replied && idle >= screenWait:
 				return stop("device is showing a full-screen program, waiting for keys")
-			case r.degraded && (replied && idle >= quiet || !replied && now.Sub(enteredAt) >= silentWait):
+			case screen && (replied && idle >= r.settleWait() || !replied && since >= silentWait):
 				r.note("full-screen: quiet for %v, next line", idle)
 				return nil
-			case r.promptKnown:
-				switch {
-				case replied && !ls.fullScreen && idle >= quiet && strings.TrimSpace(partial) != "":
-					// Not the prompt it learned and not a question: a continuation
-					// prompt of a kind we don't know ("> " in a heredoc, "dquote> ").
-					r.note("quiet for %v at %q, taking it as a prompt", idle, partial)
-					return nil
-				case !replied && now.Sub(enteredAt) >= r.stall():
-					return stop("no prompt or echo for %s; ctrl+] w for raw paste", r.stall())
-				case now.Sub(enteredAt) >= promptWait:
-					return stop("no prompt after %s", promptWait)
-				}
-			case ls.fullScreen: // its screen going quiet isn't a prompt; wait for screenWait, or give up
-				if now.Sub(enteredAt) >= promptWait {
-					return stop("no prompt after %s", promptWait)
-				}
-			case replied && idle >= quietWait, !replied && now.Sub(enteredAt) >= silentWait:
+			case !screen && r.promptKnown && replied && !ls.fullScreen && idle >= r.guessWait() && promptLike(ls, partial):
+				// Prompt-shaped, but not the prompt it learned and not a question:
+				// a continuation prompt of a kind we don't know.
+				r.note("quiet for %v at %q, taking it as a prompt", idle, partial)
 				return nil
+			case !screen && !r.promptKnown && !ls.fullScreen && (replied && idle >= quietWait || !replied && since >= silentWait):
+				return nil
+			case !screen && r.promptKnown && !replied && since >= r.stall():
+				return stop("no prompt or echo for %s; ctrl+] w for raw paste", r.stall())
+			case !screen && r.promptKnown && replied && !ls.fullScreen && idle >= r.stall() && strings.TrimSpace(partial) != "":
+				// Text with no prompt in it, and nothing more coming: a command
+				// waiting for something, or a prompt we can't recognise. Typing
+				// the next line into it could run half of it or answer it.
+				return stop("no prompt for %s, the device shows %q; ctrl+] w for raw paste", r.stall(), clip(strings.TrimSpace(partial)))
+			case since >= r.promptWait():
+				return stop("no prompt after %s", r.promptWait())
 			}
 		}
 	}
+}
+
+// clip shortens s to a length fit for the bar.
+func clip(s string) string {
+	if r := []rune(s); len(r) > 40 {
+		return string(r[:40]) + "..."
+	}
+	return s
 }
 
 // recv processes device output: echo progress, errors, free-text mode and
 // whether the prompt is back.
 func (r *run) recv(b []byte, ls *lineSend) error {
 	r.Trace.rx(b)
-	if !r.degraded && r.sawScreenProgram(b) {
-		r.degraded = true
-		r.note("full-screen output seen: timed writes, quiet-paced")
+	was := r.scr.on
+	r.scr.feed(b)
+	if r.scr.on != was {
+		r.note("alternate screen on: %v", r.scr.on)
+	}
+	if !ls.entered && !ls.addr && r.sawScreenProgram(b) {
+		ls.addr = true
+		r.note("cursor addressing while typing: timed writes, quiet-paced for this line")
 	}
 	done := r.screen.Feed(b)
 	if !ls.entered {
@@ -599,6 +665,9 @@ func (r *run) recv(b []byte, ls *lineSend) error {
 		}
 		if ls.entered {
 			ls.newLine = true
+		}
+		if r.screenMode(ls) {
+			continue // a full-screen program's text isn't command output
 		}
 		if ls.start != "" && strings.HasPrefix(l, ls.start) {
 			continue // our own echoed line, which may contain anything

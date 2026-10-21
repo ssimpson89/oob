@@ -9,10 +9,10 @@ import (
 // 1049, 1047 and 47, set (h) or reset (l).
 var altScreen = regexp.MustCompile(`\x1b\[\?([0-9;]*)([hl])`)
 
-// addressing matches a cursor move to a row and column, or to home, or a
-// screen clear: what a full-screen program draws with, and a shell prompt
-// never does.
-var addressing = regexp.MustCompile(`\x1b\[(?:[0-9]*;[0-9]*[Hf]|[Hf]|2J)`)
+// addressing matches a cursor move to a row and column: how a full-screen
+// program draws its echo. Bare home and screen clears are left out, because
+// clear, tput clear and many prompts send those.
+var addressing = regexp.MustCompile(`\x1b\[[0-9]+;[0-9]+[Hf]`)
 
 const tailKeep = 16 // bytes kept in case an escape sequence is split between reads
 
@@ -27,19 +27,12 @@ func altModeIn(params string) bool {
 }
 
 // sawScreenProgram reports whether b, with the end of the earlier output,
-// shows a full-screen program: the alternate screen switched on, or cursor
-// addressing.
+// holds a cursor move to a row and column. It is only asked of the output that
+// arrives while a line is being typed, the echo, which a prompt redraw can't be
+// mistaken for.
 func (r *run) sawScreenProgram(b []byte) bool {
 	buf := append(r.tail, b...)
 	r.tail = append(r.tail[:0], buf[max(0, len(buf)-tailKeep):]...)
-	if !bytes.Contains(buf, []byte("\x1b[")) {
-		return false
-	}
-	for _, m := range altScreen.FindAllSubmatch(buf, -1) {
-		if string(m[2]) == "h" && altModeIn(string(m[1])) {
-			return true
-		}
-	}
 	return addressing.Match(buf)
 }
 

@@ -704,3 +704,18 @@ func TestPasteTraceFile(t *testing.T) {
 		}
 	}
 }
+
+// A trace file that can't be opened is reported on the bar, not skipped
+// silently.
+func TestPasteTraceFailureIsReported(t *testing.T) {
+	t.Setenv(traceEnv, t.TempDir()+"/no/such/dir/trace.log")
+	r := newPasteRig(t)
+	p, untap := r.k.pacer()
+	defer untap()
+	if p.Trace != nil {
+		t.Error("trace opened in a directory that doesn't exist")
+	}
+	if n, isErr := r.note(); !isErr || !strings.Contains(n, "paste trace not written") {
+		t.Errorf("note = %q (err %v), want the trace failure", n, isErr)
+	}
+}
