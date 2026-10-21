@@ -380,3 +380,34 @@ func TestHelpGroups(t *testing.T) {
 		}
 	}
 }
+
+func TestEmptyAddressRejected(t *testing.T) {
+	cfg := tmpCfg(t)
+	if _, _, err := runOob(t, cfg, "", "add", "node01", "192.0.2.10", "--user", "admin", "--pass", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"edit", "node01", "--ip", ""},
+		{"add", "node01", "", "--pass", "x"},
+	} {
+		if _, _, err := runOob(t, cfg, "", args...); err == nil {
+			t.Errorf("%v: want an error for an empty address", args)
+		}
+	}
+	if h := mustLoad(t, cfg).Hosts["node01"]; h.IP != "192.0.2.10" || h.Pass != "secret" {
+		t.Fatalf("host changed: %+v", h)
+	}
+}
+
+func TestEditWithGlobalFlagsOpensEditor(t *testing.T) {
+	cfg := tmpCfg(t)
+	if _, _, err := runOob(t, cfg, "", "add", "node01", "192.0.2.10", "--user", "admin", "--pass", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	// runOob always passes -c; with -y too, plain edit must still reach the
+	// editor (here `true`, which exits 0) rather than demand a host name.
+	t.Setenv("VISUAL", "true")
+	if _, _, err := runOob(t, cfg, "", "-y", "edit"); err != nil {
+		t.Fatalf("edit with -c/-y: %v", err)
+	}
+}

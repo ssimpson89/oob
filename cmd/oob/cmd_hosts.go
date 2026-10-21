@@ -232,9 +232,10 @@ func (hf *hostFields) bind(f *pflag.FlagSet) {
 }
 
 // apply adds or updates host name, changing only the flags that were passed.
-// ip is "" when not given. With mustExist (edit <name>) a missing host is an
+// ipSet says whether an address was given at all, so an explicitly empty one
+// (say, a script variable that expanded to nothing) is rejected, not ignored. With mustExist (edit <name>) a missing host is an
 // error instead of being created, so a typo can't add a stray entry.
-func (hf *hostFields) apply(cmd *cobra.Command, name, ip string, mustExist bool) error {
+func (hf *hostFields) apply(cmd *cobra.Command, name, ip string, ipSet, mustExist bool) error {
 	fl, h := cmd.Flags(), hf.h
 	if err := validHostName(name); err != nil {
 		return err
@@ -247,7 +248,7 @@ func (hf *hostFields) apply(cmd *cobra.Command, name, ip string, mustExist bool)
 			return err
 		}
 	}
-	if ip != "" && !validIPOrHost(ip) {
+	if ipSet && !validIPOrHost(ip) {
 		return fmt.Errorf("ip %q is not an IP address or hostname", ip)
 	}
 	if hf.passStdin && fl.Changed("pass") {
@@ -272,7 +273,7 @@ func (hf *hostFields) apply(cmd *cobra.Command, name, ip string, mustExist bool)
 	if mustExist && !exists {
 		return noHost
 	}
-	if !exists && ip == "" {
+	if !exists && !ipSet {
 		return fmt.Errorf("new host %q needs an ip: usage: %s add <name> <ip>", name, AppName)
 	}
 	var pw string
@@ -299,10 +300,10 @@ func (hf *hostFields) apply(cmd *cobra.Command, name, ip string, mustExist bool)
 		if mustExist && !exists {
 			return noHost
 		}
-		if !exists && ip == "" {
+		if !exists && !ipSet {
 			return fmt.Errorf("new host %q needs an ip: usage: %s add <name> <ip>", name, AppName)
 		}
-		if ip != "" {
+		if ipSet {
 			cur.IP = ip
 			set("ip")
 		}
@@ -371,7 +372,7 @@ func addCmd() *cobra.Command {
 			if len(args) == 2 {
 				ip = args[1]
 			}
-			return hf.apply(cmd, args[0], ip, false)
+			return hf.apply(cmd, args[0], ip, len(args) == 2, false)
 		},
 	}
 	hf.bind(c.Flags())
@@ -423,9 +424,13 @@ func editCmd() *cobra.Command {
 		ValidArgsFunction: hostCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 1 {
-				return hf.apply(cmd, args[0], ip, true)
+				return hf.apply(cmd, args[0], ip, cmd.Flags().Changed("ip"), true)
 			}
-			if cmd.Flags().NFlag() > 0 {
+			// Only this command's own flags count: global ones like -c and -y
+			// still mean "open the editor".
+			changed := false
+			cmd.LocalNonPersistentFlags().VisitAll(func(f *pflag.Flag) { changed = changed || f.Changed })
+			if changed {
 				return fmt.Errorf("field flags need a host name: usage: %s edit <name> --note ...", AppName)
 			}
 			return openEditor(cmd)
