@@ -300,3 +300,19 @@ func TestWriteErrorEndsRunAndReleasesEveryone(t *testing.T) {
 	isClosed(t, done)
 	isClosed(t, r.ty.Enqueue([]byte("x")))
 }
+
+func TestQueuedIsExactAfterEnqueueReturns(t *testing.T) {
+	r := newRig(t, false, cd, ld)
+	if r.ty.Queued() != 0 {
+		t.Fatalf("Queued = %d on a fresh typer", r.ty.Queued())
+	}
+	r.ty.Enqueue([]byte("abc"))
+	if got := r.ty.Queued(); got != 3 && got != 2 { // "a" may already be out
+		t.Errorf("Queued = %d right after Enqueue(abc)", got)
+	}
+	r.next()
+	r.ty.Clear()
+	if got := r.ty.Queued(); got != 0 {
+		t.Errorf("Queued = %d after Clear, want 0", got)
+	}
+}
