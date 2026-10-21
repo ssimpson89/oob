@@ -269,6 +269,15 @@ func (c *session) guarded(ctx context.Context, fn func() error) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		// A stop or a dropped link cancels the call without the write being stuck,
+		// and the write returns at once with its own error: let it.
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			select {
+			case err := <-done:
+				return err
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 	}
 	c.closeTransport()
 	select {

@@ -605,8 +605,9 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		return fail(err)
 	}
 	defer release()
+	var lastErr error // a failed write says more than that the link dropped
 	stopped := func() (*mcp.CallToolResult, any, error, bool) {
-		if w := why(); w != "" {
+		if w := why(); w != "" && !(w == "disconnected" && lastErr != nil) {
 			return text(true, c.output(), stoppedText(w)), nil, nil, true
 		}
 		return nil, nil, nil, false
@@ -625,8 +626,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		}
 		c.tx.Mark("agent typed: " + l)
 		err := c.runLine(ctx, l, wait)
-		if res, out, e, ok := stopped(); ok {
-			return res, out, e
+		lastErr = err
+		if !errors.Is(err, errStuck) {
+			if res, out, e, ok := stopped(); ok {
+				return res, out, e
+			}
 		}
 		if err != nil {
 			s.stuck(c, err)
@@ -828,7 +832,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	}
 	changed := c.changes()
 	if err := c.write(ctx, []byte(wire.String())); err != nil {
-		if w := why(); w != "" {
+		if w := why(); w != "" && w != "disconnected" && !errors.Is(err, errStuck) {
 			return text(true, c.output(), stoppedText(w)), nil, nil
 		}
 		s.stuck(c, err)

@@ -24,16 +24,19 @@ import (
 )
 
 const (
-	replayMax      = 64 << 10        // recent output a joining window gets
-	agentReplayMax = 2 << 10         // of the current line, all an AI tool gets on joining
-	typingWindow   = 3 * time.Second // an AI tool can't take the keyboard this soon after the user's last key
-	queueMax       = 16 << 20        // bytes waiting for one client before it's dropped as too slow
-	dataChunk      = 64 << 10        // queued output for one client is merged into messages this big
+	replayMax      = 64 << 10 // recent output a joining window gets
+	agentReplayMax = 2 << 10  // of the current line, all an AI tool gets on joining
+	queueMax       = 16 << 20 // bytes waiting for one client before it's dropped as too slow
+	dataChunk      = 64 << 10 // queued output for one client is merged into messages this big
 	sendTimeout    = 5 * time.Second
 	helloTimeout   = 5 * time.Second
 	dropNoteEvery  = 2 * time.Second // how often a window is told its keys are being dropped
 	endWait        = 2 * time.Second // after the output ends, how long to wait for the exit status
 )
+
+// typingWindow: an AI tool can't take the keyboard this soon after the user's
+// last key. A variable so tests can shorten it.
+var typingWindow = 3 * time.Second
 
 var (
 	// pager matches a pager waiting at the end of the output, where a
@@ -870,6 +873,9 @@ func (h *hub) note(text string) {
 // queue sends m to p without waiting. A client that has fallen far behind is
 // dropped rather than allowed to stall everyone.
 func (h *hub) queue(p *peer, m msg) {
+	if m.T == tData {
+		m.Data = bytes.Clone(m.Data) // the peer's own, since merging appends to it
+	}
 	p.qmu.Lock()
 	if n := len(p.out); n > 0 && m.T == tData && !m.Replay && p.out[n-1].T == tData && !p.out[n-1].Replay &&
 		len(p.out[n-1].Data)+len(m.Data) <= dataChunk {
