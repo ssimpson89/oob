@@ -84,9 +84,11 @@ func (d *fakeDriver) OpenConsole(o bmc.OpenConsoleOptions) (*bmc.ConsoleTranspor
 	if d.h.openErr != nil {
 		return nil, d.h.openErr
 	}
-	fh := newFakeHost(d.h.t, d.name)
+	var fh *fakeHost
 	if d.h.initial != nil {
 		fh = newFakeHostShowing(d.h.t, d.name, *d.h.initial)
+	} else {
+		fh = newFakeHost(d.h.t, d.name)
 	}
 	if d.h.setup != nil {
 		d.h.setup(fh)
