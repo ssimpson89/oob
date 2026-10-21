@@ -2,6 +2,7 @@ package bmc
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,5 +156,73 @@ func TestSupermicroOpenConsoleOnlyClearsASessionWithForce(t *testing.T) {
 		if !strings.Contains(string(b), "sol activate") {
 			t.Errorf("force=%v: SOL never started:\n%s", force, b)
 		}
+	}
+}
+
+func TestCaptureWithCancelledContextNeverRunsFn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The slot is free, so select may pick it; repeat to cover both outcomes.
+	for range 200 {
+		ran := false
+		_, err := Capture(ctx, func() error { ran = true; return nil })
+		if ran {
+			t.Fatal("fn ran with a context that was already cancelled")
+		}
+		if err == nil {
+			t.Fatal("Capture should return the context error")
+		}
+		if capturing.Load() != nil {
+			t.Fatal("capture state installed for a cancelled context")
+		}
+	}
+	if len(captureSem) != 0 {
+		t.Error("slot not released")
+	}
+}
+
+// solRelease opens SOL against a fake ipmitool that behaves as activate says
+// and records every sol subcommand it is run with, closes the transport the
+// way a session does, and returns the recorded subcommands.
+func solRelease(t *testing.T, activate string) string {
+	t.Helper()
+	log := filepath.Join(t.TempDir(), "calls")
+	fakeIpmitool(t, `for a in "$@"; do last=$a; done
+echo "$last" >> `+log+`
+if [ "$last" = activate ]; then `+activate+`; fi`)
+	h := config.Host{IP: "192.0.2.1", User: "admin", Pass: "pw", Name: "node01"}
+	tr, err := (&ipmiDriver{"node01", h}).OpenConsole(OpenConsoleOptions{Rows: 24, Cols: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, tr.Out) // a pty child can't finish exiting until its output is read
+	if activate == `echo "Error: SOL payload already active" >&2; exit 1` {
+		select {
+		case <-tr.Done:
+		case <-time.After(10 * time.Second):
+			b, _ := os.ReadFile(log)
+			t.Fatalf("activation never ended; calls %q", b)
+		}
+	}
+	tr.Close()
+	tr.Release()
+	b, _ := os.ReadFile(log)
+	return string(b)
+}
+
+func TestSOLReleaseSkipsDeactivateWhenActivationWasRefused(t *testing.T) {
+	calls := solRelease(t, `echo "Error: SOL payload already active" >&2; exit 1`)
+	if !strings.Contains(calls, "activate") {
+		t.Fatalf("activate never ran: %q", calls)
+	}
+	if strings.Contains(calls, "deactivate") {
+		t.Errorf("Release deactivated a session this transport never owned: %q", calls)
+	}
+}
+
+func TestSOLReleaseDeactivatesOwnSession(t *testing.T) {
+	calls := solRelease(t, `echo "[SOL Session operational]"; sleep 30`)
+	if !strings.Contains(calls, "deactivate") {
+		t.Errorf("Release should deactivate the session it holds: %q", calls)
 	}
 }

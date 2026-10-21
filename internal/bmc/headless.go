@@ -75,6 +75,11 @@ func Capture(ctx context.Context, fn func() error) (string, error) {
 		return "", ctx.Err()
 	}
 	defer func() { <-captureSem }()
+	// select picks at random when both are ready, so a context that ended
+	// before or while the slot was taken must still stop fn from running.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	buf := &boundedBuffer{max: captureMax}
 	capturing.Store(&ioState{out: buf, ctx: ctx})
 	defer capturing.Store(nil)

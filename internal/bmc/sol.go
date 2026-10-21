@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
@@ -98,13 +99,24 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 		return nil, fmt.Errorf("start ipmitool: %w", err)
 	}
 	done := make(chan console.Result, 1)
+	// refused is set when ipmitool itself gave up with a non-zero exit status
+	// (for instance "SOL payload already active": someone else holds the
+	// session). This transport then never owned a session, and Release must not
+	// deactivate the other holder's. A kill by Close shows as a signal, not a
+	// status, so it doesn't count.
+	var refused atomic.Bool
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
 		err := cmd.Wait()
 		var ee *exec.ExitError
 		switch {
 		case err == nil:
 			done <- console.Result{}
 		case errors.As(err, &ee):
+			if ee.ExitCode() > 0 {
+				refused.Store(true)
+			}
 			done <- console.Result{Code: exitCodeOf(ee)}
 		default:
 			done <- console.Result{Code: 1, Err: err}
@@ -123,7 +135,18 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 			}
 			_ = ptmx.Close()
 		},
-		Release: func() { _, _ = ipmiOutput(h, ipmiQuickTimeout, "sol", "deactivate") },
+		Release: func() {
+			// Close has killed the client by now; let the waiter record how it
+			// ended before deciding whether the session was ours.
+			select {
+			case <-exited:
+			case <-time.After(2 * time.Second):
+			}
+			if refused.Load() {
+				return
+			}
+			_, _ = ipmiOutput(h, ipmiQuickTimeout, "sol", "deactivate")
+		},
 	}, nil
 }
 
