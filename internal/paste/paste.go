@@ -223,10 +223,13 @@ var (
 		`-+\s*more\s*-+|---\(more.*\)---|-- \[q quit|\[[^\]]*\]\?\s*$|\?\s*\[[^\]]*\]\s*$|press any key|` +
 		`^:\s*$|\(end\)\s*$`) // less: its prompt after the first page, and at the end
 	// promptChanger matches commands after which the prompt starts differently.
-	promptChanger = regexp.MustCompile(`^\s*(hostname|su|sudo|exit|logout|ssh|telnet)\b`)
+	promptChanger = regexp.MustCompile(`(?i)^\s*(hostname|su|sudo|exit|logout|ssh|telnet)\b`)
 	// login matches username and password prompts, which count as ready.
-	login    = regexp.MustCompile(`(?i)(username|login|password|passphrase|passcode)(\s+(as|for)\b[^\n:]{0,40})?\s*:\s*$`) // "[sudo] password for x:", "login as:"
-	password = regexp.MustCompile(`(?i)(password|passphrase)\s*:\s*$`)
+	login = regexp.MustCompile(`(?i)(username|login|password|passphrase|passcode)(\s+(as|for)\b[^\n:]{0,40})?\s*:\s*$`) // "[sudo] password for x:", "login as:"
+	// password matches the prompts whose answer is not echoed. It takes the same
+	// qualifiers as login: "[sudo] password for alice:", "Enter passphrase for
+	// key 'id_ed25519':".
+	password = regexp.MustCompile(`(?i)(password|passphrase|passcode)(\s+(as|for)\b[^\n:]{0,40})?\s*:\s*$`)
 	// textInput matches devices announcing free-text input (IOS and EOS
 	// banners, Junos load terminal), where no prompt appears between lines.
 	textInput = regexp.MustCompile(`End with the character '(.+)'|Type '(\w+)' on its own line|\[Type \^D at a new line to end input\]`)
@@ -241,6 +244,8 @@ const (
 	textWait   = 150 * time.Millisecond // free-text input: silence between lines
 	promptWait = 60 * time.Second       // a prompt is expected but hasn't come back: stop
 	tick       = 5 * time.Millisecond
+	blindChunk = 8                      // password: bytes per write, with no echo to pace by
+	blindGap   = 100 * time.Millisecond // password: pause between writes, long enough for a slow UART to drain 8 bytes
 )
 
 // Pacer sends lines to a device.
@@ -282,13 +287,14 @@ type run struct {
 
 // lineSend is the progress of one line.
 type lineSend struct {
-	body, want string // the text to type, and its lower-case form for matching the screen
+	body, want string // the text to type, and the text the screen must show (the same, matched exactly)
 	enter      bool
-	mismatch   bool   // the device shows something other than what was typed
-	start      string // the cursor line before typing, usually the prompt
-	blind      bool   // at a password prompt: expect no echo
-	sent       int    // bytes of body written
-	matched    int    // bytes of want the device shows
+	mismatch   bool      // the device shows something other than what was typed
+	start      string    // the cursor line before typing, usually the prompt
+	blind      bool      // at a password prompt: expect no echo
+	sent       int       // bytes of body written
+	lastSend   time.Time // when the last write went out, for pacing a password
+	matched    int       // bytes of want the device shows
 	lastEcho   time.Time
 	entered    bool
 	fullScreen bool // the line runs a pager or full-screen program
@@ -309,7 +315,7 @@ func (r *run) begin(line string) *lineSend {
 	body := strings.TrimSuffix(line, "\r")
 	start := r.screen.Partial()
 	ls := &lineSend{
-		body: body, want: strings.ToLower(body), enter: len(body) < len(line),
+		body: body, want: body, enter: len(body) < len(line),
 		start: start, blind: password.MatchString(start), lastEcho: time.Now(),
 	}
 	ls.fullScreen = fullScreen(body)
@@ -347,16 +353,24 @@ func (r *run) typeLine(ctx context.Context, ls *lineSend) error {
 	defer t.Stop()
 	for {
 		end := ls.sent
-		for end < len(ls.body) && (ls.blind || end-ls.matched < window) { // blind: no echo to wait for
-			end++
+		if ls.blind {
+			// No echo to pace by: a few bytes at a time on a timer, so a slow
+			// UART can't drop part of a password.
+			if time.Since(ls.lastSend) >= blindGap {
+				end = min(ls.sent+blindChunk, len(ls.body))
+			}
+		} else {
+			for end < len(ls.body) && end-ls.matched < window {
+				end++
+			}
 		}
 		if end > ls.sent {
 			if err := r.send(ctx, ls.body[ls.sent:end]); err != nil {
 				return err
 			}
-			ls.sent = end
+			ls.sent, ls.lastSend = end, time.Now()
 		}
-		if ls.sent == len(ls.body) && (ls.blind || ls.matched == len(ls.want)) {
+		if ls.sent == len(ls.body) && (ls.blind && time.Since(ls.lastSend) >= blindGap || !ls.blind && ls.matched == len(ls.want)) {
 			if !ls.enter {
 				return nil
 			}
@@ -371,7 +385,7 @@ func (r *run) typeLine(ctx context.Context, ls *lineSend) error {
 				return err
 			}
 		case now := <-t.C:
-			if now.Sub(ls.lastEcho) < echoWait {
+			if ls.blind || now.Sub(ls.lastEcho) < echoWait { // blind: nothing is expected to echo
 				continue
 			}
 			reason := "the device didn't echo the whole line, so Enter wasn't pressed (characters may have been dropped)"
@@ -402,13 +416,13 @@ func (r *run) send(ctx context.Context, s string) error {
 // unrelated output can't make the echo look further along than it is, and a
 // dropped character stalls it.
 func (r *run) track(ls *lineSend) {
-	t := strings.ToLower(r.screen.Partial())
-	if start := strings.ToLower(ls.start); start != "" && strings.HasPrefix(t, start) {
+	t := r.screen.Partial()
+	if ls.start != "" && strings.HasPrefix(t, ls.start) {
 		// The line still begins with the prompt, so what follows must be the
 		// start of what was typed. A dropped first byte ("tty" for "stty")
 		// leaves a tail that would pass the end-point search below, which is
 		// only for lines that scrolled or were interrupted.
-		after := t[len(start):]
+		after := t[len(ls.start):]
 		switch {
 		case strings.HasPrefix(ls.want, after):
 			ls.mismatch = false
@@ -428,15 +442,21 @@ func (r *run) track(ls *lineSend) {
 	}
 	// Find the first end point b, no earlier than the echo so far, where the
 	// line typed up to b ends with what the screen shows. Never moving
-	// backwards means a redraw can't undo progress.
-	for b := max(ls.matched, len(t)); b <= len(ls.want); b++ {
+	// backwards means a redraw can't undo progress. The text before the
+	// stretch shown must already be verified (at most ls.matched bytes), so
+	// until something has matched, the screen has to show the line from its
+	// very first byte: a dropped first byte can't pass as an echo, whether the
+	// cursor line was empty to begin with or a syslog message cleared it.
+	for b := max(ls.matched, len(t)); b <= len(ls.want) && b-len(t) <= ls.matched; b++ {
 		if ls.want[b-len(t):b] == t {
+			ls.mismatch = false
 			if b > ls.matched {
 				ls.matched, ls.lastEcho = b, time.Now()
 			}
 			return
 		}
 	}
+	ls.mismatch = true
 }
 
 // awaitPrompt waits after Enter until the device is ready for the next line.
@@ -522,7 +542,7 @@ func (r *run) recv(b []byte, ls *lineSend) error {
 	case ls.newLine && r.isPrompt(partial):
 		ls.atPrompt = true
 		r.learn(partial)
-	case partial != "":
+	default: // anything else, an empty cursor line included, is not a prompt
 		ls.atPrompt = false
 	}
 	return nil

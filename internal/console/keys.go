@@ -29,10 +29,11 @@ const (
 	actPower
 	actDisconnect
 	actHelp
-	actCancel // left command mode with nothing done (unknown key, n)
-	actRaw    // toggle raw (unpaced) paste
-	actStop   // stop a paste in progress (x, or esc in command mode)
-	actPaste  // bracketed paste finished: action.text is the pasted text
+	actCancel      // left command mode with nothing done (unknown key, n)
+	actRaw         // toggle raw (unpaced) paste
+	actStop        // stop a paste in progress (x, or esc in command mode)
+	actPaste       // bracketed paste finished: action.text is the pasted text
+	actPasteTooBig // a paste over pasteMax: none of it is sent
 )
 
 // action is a parsed key: what to do, plus the SysRq letter.
@@ -107,9 +108,9 @@ const (
 	pasteEnd   = "\x1b[201~"
 )
 
-// pasteChunkMax caps what a paste collects before it is handed over, in case
-// the end marker never comes.
-const pasteChunkMax = 4 << 20
+// pasteMax caps the size of one paste. A larger one is rejected whole, never
+// sent in part: running a prefix of a script is worse than running none of it.
+const pasteMax = 4 << 20
 
 // escWait is how long a held ESC waits for the rest of its sequence before it
 // is taken as a bare key: short enough to feel instant, long enough for a
@@ -126,6 +127,7 @@ type keyParser struct {
 	tilde   bool // a ~ at line start is held back until the next byte
 	paste   bool // between the paste markers: bytes are collected, not typed
 	pasted  []byte
+	over    bool // the paste passed pasteMax: the rest is discarded and none of it is sent
 	held    []byte
 	skip    int // command mode is skipping an escape sequence: 1 CSI, 2 SS3
 }
@@ -188,7 +190,7 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 			}
 			if n > 0 {
 				if string(b[i:i+n]) == pasteStart {
-					p.paste, p.pasted = true, nil
+					p.paste, p.pasted, p.over = true, nil, false
 					p.skip = 0
 					if p.tilde { // the held ~ was typed before the paste
 						p.tilde = false
@@ -200,22 +202,27 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 						acts = append(acts, action{act: actCancel})
 					}
 				} else {
-					if p.paste && len(p.pasted) > 0 {
+					switch {
+					case p.paste && p.over:
+						acts = append(acts, action{act: actPasteTooBig, at: len(fwd)})
+					case p.paste && len(p.pasted) > 0:
 						acts = append(acts, action{act: actPaste, text: string(p.pasted), at: len(fwd)})
 					}
-					p.paste, p.pasted = false, nil
+					p.paste, p.pasted, p.over = false, nil, false
 				}
 				i += n - 1
 				continue
 			}
 		}
 		if p.paste {
-			p.pasted = append(p.pasted, c)
 			p.midLine = c != '\r' && c != '\n'
 			p.started = true
-			if len(p.pasted) >= pasteChunkMax { // no end marker in sight: hand over what there is
-				acts = append(acts, action{act: actPaste, text: string(p.pasted), at: len(fwd)})
-				p.pasted = nil
+			switch {
+			case p.over:
+			case len(p.pasted) >= pasteMax: // too big: drop it all, and the rest up to the end marker
+				p.over, p.pasted = true, nil
+			default:
+				p.pasted = append(p.pasted, c)
 			}
 			continue
 		}

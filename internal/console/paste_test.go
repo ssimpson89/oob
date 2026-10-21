@@ -559,3 +559,57 @@ func TestBarShowsPasteProgressAndRaw(t *testing.T) {
 		t.Errorf("command bar = %q, want paced paste and stop paste during a paste", got)
 	}
 }
+
+// plainRig is a console on a plain ssh link, where pastes go out raw.
+func plainRig(t *testing.T) (*consoleKeys, *plainLink, *console) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&outLocked{w: &out}, "node01", "ssh", 24, 80)
+	con.Start()
+	stop := make(chan struct{})
+	pl := &plainLink{}
+	t.Cleanup(func() { close(stop); con.Close() })
+	return &consoleKeys{cs: &Setup{Link: pl}, con: con, cleanup: func() {}, stop: stop}, pl, con
+}
+
+func TestEveryPasteGoesOutAtItsOwnOffset(t *testing.T) {
+	k, pl, _ := plainRig(t)
+	k.Input([]byte("a" + pasteStart + "p" + pasteEnd + "b" + pasteStart + "q" + pasteEnd + "c"))
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	if string(pl.sent) != "apbqc" {
+		t.Errorf("sent %q, want apbqc (typing order)", pl.sent)
+	}
+}
+
+func TestOversizedPasteIsRejectedWhole(t *testing.T) {
+	k, pl, con := plainRig(t)
+	big := strings.Repeat("x", pasteMax+1)
+	// Arrive in several reads, with typing before and after.
+	k.Input([]byte("a" + pasteStart + big[:pasteMax/2]))
+	k.Input([]byte(big[pasteMax/2:] + "\r"))
+	k.Input([]byte(pasteEnd + "z"))
+	pl.mu.Lock()
+	sent := string(pl.sent)
+	pl.mu.Unlock()
+	if sent != "az" {
+		t.Errorf("sent %d bytes (%.20q...), want only the typed a and z", len(sent), sent)
+	}
+	con.mu.Lock()
+	note, isErr := con.st.note, con.st.noteErr
+	con.mu.Unlock()
+	if !isErr || !strings.Contains(note, "paste not sent") {
+		t.Errorf("note = %q (err %v), want a paste not sent error", note, isErr)
+	}
+}
+
+func TestPasteAtTheLimitIsStillSent(t *testing.T) {
+	k, pl, _ := plainRig(t)
+	k.Input([]byte(pasteStart + strings.Repeat("x", pasteMax) + pasteEnd))
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	if len(pl.sent) != pasteMax {
+		t.Errorf("sent %d bytes, want %d", len(pl.sent), pasteMax)
+	}
+}

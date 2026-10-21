@@ -625,11 +625,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 // runLine types a line and waits for the console to answer: until it is quiet
 // at a prompt or a question, or wait passes.
 func (c *session) runLine(ctx context.Context, l string, wait time.Duration) error {
-	deadline := time.Now().Add(wait)
 	changed := c.changes()
 	if err := c.typeLine(ctx, l); err != nil {
 		return err
 	}
+	deadline := time.Now().Add(wait) // typing a line paced takes a while; wait_seconds is for the answer
 	for {
 		c.settle(ctx, changed, time.Until(deadline), false)
 		if ctx.Err() != nil || !time.Now().Before(deadline) {

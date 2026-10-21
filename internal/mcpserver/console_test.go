@@ -365,3 +365,26 @@ func TestSendCommandStopsBeforeEnterWhenTheEchoIsWrong(t *testing.T) {
 		t.Errorf("after the stop: %q %v", out, isErr)
 	}
 }
+
+// wait_seconds is how long to wait for the console's answer, not for the line
+// to be typed: a slow paced line must not use the wait up before Enter.
+func TestSendCommandWaitStartsAfterTyping(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) {
+		f.sendDelay = 150 * time.Millisecond
+		f.respond = func(f *fakeHost, cmd string) bool {
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				f.emit("late-result\r\n" + f.prompt)
+			}()
+			return true
+		}
+	}
+	h.connect()
+	line := "echo " + strings.Repeat("abcdefgh", 5) // several paced writes, 0.75s or more to type
+	start := time.Now()
+	out, isErr := h.call("send_command", map[string]any{"session": "s1", "line": line, "wait_seconds": 0.6})
+	if isErr || !strings.Contains(out, "late-result") {
+		t.Errorf("answer arrived %.1fs after typing began but was missed: %q %v", time.Since(start).Seconds(), out, isErr)
+	}
+}

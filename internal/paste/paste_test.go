@@ -275,6 +275,7 @@ func TestAtLogin(t *testing.T) {
 		"Password: ":                  true,
 		"[sudo] password for alice: ": true,
 		"login as: ":                  true,
+		"Enter passcode: ":            true,
 		"Enter passphrase for key 'id_ed25519': ": true,
 		"Unauthorized login prohibited. Contact:": false,
 		"Switch#": false,
@@ -458,5 +459,199 @@ func TestFirstByteLostIsAMismatch(t *testing.T) {
 	}
 	if entered {
 		t.Error("Enter was pressed on a line that lost its first byte")
+	}
+}
+
+// The no-echo matcher takes the qualifiers the login matcher does.
+func TestPasswordMatcherQualifiers(t *testing.T) {
+	for prompt, want := range map[string]bool{
+		"Password: ":                              true,
+		"[sudo] password for alice: ":             true,
+		"Enter passphrase for key 'id_ed25519': ": true,
+		"Enter passcode: ":                        true,
+		"Username: ":                              false,
+		"Switch#":                                 false,
+	} {
+		if got := password.MatchString(prompt); got != want {
+			t.Errorf("password.MatchString(%q) = %v, want %v", prompt, got, want)
+		}
+	}
+}
+
+// echoRig is a Pacer whose writes echo (after dropping the first n bytes of
+// the first write) into a buffered channel, and which records what it sent.
+type echoRig struct {
+	rx      chan []byte
+	writes  []string
+	times   []time.Time
+	entered bool
+}
+
+func (e *echoRig) write(b []byte) error {
+	e.writes = append(e.writes, string(b))
+	e.times = append(e.times, time.Now())
+	if strings.Contains(string(b), "\r") {
+		e.entered = true
+	}
+	return nil
+}
+
+func newEchoRig() *echoRig { return &echoRig{rx: make(chan []byte, 256)} }
+
+func stopsUnentered(t *testing.T, err error, e *echoRig) {
+	t.Helper()
+	var se *StopError
+	if !errors.As(err, &se) || !se.Unentered {
+		t.Fatalf("err = %v, want a StopError with Enter not pressed", err)
+	}
+	if e.entered {
+		t.Error("Enter was pressed on a line that lost its first byte")
+	}
+}
+
+// With nothing on the cursor line to begin with, a tail of the line ("tty")
+// must not pass for the whole echo.
+func TestFirstByteLostWithEmptyCursor(t *testing.T) {
+	t.Parallel()
+	e := newEchoRig()
+	first := true
+	p := &Pacer{Baud: 115200, Prompt: "", Rx: e.rx, Write: func(b []byte) error {
+		_ = e.write(b)
+		if first {
+			first, b = false, b[1:]
+		}
+		e.rx <- b
+		return nil
+	}}
+	stopsUnentered(t, p.Type(context.Background(), "stty rows 50 cols 200\r"), e)
+}
+
+// A syslog line landing before the first echo leaves the cursor line empty
+// again, so a line that lost its first byte must still be refused.
+func TestFirstByteLostAfterSyslogNewline(t *testing.T) {
+	t.Parallel()
+	e := newEchoRig()
+	first := true
+	p := &Pacer{Baud: 115200, Prompt: "root@h:~ # ", Rx: e.rx, Write: func(b []byte) error {
+		_ = e.write(b)
+		if first {
+			first, b = false, b[1:]
+			e.rx <- []byte("\r\n<189>link state changed\r\n")
+		}
+		e.rx <- b
+		return nil
+	}}
+	stopsUnentered(t, p.Type(context.Background(), "stty rows 50 cols 200\r"), e)
+}
+
+// Once the start of the line has been verified, an interruption (syslog
+// scrolling the prompt away) may leave only the tail on screen.
+func TestSyslogAfterVerifiedPrefixStillCompletes(t *testing.T) {
+	t.Parallel()
+	e := newEchoRig()
+	n := 0
+	p := &Pacer{Baud: 115200, Prompt: "root@h:~ # ", Rx: e.rx, Write: func(b []byte) error {
+		_ = e.write(b)
+		n++
+		if n == 2 { // the first 8 bytes are on screen; a message arrives, then the rest echo with no prompt
+			e.rx <- []byte("\r\n<189>link state changed\r\n")
+		}
+		e.rx <- b
+		return nil
+	}}
+	if err := p.Type(context.Background(), "stty rows 50 cols 200\r"); err != nil {
+		t.Fatalf("Type: %v", err)
+	}
+	if !e.entered {
+		t.Error("Enter not pressed")
+	}
+}
+
+// A password is not echoed, but it still goes out in small writes with a
+// pause between them, then Enter.
+func TestPasswordIsPacedInSmallWrites(t *testing.T) {
+	t.Parallel()
+	e := newEchoRig()
+	secret := "correct-horse-battery-staple-1234"
+	p := &Pacer{Baud: 115200, Prompt: "[sudo] password for alice: ", Rx: e.rx, Write: e.write}
+	if err := p.Type(context.Background(), secret+"\r"); err != nil {
+		t.Fatalf("Type: %v", err)
+	}
+	if got := strings.Join(e.writes, ""); got != secret+"\r" {
+		t.Fatalf("typed %q, want %q", got, secret+"\r")
+	}
+	for i, w := range e.writes {
+		if len(strings.TrimSuffix(w, "\r")) > blindChunk {
+			t.Errorf("write %d is %d bytes, want at most %d", i, len(w), blindChunk)
+		}
+		if i > 0 {
+			if gap := e.times[i].Sub(e.times[i-1]); gap < blindGap-10*time.Millisecond {
+				t.Errorf("write %d came %v after the one before, want at least %v", i, gap, blindGap)
+			}
+		}
+	}
+	if e.writes[len(e.writes)-1] != "\r" {
+		t.Errorf("last write %q, want Enter on its own", e.writes[len(e.writes)-1])
+	}
+}
+
+// Lower-casing the line to match the screen changed its length for some
+// characters (KELVIN SIGN lowercases to k, one byte for three), putting the
+// echo count out of step with the bytes sent. The line is matched exactly.
+func TestUnicodeLineMatchedExactly(t *testing.T) {
+	t.Parallel()
+	line := "echo KKK İstanbul K"
+	e := newEchoRig()
+	var echoed int
+	p := &Pacer{Baud: 115200, Prompt: "root@h:~ # ", Rx: e.rx, Write: func(b []byte) error {
+		_ = e.write(b)
+		sent := 0
+		for _, w := range e.writes {
+			sent += len(strings.TrimSuffix(w, "\r"))
+		}
+		if ahead := sent - echoed; ahead > window {
+			t.Errorf("%d bytes typed ahead of the echo, want at most %d", ahead, window)
+		}
+		echoed += len(strings.TrimSuffix(string(b), "\r"))
+		e.rx <- b
+		return nil
+	}}
+	if err := p.Type(context.Background(), line+"\r"); err != nil {
+		t.Fatalf("Type: %v", err)
+	}
+	if got := strings.TrimSuffix(strings.Join(e.writes, ""), "\r"); got != line {
+		t.Errorf("typed %q, want %q", got, line)
+	}
+}
+
+// An echo in other letters than were typed is not the line.
+func TestEchoInOtherCaseIsAMismatch(t *testing.T) {
+	t.Parallel()
+	e := newEchoRig()
+	p := &Pacer{Baud: 115200, Prompt: "root@h:~ # ", Rx: e.rx, Write: func(b []byte) error {
+		_ = e.write(b)
+		e.rx <- []byte(strings.ToUpper(string(b)))
+		return nil
+	}}
+	err := p.Type(context.Background(), "ls -l\r")
+	var se *StopError
+	if !errors.As(err, &se) || !se.Unentered || e.entered {
+		t.Fatalf("err = %v entered %v, want a mismatch stop before Enter", err, e.entered)
+	}
+}
+
+// An empty cursor line after the prompt came back means the prompt isn't
+// there any more: the pacer must keep waiting rather than call it ready.
+func TestEmptyCursorClearsAtPrompt(t *testing.T) {
+	t.Parallel()
+	r := &run{Pacer: &Pacer{}}
+	r.learn("root@h:~ # ")
+	ls := &lineSend{entered: true, newLine: true, atPrompt: true}
+	r.screen.Feed([]byte("\r\n"))
+	if err := r.recv(nil, ls); err != nil {
+		t.Fatal(err)
+	}
+	if ls.atPrompt {
+		t.Error("atPrompt still set with an empty cursor line")
 	}
 }

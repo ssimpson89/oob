@@ -306,25 +306,32 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 		return false
 	default:
 	}
-	// Bytes typed before a paste go out before it; those after it are typed
-	// into a running paste and dropped by send.
-	head := fwd
+	// Bytes typed before each paste go out before that paste starts, so the
+	// remote sees keys and pastes in the order they came. A paste that runs
+	// paced makes later keys and pastes in this read get dropped by busy.
+	pos := len(fwd)
 	for _, a := range acts {
-		if a.act == actPaste {
-			head = fwd[:a.at]
+		if a.act == actPaste || a.act == actPasteTooBig {
+			pos = a.at
 			break
 		}
 	}
-	if !k.send(head) {
+	if !k.send(fwd[:pos]) {
 		return false
 	}
 	k.con.SetMode(k.parser.Mode())
 	for _, a := range acts {
+		if a.act == actPaste || a.act == actPasteTooBig {
+			if a.at > pos && !k.send(fwd[pos:a.at]) {
+				return false
+			}
+			pos = max(pos, a.at)
+		}
 		if !k.do(a) {
 			return false
 		}
 	}
-	return k.send(fwd[len(head):])
+	return k.send(fwd[pos:])
 }
 
 // send types keystrokes at the remote. During a paste they are dropped with a
@@ -349,6 +356,8 @@ func (k *consoleKeys) do(a action) bool {
 	switch a.act {
 	case actPaste:
 		return k.pasteText(a.text)
+	case actPasteTooBig:
+		con.Note(fmt.Sprintf("paste not sent: over %d MiB", pasteMax>>20), true)
 	case actStop:
 		k.stopPaste()
 	case actRaw:
