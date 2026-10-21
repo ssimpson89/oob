@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -143,7 +144,7 @@ func (s *server) addConsoleTools(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "send_break",
 		Description: "Send a serial BREAK (IPMI SOL consoles only; iLO and iDRAC have none). On Linux the next key becomes a " +
-			"SysRq command. Needs the user's approval.",
+			"SysRq command. Needs the user's approval, and is refused while the prompt has text typed after it (the BREAK starts with a carriage return).",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: &yes, OpenWorldHint: &yes},
 	}, s.sendBreak)
 	mcp.AddTool(srv, &mcp.Tool{
@@ -490,6 +491,22 @@ func safeAnswerKeys(text string, keys []string) bool {
 	return !slices.ContainsFunc(keys, func(k string) bool { return !safeAnswer("", k) })
 }
 
+// staged is what is typed at the prompt and not yet run, or "" if the line is
+// empty: the text after the prompt, text sent that the echo hasn't shown yet,
+// or a note that the line was edited by keys the server can't follow.
+func (c *session) staged() string {
+	at := c.line()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	typed := at.typed()
+	if pending, unknown := c.typing.pending(at.prompts); len(pending) > len(typed) {
+		typed = pending
+	} else if unknown && typed == "" {
+		typed = "a line edited or recalled with cursor, editing or history keys"
+	}
+	return typed
+}
+
 // sinceBreak reports whether a BREAK was sent recently enough that the next
 // key may be a SysRq command.
 func (c *session) sinceBreak() bool {
@@ -542,16 +559,13 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	}
 
 	var shownLines, whys []string
+	ctx0 := c.contextWhy(at)
 	for i, l := range lines {
 		why := risk(l)
 		switch {
 		case why != "":
-		case at.atBootloader():
-			why = whyBoot
-		case c.onBMC():
-			why = whyBMC
-		case c.sinceBreak():
-			why = whyAfter
+		case ctx0 != "":
+			why = ctx0
 		case i == 0 && answering && !safeAnswer(l, "enter"):
 			why = whyAnswer
 		}
@@ -574,6 +588,17 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	}
 
 	for i, l := range lines {
+		// The approval covered the context the batch started in. Each line
+		// after the first is typed where the earlier ones left the console: if
+		// that is a bootloader, the BMC or just after a BREAK, and the batch
+		// wasn't approved for it, stop here and let the next call ask.
+		if i > 0 {
+			if now := c.contextWhy(c.line()); now != "" && now != ctx0 {
+				return text(false, c.output(), "Stopped before line "+strconv.Itoa(i+1)+": the console is now somewhere that needs the "+
+					"user's approval for what is typed (it "+now+"). Lines sent: "+strconv.Itoa(i)+". Lines not sent, which "+
+					"nothing will replay:\n"+strings.Join(lines[i:], "\n")+"\nSend them with a new send_command, which will ask the user."), nil, nil
+			}
+		}
 		c.tx.Mark("agent typed: " + l)
 		if err := c.runLine(ctx, l, wait); err != nil {
 			s.stuck(c, err)
@@ -583,12 +608,12 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 			return fail(err) // what arrived stays unread for the next call
 		}
 		if left := len(lines) - i - 1; left > 0 {
-			if advice := c.stopAdvice(); advice != "" {
+			if advice := c.stopAdvice(true); advice != "" {
 				return text(false, c.output(), advice, fmt.Sprintf("The %d line(s) after it weren't sent.", left)), nil, nil
 			}
 		}
 	}
-	return text(false, c.output(), c.stopAdvice()), nil, nil
+	return text(false, c.output(), c.stopAdvice(false)), nil, nil
 }
 
 // runLine types a line and waits for the console to answer: until it is quiet
@@ -617,9 +642,26 @@ func (c *session) runLine(ctx context.Context, l string, wait time.Duration) err
 	}
 }
 
+// contextWhy says why anything typed at the console as it is now needs the
+// user's approval, from where the cursor is: a bootloader, the BMC's own
+// command line, or right after a BREAK. "" if nowhere special.
+func (c *session) contextWhy(at line) string {
+	switch {
+	case at.atBootloader():
+		return whyBoot
+	case c.onBMC():
+		return whyBMC
+	case c.sinceBreak():
+		return whyAfter
+	}
+	return ""
+}
+
 // stopAdvice explains where the console stopped, if it is waiting for the
-// model: a question, a pager, a login, or a command still running.
-func (c *session) stopAdvice() string {
+// model: a question, a pager, a login, or a command still running. Lines of a
+// batch still to send (mid) must never go in at a login or password prompt;
+// the final result carries the login note already (see notes).
+func (c *session) stopAdvice(mid bool) string {
 	cur := c.line().cursor
 	switch {
 	case confirming.MatchString(cur):
@@ -627,6 +669,10 @@ func (c *session) stopAdvice() string {
 	case paging.MatchString(cur):
 		return "The console is paging: send_keys keys [\"space\"] shows the next page, text q stops. Paging off, or head and grep, avoids this."
 	case loginPrompt.MatchString(cur):
+		if mid {
+			return "The console is at a login or password prompt, so the lines after it would be typed in as a name or a password. " +
+				"Ask the user to log in or to give you credentials; don't guess."
+		}
 		return "" // notes() says to ask the user
 	case !looksLikePrompt(cur):
 		return "No prompt yet: the command may still be running. read_output can wait for it; send_keys ctrl+c stops it."
@@ -776,6 +822,10 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 	if c.tr.Toggle != nil { // an SSH console through the BMC: iLO VSP, iDRAC
 		return fail("nothing was sent: this console (" + c.tr.Kind + ", through the BMC's SSH command line) has no serial BREAK. " +
 			"Only IPMI SOL consoles do")
+	}
+	if typed := c.staged(); typed != "" {
+		return fail(fmt.Sprintf("nothing was sent: the prompt has %q typed after it, and the BREAK is sent after a carriage return "+
+			"that would run it. Clear the line with send_keys keys [\"ctrl+u\"], then call send_break again", typed))
 	}
 	if res, err := s.approve(req, c.target(), "send a serial BREAK to the console of "+c.host, []string{whyBreak}); res != nil || err != nil {
 		if err != nil {

@@ -186,6 +186,7 @@ func (f *fakeHost) Send(b []byte) error {
 			f.mu.Lock()
 			f.buf = ""
 			f.mu.Unlock()
+			f.emit("\r\x1b[K" + f.prompt) // a shell redraws the empty line
 		case 0x03:
 			f.mu.Lock()
 			f.buf = ""

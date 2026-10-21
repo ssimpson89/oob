@@ -345,3 +345,105 @@ func TestClosingNeverTypesAtTheConsole(t *testing.T) {
 		}
 	}
 }
+
+// 4340518996: a later line of a batch is checked where the earlier ones left the console.
+func TestBatchStopsWhenTheContextNeedsApproval(t *testing.T) {
+	// Into a bootloader.
+	h := start(t, Options{}, "")
+	h.connect()
+	out, isErr := h.send("s1", "grub\nboot")
+	if isErr || !strings.Contains(out, "Stopped before line 2") || !strings.Contains(out, "bootloader") ||
+		!strings.Contains(out, "Lines sent: 1") || !strings.Contains(out, "\nboot\n") {
+		t.Errorf("grub then boot: %q %v", out, isErr)
+	}
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "grub" {
+		t.Errorf("the host got %q, want only grub", got)
+	}
+	// The rest isn't replayed or sneaked in: sending it again is a new call that needs approval.
+	if out, isErr := h.send("s1", "boot"); !isErr || !strings.Contains(out, "approval") {
+		t.Errorf("boot at the bootloader: %q %v", out, isErr)
+	}
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "grub" {
+		t.Errorf("the host got %q after the refused call", got)
+	}
+
+	// Into the BMC's own command line.
+	h = start(t, Options{}, "")
+	h.setup = func(f *fakeHost) {
+		f.toggle = true
+		f.respond = func(f *fakeHost, cmd string) bool {
+			if cmd == "cli" {
+				f.emit("\r\n</>hpiLO-> ")
+				return true
+			}
+			return false
+		}
+	}
+	h.connect()
+	out, isErr = h.send("s1", "cli\nuname -r")
+	if isErr || !strings.Contains(out, "Stopped before line 2") {
+		t.Errorf("into the BMC: %q %v", out, isErr)
+	}
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "cli" {
+		t.Errorf("the host got %q, want only cli", got)
+	}
+
+	// A batch that was approved for the context it starts in goes on.
+	h = start(t, Options{}, "accept")
+	h.connect()
+	h.send("s1", "grub")
+	out, isErr = h.send("s1", "help\nls")
+	if isErr || strings.Contains(out, "Stopped before") {
+		t.Errorf("a batch approved at the bootloader was stopped: %q %v", out, isErr)
+	}
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "grub|help|ls" {
+		t.Errorf("the host got %q", got)
+	}
+}
+
+// 4340519042: lines after a login or password prompt aren't typed into it.
+func TestBatchStopsAtALoginPrompt(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) {
+		f.respond = func(f *fakeHost, cmd string) bool {
+			if cmd == "su" {
+				f.emit("Password: ")
+				return true
+			}
+			return false
+		}
+	}
+	h.connect()
+	out, isErr := h.send("s1", "su\nnot-a-real-password\nid")
+	if isErr || !strings.Contains(out, "login or password prompt") || !strings.Contains(out, "weren't sent") {
+		t.Errorf("got %q %v", out, isErr)
+	}
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "su" {
+		t.Errorf("the host got %q, want only su", got)
+	}
+}
+
+// 4340519071: BREAK is sent after a carriage return, so it is refused while
+// input is staged at the prompt, and nothing is submitted.
+func TestBreakIsRefusedWithStagedInput(t *testing.T) {
+	for _, staged := range []func(h *harness){
+		func(h *harness) { h.keys("s1", "uname -r") },
+		func(h *harness) { h.keys("s1", "", "left") },
+	} {
+		h := start(t, Options{}, "accept")
+		h.connect()
+		staged(h)
+		out, isErr := h.call("send_break", map[string]any{"session": "s1"})
+		f := h.host("node01")
+		if !isErr || !strings.Contains(out, "ctrl+u") || f.breaks != 0 || len(f.entered()) != 0 || h.askedAll() != "" {
+			t.Errorf("break over staged input: %q %v breaks=%d entered=%q asked=%q", out, isErr, f.breaks, f.entered(), h.askedAll())
+		}
+		h.keys("s1", "", "ctrl+u")
+		if out, isErr := h.call("send_break", map[string]any{"session": "s1"}); isErr {
+			t.Errorf("break after clearing the line: %q", out)
+		}
+		if f.breaks != 1 {
+			t.Errorf("breaks = %d after clearing the line", f.breaks)
+		}
+	}
+}
