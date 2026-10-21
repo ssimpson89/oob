@@ -174,8 +174,9 @@ func solConsole(h config.Host, name string, power func() (string, error)) (int, 
 	if err != nil {
 		return 1, err
 	}
+	addr, typ := share.Endpoint(h)
 	c, err := share.Open(context.Background(), share.Options{
-		Host: name, NoLinger: true,
+		Host: name, Addr: addr, Type: typ, NoLinger: true,
 		Open: func() (*console.Transport, error) { return openSOL(h, console.RemoteRows(rows), w) },
 	})
 	if err != nil {

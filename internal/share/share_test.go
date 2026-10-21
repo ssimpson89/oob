@@ -554,7 +554,7 @@ func TestSocketAndFolderArePrivate(t *testing.T) {
 	if ds.Mode().Perm() != 0o700 {
 		t.Errorf("folder mode %v", ds.Mode().Perm())
 	}
-	if !Exists("node01") || Exists("other") {
+	if !Exists("node01", "") || Exists("other", "") {
 		t.Error("Exists is wrong")
 	}
 }
@@ -573,7 +573,7 @@ func TestASocketThatIsntOursIsRefused(t *testing.T) {
 	if err := checkSocket(sock); err == nil {
 		t.Error("a regular file was accepted as a socket")
 	}
-	if Exists("node01") {
+	if Exists("node01", "") {
 		t.Error("Exists trusted a non-socket")
 	}
 }
@@ -595,7 +595,7 @@ func TestStaleSocketAndLockAreRecovered(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "node01.lock"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if Exists("node01") {
+	if Exists("node01", "") {
 		t.Error("a dead socket counted as a hub")
 	}
 	f := newFake()
@@ -620,7 +620,7 @@ func TestVersionMismatchIsRefused(t *testing.T) {
 	env(t)
 	f := newFake()
 	host(t, f, Options{NoLinger: true})
-	conn, err := net.Dial("unix", func() string { s, _, _ := paths("node01"); return s }())
+	conn, err := net.Dial("unix", func() string { s, _, _ := paths("node01", ""); return s }())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,4 +752,65 @@ func TestNonVSPInputIsUnchangedAtTheHub(t *testing.T) {
 	win := host(t, f, Options{NoLinger: true})
 	win.Enqueue([]byte("\x1b\x1b[Ax"))
 	eventually(t, "typed", func() bool { return f.got() == "\x1b\x1b[Ax" })
+}
+
+func TestTheSameNameAtAnotherAddressIsAnotherConsole(t *testing.T) {
+	env(t)
+	f1, f2 := newFake(), newFake()
+	a := host(t, f1, Options{Addr: "192.0.2.1", Type: "ilo", NoLinger: true})
+	// The config now points node01 at another BMC. It must not join the first
+	// one's console and type at the wrong server: it opens its own.
+	b := host(t, f2, Options{Addr: "192.0.2.2", Type: "ilo", NoLinger: true})
+	if b.Joined() || !b.Hosting() || !a.Hosting() {
+		t.Fatalf("joined/hosting: a %v/%v b %v/%v", a.Joined(), a.Hosting(), b.Joined(), b.Hosting())
+	}
+	b.Enqueue([]byte("on-b"))
+	eventually(t, "b types at its own console", func() bool { return f2.got() == "on-b" })
+	if f1.got() != "" {
+		t.Errorf("the first console got %q from a window for another address", f1.got())
+	}
+	// Same name and address joins as before.
+	w, err := join(t, Options{Addr: "192.0.2.1", Type: "ilo"})
+	if err != nil || !w.Joined() {
+		t.Fatalf("same address: joined %v, %v", w != nil && w.Joined(), err)
+	}
+	if Exists("node01", "192.0.2.3") || !Exists("node01", "192.0.2.1") {
+		t.Error("Exists must look at the address too")
+	}
+	if _, err := join(t, Options{Addr: "192.0.2.3"}); !errors.Is(err, ErrNoHub) {
+		t.Errorf("a join-only open for a third address: %v, want ErrNoHub", err)
+	}
+}
+
+func TestJoinWithADifferentAddressOrTypeIsRefusedAtHello(t *testing.T) {
+	env(t)
+	f := newFake()
+	host(t, f, Options{Addr: "192.0.2.1", Type: "ilo", NoLinger: true})
+	sock, _, _ := paths("node01", "192.0.2.1")
+	for _, c := range []struct {
+		name string
+		hi   msg
+		want string
+	}{
+		{"address", msg{T: tHello, Version: version, Addr: "192.0.2.9", Type: "ilo"}, "different BMC address"},
+		{"no address", msg{T: tHello, Version: version, Type: "ilo"}, "different BMC address"},
+		{"type", msg{T: tHello, Version: version, Addr: "192.0.2.1", Type: "idrac"}, "ilo host"},
+	} {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := newWire(conn)
+		_ = w.send(c.hi)
+		m, err := w.recv()
+		conn.Close()
+		if err != nil || m.T != tBye || !strings.Contains(m.Text, c.want) {
+			t.Errorf("%s: got %+v, %v; want a bye mentioning %q", c.name, m, err, c.want)
+		}
+	}
+	// An unknown type on either side still joins.
+	w, err := join(t, Options{Addr: "192.0.2.1"})
+	if err != nil || !w.Joined() {
+		t.Errorf("a joiner with no type: %v", err)
+	}
 }

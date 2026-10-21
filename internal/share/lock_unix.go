@@ -51,9 +51,12 @@ func dir() (string, error) {
 
 var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
-// paths returns the socket and lock for a host, or ok false if it can't be
-// shared here. A host name that isn't safe in a file name is hashed.
-func paths(host string) (sock, lockPath string, ok bool) {
+// paths returns the socket and lock for a host at addr, or ok false if it can't
+// be shared here. The host name alone doesn't say which console it is: the
+// config can point the same name at another BMC between two oob processes, and
+// they must not end up on one console. So a name with an address is followed
+// by a hash of both. A host name that isn't safe in a file name is hashed.
+func paths(host, addr string) (sock, lockPath string, ok bool) {
 	d, err := dir()
 	if err != nil {
 		return "", "", false
@@ -62,6 +65,13 @@ func paths(host string) (sock, lockPath string, ok bool) {
 	if !safeName.MatchString(host) {
 		sum := sha256.Sum256([]byte(host))
 		name = "h-" + hex.EncodeToString(sum[:8])
+	}
+	if addr != "" {
+		if len(name) > 24 {
+			name = name[:24]
+		}
+		sum := sha256.Sum256([]byte(host + "\x00" + addr))
+		name += "-" + hex.EncodeToString(sum[:6])
 	}
 	sock = filepath.Join(d, name+".sock")
 	if len(sock) > 100 { // the socket path limit is about 104 bytes

@@ -73,9 +73,10 @@ func confirmDestructive(cmd, name string, h config.Host, rest []string) error {
 
 // joinSharedConsole joins the console another oob has open for name, as a
 // window. joined is false when nobody has it, and the caller opens it itself.
-func joinSharedConsole(name string, o bmc.SOLOptions, drv bmc.Driver) (joined bool, err error) {
+func joinSharedConsole(name string, h config.Host, o bmc.SOLOptions, drv bmc.Driver) (joined bool, err error) {
+	addr, typ := share.Endpoint(h)
 	if o.Raw || o.Deact || o.Force {
-		if share.Exists(name) {
+		if share.Exists(name, addr) {
 			return true, fmt.Errorf("%s's console is open in another oob and shared; --raw, --force and --deactivate would take it from them. Run `%s sol %s` to join it", name, app.Name, name)
 		}
 		return false, nil
@@ -83,7 +84,7 @@ func joinSharedConsole(name string, o bmc.SOLOptions, drv bmc.Driver) (joined bo
 	if !console.UseBar() {
 		return false, nil
 	}
-	c, err := share.Open(context.Background(), share.Options{Host: name, NoLinger: true})
+	c, err := share.Open(context.Background(), share.Options{Host: name, Addr: addr, Type: typ, NoLinger: true})
 	if errors.Is(err, share.ErrNoHub) {
 		return false, nil
 	}
@@ -135,7 +136,7 @@ func bmcCmds() []*cobra.Command {
 				h.LineDelayMS = ptrMS(lineDelay)
 			}
 			drv := bmc.DriverForProbed(name, h)
-			if joined, err := joinSharedConsole(name, o, drv); joined {
+			if joined, err := joinSharedConsole(name, h, o, drv); joined {
 				return err
 			}
 			return drv.Console(o)

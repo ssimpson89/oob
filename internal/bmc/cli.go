@@ -531,8 +531,9 @@ func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, er
 	if err != nil {
 		return 1, err
 	}
+	addr, typ := share.Endpoint(h)
 	c, err := share.Open(context.Background(), share.Options{
-		Host: name, NoLinger: true,
+		Host: name, Addr: addr, Type: typ, NoLinger: true,
 		Open: func() (*console.Transport, error) {
 			app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
 			return cliOpen(name, h, sp, console.RemoteRows(rows), w)

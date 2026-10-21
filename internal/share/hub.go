@@ -69,6 +69,8 @@ type hub struct {
 
 	keysNoted bool // the link's input note was shown (guarded by mu)
 
+	addr, typ string // which console this is, as the host that opened it resolved it
+
 	enqMu    sync.Mutex
 	enqCount int64   // bytes handed to the typer, as far as is known
 	flight   *flight // the AI tool's write being typed
@@ -329,6 +331,11 @@ func (h *hub) serve(conn net.Conn, local bool) {
 		conn.Close()
 		return
 	}
+	if why := h.identityMismatch(hello); why != "" {
+		_ = w.send(msg{T: tBye, Text: why})
+		conn.Close()
+		return
+	}
 	p := &peer{w: w, conn: conn, wake: make(chan struct{}, 1), done: make(chan struct{}), agent: hello.Agent, name: hello.Name}
 
 	h.mu.Lock()
@@ -363,6 +370,20 @@ func (h *hub) serve(conn net.Conn, local bool) {
 	go p.writeLoop()
 	h.readLoop(p)
 	h.leave(p)
+}
+
+// identityMismatch says why a client that resolved the host to something else
+// can't join this console, or "". The socket's name already keeps different
+// addresses apart; this checks what the client says in its hello, so a socket
+// reached by another route still can't hand a window the wrong server's console.
+func (h *hub) identityMismatch(hello msg) string {
+	switch {
+	case hello.Addr != h.addr:
+		return "this console is open in another oob for a different BMC address than this host has now; close that one first"
+	case hello.Type != "" && h.typ != "" && hello.Type != h.typ:
+		return "this console is open in another oob as a " + h.typ + " host, but this one has it as " + hello.Type + "; close that one first"
+	}
+	return ""
 }
 
 // replay is the output a new client starts with: for a window, the recent

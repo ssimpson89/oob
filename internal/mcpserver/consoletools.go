@@ -320,7 +320,8 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		// Join the console if the user already has it open in an oob window (an
 		// iLO allows one VSP session, so a second connection couldn't work);
 		// otherwise open it here, and a window opened later joins this one.
-		cl, err := share.Open(ctx, share.Options{Host: name, Agent: true, Name: who,
+		addr, typ := share.Endpoint(h)
+		cl, err := share.Open(ctx, share.Options{Host: name, Addr: addr, Type: typ, Agent: true, Name: who,
 			Open: func() (*bmc.ConsoleTransport, error) {
 				return s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
 			}})

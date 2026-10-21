@@ -25,9 +25,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 )
 
@@ -56,14 +58,29 @@ const (
 
 // Options say which console to open and as what.
 type Options struct {
-	Host  string
-	Agent bool   // an AI tool (oob mcp), not a window
-	Name  string // the AI tool's name
+	Host string
+	// Addr and Type are what Host resolves to (the BMC's address and port, and
+	// its type, if known). They are part of which console this is: the same
+	// name with another address is another console, and a joiner whose Type
+	// disagrees with the hub's is refused. Empty Type matches any.
+	Addr, Type string
+	Agent      bool   // an AI tool (oob mcp), not a window
+	Name       string // the AI tool's name
 	// Open opens the console when no one else has it. Nil means only join.
 	Open func() (*console.Transport, error)
 	// NoLinger ends the console when this client leaves, even if other windows
 	// are on it. oob sol sets it: its process is about to exit.
 	NoLinger bool
+}
+
+// Endpoint is the Addr and Type of Options for a host as the config resolved
+// it: its BMC address (with the SSH port when one is set) and its type.
+func Endpoint(h config.Host) (addr, typ string) {
+	addr = h.IP
+	if addr != "" && h.Port != 0 {
+		addr = net.JoinHostPort(addr, strconv.Itoa(h.Port))
+	}
+	return addr, h.Type
 }
 
 // Client is this process's side of a shared console.
@@ -102,8 +119,8 @@ type holder struct {
 // Exists reports whether another oob has a hub for host, by reaching its
 // socket and hanging up (the hub ignores that). It takes no lock and never
 // touches the console.
-func Exists(host string) bool {
-	sock, _, ok := paths(host)
+func Exists(host, addr string) bool {
+	sock, _, ok := paths(host, addr)
 	if !ok || checkSocket(sock) != nil {
 		return false
 	}
@@ -122,7 +139,7 @@ func Open(ctx context.Context, opt Options) (*Client, error) {
 		opt: opt, notes: make(chan console.Note, 64), out: newOutBuf(),
 		doneC: make(chan console.Result, 1), done: make(chan struct{}), pending: map[int]chan msg{},
 	}
-	sock, lockPath, ok := paths(opt.Host)
+	sock, lockPath, ok := paths(opt.Host, opt.Addr)
 	if !ok {
 		return c.openPrivately()
 	}
@@ -183,6 +200,7 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 		return err
 	}
 	h := newHub(tr)
+	h.addr, h.typ = c.opt.Addr, c.opt.Type
 	ho := &holder{hub: h, lock: lockFile}
 	if lockFile != nil {
 		_ = os.Remove(sock) // left by an oob that died; ours now that we hold the lock
@@ -254,7 +272,7 @@ func (c *Client) join(sock string) error {
 // hello introduces this client and waits for the console's state.
 func (c *Client) hello(conn net.Conn) error {
 	w := newWire(conn)
-	if err := w.send(msg{T: tHello, Version: version, Agent: c.opt.Agent, Name: c.opt.Name, Replay: !c.opt.Agent}); err != nil {
+	if err := w.send(msg{T: tHello, Version: version, Agent: c.opt.Agent, Name: c.opt.Name, Replay: !c.opt.Agent, Addr: c.opt.Addr, Type: c.opt.Type}); err != nil {
 		conn.Close()
 		return err
 	}

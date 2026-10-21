@@ -15,7 +15,7 @@ import (
 // window joins the console the agent opened, the way `oob sol` does.
 func window(t *testing.T) *share.Client {
 	t.Helper()
-	w, err := share.Open(context.Background(), share.Options{Host: "node01"})
+	w, err := share.Open(context.Background(), share.Options{Host: "node01", Addr: "192.0.2.11:22", Type: "ipmi"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestAgentJoinsTheUsersConsole(t *testing.T) {
 	h := start(t, Options{}, "")
 	// The user's oob sol opens it first.
 	f := newFakeHost(t, "node01")
-	user, err := share.Open(context.Background(), share.Options{Host: "node01", NoLinger: true,
+	user, err := share.Open(context.Background(), share.Options{Host: "node01", Addr: "192.0.2.11:22", Type: "ipmi", NoLinger: true,
 		Open: func() (*bmc.ConsoleTransport, error) { return f.transport(), nil }})
 	if err != nil {
 		t.Fatal(err)

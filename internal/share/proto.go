@@ -60,6 +60,8 @@ type msg struct {
 	Agent   bool   `json:"agent,omitempty"`  // hello: an AI tool, not a window
 	Name    string `json:"name,omitempty"`   // hello: the AI tool's name
 	Replay  bool   `json:"replay,omitempty"` // hello: send recent output; data: this is it
+	Addr    string `json:"addr,omitempty"`   // hello: the BMC address this client resolved the host to
+	Type    string `json:"type,omitempty"`   // hello: the host's console type, if known
 
 	Data  []byte  `json:"data,omitempty"`  // data, write, urgent, req write
 	Text  string  `json:"text,omitempty"`  // note, mark, stopped, bye, end, reply
