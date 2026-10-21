@@ -1,0 +1,138 @@
+# Releases are built by .github/workflows/release.yml when a v* tag is pushed.
+# Try it locally with: goreleaser release --snapshot --clean
+version: 2
+
+project_name: oob
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  # Pure Go (CGO_ENABLED=0). No Windows build: oob needs SIGWINCH, flock and a
+  # pty. Linux arm v7 is for Raspberry Pi jump hosts.
+  - id: oob
+    main: ./cmd/oob
+    binary: oob
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64, arm]
+    goarm: ["7"]
+    ignore:
+      - goos: darwin
+        goarch: arm
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    files: [LICENSE, README.md]
+
+# Linux packages: an .rpm and a .deb for each Linux build, on the release
+# page. RPMs are signed when the RPM_SIGNING_KEY and RPM_SIGNING_PASSPHRASE
+# secrets exist, and built unsigned otherwise. apt checks a signed
+# repository index, not the .deb itself, so .debs aren't signed.
+nfpms:
+  - ids: [oob]
+    package_name: oob
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: Stephen Simpson
+    homepage: https://github.com/ssimpson89/oob
+    maintainer: Stephen Simpson <ssimpson89@users.noreply.github.com>
+    description: |-
+      Shortcuts for BMC consoles and power
+      Server serial console, BMC CLI, power and boot over IPMI, Redfish and SSH.
+    license: MIT
+    section: utils
+    mtime: "{{ .CommitDate }}" # file dates (nfpm still dates the RPM signature 1970; rpm accepts it)
+    formats: [rpm, deb]
+    bindir: /usr/bin
+    # ipmitool is only needed for plain IPMI and Supermicro hosts.
+    suggests:
+      - ipmitool
+    contents:
+      - src: LICENSE
+        dst: /usr/share/licenses/oob/LICENSE
+        packager: rpm
+      - src: LICENSE
+        dst: /usr/share/doc/oob/copyright
+        packager: deb
+      - src: README.md
+        dst: /usr/share/doc/oob/README.md
+    rpm:
+      signature:
+        key_file: '{{ if index .Env "RPM_SIGNING_KEY_FILE" }}{{ .Env.RPM_SIGNING_KEY_FILE }}{{ end }}'
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:", "^ci:"]
+
+# Homebrew: two casks in github.com/ssimpson89/homebrew-tap. oob@beta gets
+# every release; oob gets stable releases, and betas too until the first
+# stable one (the workflow sets HAS_STABLE once a stable tag exists). Both need
+# the HOMEBREW_TAP_TOKEN secret (a token that can write to that repo); without
+# it this step is skipped. See RELEASING.md.
+homebrew_casks:
+  - &cask
+    name: oob
+    binaries: [oob]
+    conflicts:
+      - cask: oob@beta
+    skip_upload: '{{ if not (index .Env "HOMEBREW_TAP_TOKEN") }}true{{ else if and .Prerelease (index .Env "HAS_STABLE") }}true{{ else }}false{{ end }}'
+    repository:
+      owner: ssimpson89
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/ssimpson89/oob
+    description: Shortcuts for BMC consoles and power
+    commit_msg_template: "oob {{ .Tag }}"
+    # The binary isn't signed, so take it out of quarantine, or macOS blocks
+    # it the first time it runs. Homebrew 7's structured steps: the older
+    # postflight block is deprecated there. chdir "." is the staged path.
+    # When GoReleaser 2.19 ships, use its hooks.post.install_steps instead:
+    # custom_block lands above version, which brew style flags.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-d", "com.apple.quarantine", "oob"], chdir: ".",
+                                must_succeed: false, print_stderr: false
+        end
+      end
+  - <<: *cask
+    name: oob@beta
+    description: Shortcuts for BMC consoles and power (betas included)
+    conflicts:
+      - cask: oob
+    skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}false{{ else }}true{{ end }}'
+
+# Signing and notarizing macOS binaries needs a paid Apple Developer account.
+# It stays off until the MACOS_* secrets exist; see RELEASING.md.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids: [oob]
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
+
+release:
+  github:
+    owner: ssimpson89
+    name: oob
+  # Tags with a suffix, like v0.0.1-beta.1 or v0.2.0-rc.1, are published as
+  # pre-releases and never marked Latest.
+  prerelease: auto

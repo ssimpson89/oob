@@ -1,0 +1,51 @@
+name: release
+
+# Runs when a v* tag is pushed. GoReleaser builds and attaches the archives,
+# packages and checksums to the GitHub release it creates.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    # ubuntu-latest is enough: oob has no cgo, so every target cross-compiles.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the changelog needs history
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      # Betas update the plain oob cask only until there's a stable release.
+      - run: if git tag -l 'v*' | grep -qv -- -; then echo HAS_STABLE=1 >> "$GITHUB_ENV"; fi
+      # Optional: sign the RPMs, if the key is set.
+      - env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+          RPM_SIGNING_PASSPHRASE: ${{ secrets.RPM_SIGNING_PASSPHRASE }}
+        run: |
+          if [ -n "$RPM_SIGNING_KEY" ] && [ -n "$RPM_SIGNING_PASSPHRASE" ]; then
+            umask 077
+            printf '%s\n' "$RPM_SIGNING_KEY" > "$RUNNER_TEMP/rpm-signing-key.asc"
+            echo "RPM_SIGNING_KEY_FILE=$RUNNER_TEMP/rpm-signing-key.asc" >> "$GITHUB_ENV"
+          fi
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: "v2.18.3"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: updates the Homebrew tap (ssimpson89/homebrew-tap).
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          NFPM_PASSPHRASE: ${{ secrets.RPM_SIGNING_PASSPHRASE }}
+          # Optional: macOS signing and notarization (paid Apple Developer account).
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
