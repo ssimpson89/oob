@@ -241,11 +241,34 @@ func Connect(h config.Host, khPath string) (*ssh.Client, error) {
 
 // sshConnectOpts is sshConnect with a callback for the server's pre-auth banner.
 func ConnectOpts(h config.Host, khPath string, banner func(string)) (*ssh.Client, error) {
-	cl, err := sshConnectRaw(h, khPath, banner)
+	return ConnectTimeout(h, khPath, banner, connectTimeout)
+}
+
+// ConnectTimeout is ConnectOpts with its own limit for the TCP connect and the
+// SSH handshake.
+func ConnectTimeout(h config.Host, khPath string, banner func(string), timeout time.Duration) (*ssh.Client, error) {
+	return ConnectWith(h, khPath, Options{Banner: banner, Timeout: timeout})
+}
+
+// Options tunes ConnectWith.
+type Options struct {
+	Banner  func(string)  // receives the pre-auth banner after a successful login
+	Timeout time.Duration // TCP connect and handshake limit (0: the default)
+	// NoPrompt keeps the login non-interactive: a key that needs a passphrase
+	// fails with ErrNeedsInput instead of asking on the terminal.
+	NoPrompt bool
+}
+
+// ConnectWith dials the BMC as Connect does, with the given options.
+func ConnectWith(h config.Host, khPath string, o Options) (*ssh.Client, error) {
+	if o.Timeout <= 0 {
+		o.Timeout = connectTimeout
+	}
+	cl, err := sshConnectRaw(h, khPath, o.Banner, o.Timeout, o.NoPrompt)
 	return cl, console.CleanErr(err)
 }
 
-func sshConnectRaw(h config.Host, khPath string, banner func(string)) (*ssh.Client, error) {
+func sshConnectRaw(h config.Host, khPath string, banner func(string), timeout time.Duration, noPrompt bool) (*ssh.Client, error) {
 	cb, err := acceptNew(khPath)
 	if err != nil {
 		return nil, err
@@ -257,7 +280,7 @@ func sshConnectRaw(h config.Host, khPath string, banner func(string)) (*ssh.Clie
 	if stored := storedKeyTypes(khPath, addr); len(stored) > 0 {
 		hostKeys = sshHostKeyAlgs(stored)
 	}
-	auth, closeAuth, err := sshAuthMethods(h)
+	auth, closeAuth, err := sshAuthMethods(h, noPrompt)
 	if err != nil {
 		return nil, err
 	}
@@ -287,11 +310,11 @@ func sshConnectRaw(h config.Host, khPath string, banner func(string)) (*ssh.Clie
 		}
 		return err
 	}
-	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, slow(err)
 	}
-	if err := conn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		conn.Close()
 		return nil, err
 	}

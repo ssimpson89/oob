@@ -152,6 +152,13 @@ oob picks a driver from the host's `type` (see `oob add --type`). If you leave i
 the type the first time an SSH session shows an iLO, iDRAC or Supermicro banner or prompt. Set
 `"type": "ipmi"` to pin a host to plain IPMI and turn detection off.
 
+oob detects the vendor over SSH the first time you use a host with no type: `sol`, `power`, `boot`,
+`uid`, `nmi`, `sel`, `mcreset` and `status` log in once (same keys, password and host key pinning as
+`oob ssh`), read the banner and the first prompt, and save the type. Set `--type` to skip this, or
+`--type ipmi` to force generic IPMI. If SSH is unreachable or nothing is recognized, nothing is
+saved and the command goes on as generic IPMI (the next run tries again). `OOB_NO_PROBE=1` turns the
+probe off.
+
 | Vendor | `type` | Status |
 | --- | --- | --- |
 | HPE iLO 7 | `ilo` | Tested: SSH, the VSP console, power status. Redfish write operations (power on/off/reset, PXE boot) are written to the HPE spec but untested |

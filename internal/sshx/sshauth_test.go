@@ -260,7 +260,7 @@ func TestAuthNothingToTry(t *testing.T) {
 		t.Errorf("agent reachable: %v", err)
 	}
 	noAgentEnv(t)
-	if _, _, err := sshAuthMethods(config.Host{}); err == nil {
+	if _, _, err := sshAuthMethods(config.Host{}, false); err == nil {
 		t.Error("sshAuthMethods with nothing succeeded")
 	}
 }
@@ -337,5 +337,19 @@ func TestKeyMerge(t *testing.T) {
 	}
 	if _, h, _ := c.Lookup("b"); h.Key != "~/b" {
 		t.Errorf("b key = %q", h.Key)
+	}
+}
+
+func TestConnectNoPromptSkipsPassphrase(t *testing.T) {
+	path, _ := writeTestKey(t, 0o600, "secret")
+	prompts := 0
+	old := keyPassphrase
+	keyPassphrase = func(string) ([]byte, error) { prompts++; return []byte("secret"), nil }
+	t.Cleanup(func() { keyPassphrase = old })
+	if _, err := loadKeySignerOpts(path, true); !errors.Is(err, ErrNeedsInput) || prompts != 0 {
+		t.Fatalf("err %v prompts %d", err, prompts)
+	}
+	if _, err := loadKeySignerOpts(path, false); err != nil || prompts != 1 {
+		t.Fatalf("interactive: err %v prompts %d", err, prompts)
 	}
 }

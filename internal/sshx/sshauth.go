@@ -101,7 +101,15 @@ var keyPassphrase = func(path string) ([]byte, error) {
 // loadKeySigner reads a private key file. It refuses a file that group or
 // other can read (as OpenSSH does) and asks once for a passphrase if needed.
 // Nothing about the key is ever printed.
-func loadKeySigner(path string) (ssh.Signer, error) {
+func loadKeySigner(path string) (ssh.Signer, error) { return loadKeySignerOpts(path, false) }
+
+// ErrNeedsInput says a login would have to ask the user for something (a key
+// passphrase) and the caller asked not to be prompted.
+var ErrNeedsInput = errors.New("login needs interactive input (key passphrase)")
+
+// loadKeySignerOpts is loadKeySigner; with noPrompt a passphrase-protected key
+// returns ErrNeedsInput instead of asking.
+func loadKeySignerOpts(path string, noPrompt bool) (ssh.Signer, error) {
 	p, err := expandHome(path)
 	if err != nil {
 		return nil, err
@@ -123,6 +131,9 @@ func loadKeySigner(path string) (ssh.Signer, error) {
 	signer, err := ssh.ParsePrivateKey(b)
 	var missing *ssh.PassphraseMissingError
 	if errors.As(err, &missing) {
+		if noPrompt {
+			return nil, fmt.Errorf("ssh key %s: %w", p, ErrNeedsInput)
+		}
 		pw, perr := keyPassphrase(p)
 		if perr != nil {
 			return nil, perr
@@ -142,12 +153,12 @@ func loadKeySigner(path string) (ssh.Signer, error) {
 
 // sshAuthMethods builds the auth methods for h in the order described above.
 // The returned func releases the agent connection.
-func sshAuthMethods(h config.Host) ([]ssh.AuthMethod, func(), error) {
+func sshAuthMethods(h config.Host, noPrompt bool) ([]ssh.AuthMethod, func(), error) {
 	var methods []ssh.AuthMethod
 	closeFn := func() {}
 	switch {
 	case h.Key != "":
-		s, err := loadKeySigner(h.Key)
+		s, err := loadKeySignerOpts(h.Key, noPrompt)
 		if err != nil {
 			return nil, nil, err
 		}

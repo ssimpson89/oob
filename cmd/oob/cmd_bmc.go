@@ -93,7 +93,7 @@ func bmcCmds() []*cobra.Command {
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: hostCompletion,
 		RunE: withHost(func(name string, h config.Host, _ []string) error {
-			return bmc.DriverFor(name, h).Console(o)
+			return bmc.DriverForProbed(name, h).Console(o)
 		}),
 	}
 	sol.Flags().BoolVar(&o.Force, "force", false, "deactivate any stale SOL session first")
@@ -118,7 +118,7 @@ func bmcCmds() []*cobra.Command {
 			if err := confirmDestructive("power", name, h, rest); err != nil {
 				return err
 			}
-			return bmc.DriverFor(name, h).Power(act)
+			return bmc.DriverForProbed(name, h).Power(act)
 		}),
 	})
 
@@ -135,7 +135,7 @@ func bmcCmds() []*cobra.Command {
 			default:
 				return errors.New("boot device must be pxe, disk or bios")
 			}
-			return bmc.DriverFor(name, h).Boot(rest[0], legacy, persistent)
+			return bmc.DriverForProbed(name, h).Boot(rest[0], legacy, persistent)
 		}),
 	}
 	boot.Flags().BoolVar(&legacy, "legacy", false, "legacy (BIOS) boot instead of the default UEFI")
@@ -149,7 +149,7 @@ func bmcCmds() []*cobra.Command {
 		Args:              cobra.RangeArgs(1, 2),
 		ValidArgsFunction: argsThen([]string{"on", "off"}),
 		RunE: withHost(func(name string, h config.Host, rest []string) error {
-			return bmc.DriverFor(name, h).UID(argOr(rest, ""))
+			return bmc.DriverForProbed(name, h).UID(argOr(rest, ""))
 		}),
 	})
 
@@ -163,7 +163,7 @@ func bmcCmds() []*cobra.Command {
 			if err := confirmDestructive("nmi", name, h, rest); err != nil {
 				return err
 			}
-			return bmc.DriverFor(name, h).NMI()
+			return bmc.DriverForProbed(name, h).NMI()
 		}),
 	})
 
@@ -183,7 +183,7 @@ func bmcCmds() []*cobra.Command {
 			if err := confirmDestructive("sel", name, h, rest); err != nil {
 				return err
 			}
-			return bmc.DriverFor(name, h).SEL(act)
+			return bmc.DriverForProbed(name, h).SEL(act)
 		}),
 	})
 
@@ -210,7 +210,7 @@ func bmcCmds() []*cobra.Command {
 			if err := confirmDestructive("mcreset", name, h, rest); err != nil {
 				return err
 			}
-			return bmc.DriverFor(name, h).MCReset(kind)
+			return bmc.DriverForProbed(name, h).MCReset(kind)
 		}),
 	})
 	cmds = append(cmds, &cobra.Command{

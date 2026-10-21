@@ -210,3 +210,31 @@ func TestMarkTypeKeepsConfig(t *testing.T) {
 		t.Errorf("notices %q", notices.msgs)
 	}
 }
+
+func TestClassify(t *testing.T) {
+	for _, c := range []struct {
+		name, banner, out string
+		typ               string
+		gen               int
+	}{
+		{"ilo banner", "Integrated Lights-Out 7\n", "", TypeILO, 7},
+		{"ilo gen from banner, output without", "Integrated Lights-Out 6\n", "</>hpeiLO-> ", TypeILO, 6},
+		{"ilo in output", "", "Integrated Lights-Out 5\r\n</>hpeiLO-> ", TypeILO, 5},
+		{"idrac prompt", "", "\r\n/admin1-> ", TypeIDRAC, 0},
+		{"smash", "", "SMASH-CLP shell", TypeSupermicro, 0},
+		{"nothing", "Welcome\n", "user@node01:~$ ", "", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			typ, gen := Classify(c.banner, c.out)
+			if typ != c.typ || gen != c.gen {
+				t.Errorf("got %q %d want %q %d", typ, gen, c.typ, c.gen)
+			}
+		})
+	}
+	if !WindowDone("x\r\n</>hpeiLO-> ") || WindowDone("Welcome to the BMC") {
+		t.Error("WindowDone prompt detection")
+	}
+	if VendorLabel(TypeILO, 7) != "HPE iLO 7" || VendorLabel(TypeIDRAC, 0) != "Dell iDRAC" {
+		t.Error("VendorLabel")
+	}
+}
