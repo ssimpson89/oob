@@ -36,3 +36,19 @@ func TestHubUntapStops(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+func TestHubTracksAlternateScreen(t *testing.T) {
+	var h Hub
+	if h.FullScreen() {
+		t.Fatal("full-screen before any output")
+	}
+	h.Feed([]byte("$ vim x\r\n\x1b[?10"))
+	h.Feed([]byte("49h\x1b[1;1H"))
+	if !h.FullScreen() {
+		t.Error("alternate screen on, not noticed (split across reads)")
+	}
+	h.Feed([]byte("\x1b[?1049l$ "))
+	if h.FullScreen() {
+		t.Error("alternate screen off, still reported")
+	}
+}

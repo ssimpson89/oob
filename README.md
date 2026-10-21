@@ -252,14 +252,22 @@ Press `ctrl+]`, then one key. Everything else you type goes to the machine.
 Pasting into a serial console (IPMI SOL, iLO VSP, iDRAC `com2`, Supermicro SOL) is paced. A serial line
 can't take a whole paste at once, and over a laggy link the BMC's buffer overflows and drops characters. oob
 types each pasted line a few characters ahead of the echo, presses Enter only when the echoed line matches
-what it typed, waits for the prompt (or for quiet) before the next line, and stops at the first error message
-or question from the device. Tabs become spaces. A paste with no newline is typed and left at the prompt. The bar shows
-`pasting 3/12` and, if the paste stops, why. `ctrl+] x` (or `ctrl+] esc`) cancels it. Keystrokes you type
-during a paste are dropped with a note on the bar, because a held Enter would run half a pasted line. The `s`
+what it typed, waits for the prompt before the next line (a continuation prompt such as `> `, `... ` or `-> `
+counts, and so does output going quiet for a moment at a line with text, so a heredoc can't stall it), and stops
+at the first error message or question from the device. In a full-screen program such as vim, whose echo can't be
+read, lines go out in small timed writes instead. A device that says nothing at all after Enter for 5 seconds
+stops the paste with a reason on the bar. Tabs become spaces. A paste with no newline is typed and left at the prompt. The bar shows
+`pasting 3/12` and, if the paste stops, why. `ctrl+] x` (or `ctrl+] esc`) cancels it. The first key
+you type during a paste stops it (the bar says "paste stopped by keypress") and is not sent; the keys after it go
+through, so a paste can never hold the keyboard. The `s`
 size line goes through the same echo check, so a dropped first byte can't turn `stty` into `tty`. If the remote
 doesn't echo (a program with echo off), the paste stops before Enter; `ctrl+] w` switches to raw paste, which
 writes the paste in one go as before. Plain `oob ssh` sessions and the BMC's own CLI prompt have flow
 control and are never paced. The MCP server's `send_command` types each line the same way.
+
+To debug a paste that misbehaves, set `OOB_DEBUG_PASTE=/path/to/file` before `oob sol`. Each paste appends a
+timestamped log of the bytes sent and received and the pacer's decisions (passwords are redacted from what was
+sent). The rest is written as is, so the file holds the pasted text and the device's output; keep it private.
 
 Logs go to `~/.local/state/oob/logs/<name>-<timestamp>.log` (or under `$XDG_STATE_HOME`), with
 escape sequences removed, readable only by you. oob handles `~.` itself, and ipmitool's own escape is remapped so only oob interprets `~`. Use `oob sol --raw <name>` for the plain `ipmitool` behavior.

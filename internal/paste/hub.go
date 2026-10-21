@@ -6,8 +6,17 @@ import "sync"
 // while the console or session keeps reading the same stream. The zero Hub
 // is ready to use.
 type Hub struct {
-	mu   sync.Mutex
-	taps map[*tap]struct{}
+	mu     sync.Mutex
+	taps   map[*tap]struct{}
+	screen screenTracker
+}
+
+// FullScreen reports whether the output so far left the alternate screen on:
+// vim, less and the like are showing.
+func (h *Hub) FullScreen() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.screen.on
 }
 
 // tap queues chunks without bound: Feed must never wait for a Pacer that is
@@ -50,6 +59,7 @@ func (h *Hub) Feed(b []byte) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.screen.feed(b)
 	if len(h.taps) == 0 {
 		return
 	}

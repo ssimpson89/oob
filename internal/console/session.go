@@ -334,14 +334,14 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 	return k.send(fwd[pos:])
 }
 
-// send types keystrokes at the remote. During a paste they are dropped with a
-// note on the bar; waiting for a size line to finish is fine. It reports false
-// if the link refused the bytes.
+// send types keystrokes at the remote. The first one during a paste stops the
+// paste instead (and is not sent); waiting for a size line to finish is fine.
+// It reports false if the link refused the bytes.
 func (k *consoleKeys) send(b []byte) bool {
 	if len(b) == 0 {
 		return true
 	}
-	if k.busy("typing") {
+	if k.keyStopsPaste(b) {
 		return true
 	}
 	k.ty.wmu.Lock()

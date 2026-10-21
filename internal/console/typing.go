@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -41,8 +43,17 @@ type typer struct {
 	raw     bool // pastes go out unpaced
 	pasting bool
 	cancel  context.CancelFunc
-	at      int // the line a paste is on, counting from 0
+	at      int  // the line a paste is on, counting from 0
+	byKey   bool // a keypress stopped the paste
 }
+
+// traceEnv names the file that gets a debug trace of each paste.
+const traceEnv = "OOB_DEBUG_PASTE"
+
+// terminalReply matches what the terminal itself sends on stdin without the
+// user touching a key: cursor position and device attribute reports, focus
+// events, and OSC answers. They never stop a paste.
+var terminalReply = regexp.MustCompile(`^(\x1b\[[?>0-9;]*[Rc]|\x1b\[[IO]|\x1b\].*(\x07|\x1b\\))$`)
 
 func (k *consoleKeys) isPasting() bool {
 	k.ty.mu.Lock()
@@ -64,9 +75,34 @@ func (k *consoleKeys) serial() bool {
 	return ok && s.Serial()
 }
 
+// keyStopsPaste handles typing during a paste. The first keystroke stops the
+// paste and is not sent: the user is taking over, and a stuck paste must never
+// hold the keyboard. It reports true if b was consumed. Keys after that go
+// out as usual (the send waits for the paste to let go of the line).
+func (k *consoleKeys) keyStopsPaste(b []byte) bool {
+	k.ty.mu.Lock()
+	if !k.ty.pasting || k.ty.byKey {
+		k.ty.mu.Unlock()
+		return false
+	}
+	if terminalReply.Match(b) {
+		k.ty.mu.Unlock()
+		return true
+	}
+	k.ty.byKey = true
+	cancel := k.ty.cancel
+	k.ty.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	k.con.Note("paste stopped by keypress", true)
+	return true
+}
+
 // busy notes that a paste is running and reports true if so. Anything that
-// would type at the remote waits for it: keystrokes are dropped, not held,
-// because a held Enter would run half of a pasted line.
+// would type at the remote waits for it: it is dropped, not held, because a
+// held Enter would run half of a pasted line. (Plain keystrokes are different:
+// the first one stops the paste, see keyStopsPaste.)
 func (k *consoleKeys) busy(what string) bool {
 	if !k.isPasting() {
 		return false
@@ -92,12 +128,21 @@ func (k *consoleKeys) runCtx() (context.Context, context.CancelFunc) {
 // opened together with the prompt snapshot. Call untap when done.
 func (k *consoleKeys) pacer() (p *paste.Pacer, untap func()) {
 	rx, untap, cursor := k.con.Tap()
-	return &paste.Pacer{
-		Write:  k.cs.Link.Send,
-		Rx:     rx,
-		Baud:   pasteBaud,
-		Prompt: cursor,
-	}, untap
+	p = &paste.Pacer{
+		Write:      k.cs.Link.Send,
+		Rx:         rx,
+		Baud:       pasteBaud,
+		Prompt:     cursor,
+		FullScreen: k.con.taps.FullScreen(),
+	}
+	if path := os.Getenv(traceEnv); path != "" {
+		if tr, err := paste.OpenTrace(path); err == nil {
+			p.Trace = tr
+			stopTap := untap
+			return p, func() { stopTap(); tr.Close() }
+		}
+	}
+	return p, untap
 }
 
 // pasteText handles a finished bracketed paste.
@@ -116,7 +161,7 @@ func (k *consoleKeys) pasteText(text string) bool {
 	}
 	ctx, cancel := k.runCtx()
 	k.ty.mu.Lock()
-	k.ty.pasting, k.ty.cancel, k.ty.at = true, cancel, 0
+	k.ty.pasting, k.ty.cancel, k.ty.at, k.ty.byKey = true, cancel, 0, false
 	k.ty.mu.Unlock()
 	k.con.SetPaste(1, len(lines))
 	guard(k.cleanup, func() {
@@ -139,8 +184,8 @@ func (k *consoleKeys) pasteText(text string) bool {
 // pasteEnded reports how a paste finished, on the bar and in the log.
 func (k *consoleKeys) pasteEnded(err error, lines []string) {
 	k.ty.mu.Lock()
-	at := k.ty.at
-	k.ty.pasting, k.ty.cancel = false, nil
+	at, byKey := k.ty.at, k.ty.byKey
+	k.ty.pasting, k.ty.cancel, k.ty.byKey = false, nil, false
 	k.ty.mu.Unlock()
 	k.con.SetPaste(0, 0)
 	n := len(lines)
@@ -161,6 +206,8 @@ func (k *consoleKeys) pasteEnded(err error, lines []string) {
 		if se.Unentered {
 			msg += "; ctrl+u clears the line, ctrl+] w pastes raw"
 		}
+	case byKey && errors.Is(err, context.Canceled):
+		msg = fmt.Sprintf("paste stopped by keypress at line %d of %d; a half-typed line may remain (ctrl+u clears it)", at+1, n)
 	case errors.Is(err, context.Canceled):
 		msg = fmt.Sprintf("paste cancelled at line %d of %d; a half-typed line may remain (ctrl+u clears it)", at+1, n)
 	default:

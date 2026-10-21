@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ type serialDev struct {
 	lineStart []time.Time   // when the first byte of each line was accepted
 	promptAt  []time.Time   // when each prompt was printed
 	holdPause time.Duration // "slow" takes this long before the prompt returns
+	inDoc     bool          // inside a heredoc: the prompt is "> " until a line "EOF"
 	serial    bool
 	sizeLine  bool
 	fits      [][2]int
@@ -88,6 +90,14 @@ func (d *serialDev) take(c byte) {
 	d.mu.Unlock()
 	d.emit("\r\n")
 	switch {
+	case d.inDoc && line == "EOF":
+		d.inDoc = false
+		d.prompt()
+	case d.inDoc:
+		d.emit("> ")
+	case strings.Contains(line, "<<'EOF'"):
+		d.inDoc = true
+		d.emit("> ")
 	case strings.HasPrefix(line, "bad"):
 		d.emit("bash: " + line + ": command not found\r\n")
 		d.prompt()
@@ -404,7 +414,9 @@ func TestCancelPaste(t *testing.T) {
 	}
 }
 
-func TestKeystrokesDuringPasteAreRejected(t *testing.T) {
+// The first key typed during a paste stops it and is not sent; the keys after
+// it go through. A stuck paste can't hold the user's input hostage.
+func TestKeystrokeDuringPasteStopsIt(t *testing.T) {
 	r := newPasteRig(t)
 	r.dev.holdPause = 5 * time.Second
 	r.paste("slow\nuptime\n")
@@ -412,33 +424,94 @@ func TestKeystrokesDuringPasteAreRejected(t *testing.T) {
 	r.dev.mu.Lock()
 	before := len(r.dev.sent)
 	r.dev.mu.Unlock()
-	r.k.Input([]byte("zz\r"))
+	r.k.Input([]byte("z"))
+	r.waitDone(t)
 	r.dev.mu.Lock()
 	after := len(r.dev.sent)
 	r.dev.mu.Unlock()
 	if after != before {
-		t.Errorf("typed keys reached the console during a paste (%d bytes)", after-before)
+		t.Errorf("the key that stopped the paste was sent (%d bytes)", after-before)
 	}
-	if n, isErr := r.note(); !isErr || !strings.Contains(n, "ignored: paste in progress") {
-		t.Errorf("note = %q (err %v)", n, isErr)
+	if n, isErr := r.note(); !isErr || !strings.Contains(n, "paste stopped by keypress") {
+		t.Errorf("note = %q (err %v), want a keypress stop", n, isErr)
 	}
-	// Sending BREAK or the size is refused too, and a second paste.
-	r.k.Input([]byte(string(rune(escapeByte)) + "s"))
-	r.paste("ls\n")
-	r.dev.mu.Lock()
-	after = len(r.dev.sent)
-	r.dev.mu.Unlock()
-	if after != before {
-		t.Errorf("size or a second paste typed during a paste (%d bytes)", after-before)
+	if r.state().pasteN != 0 {
+		t.Error("progress still on the bar")
 	}
-	r.k.stopPaste()
-	r.waitDone(t)
+	if got := r.applied(); len(got) != 1 {
+		t.Errorf("device ran %q; nothing after the stop should run", got)
+	}
 	r.k.Input([]byte("q"))
 	r.dev.mu.Lock()
 	last := string(r.dev.sent[len(r.dev.sent)-1:])
 	r.dev.mu.Unlock()
 	if last != "q" {
-		t.Error("typing doesn't resume after the paste")
+		t.Error("typing doesn't go through after the paste was stopped")
+	}
+}
+
+// A second paste, and the keys that act on the remote, are still refused
+// while a paste runs.
+func TestOtherActionsDuringPasteAreRefused(t *testing.T) {
+	r := newPasteRig(t)
+	r.dev.holdPause = 5 * time.Second
+	r.paste("slow\nuptime\n")
+	r.wait(t, "the paste to reach line 1", func() bool { return len(r.applied()) == 1 })
+	r.dev.mu.Lock()
+	before := len(r.dev.sent)
+	r.dev.mu.Unlock()
+	r.k.Input([]byte(string(rune(escapeByte)) + "s"))
+	r.paste("ls\n")
+	r.dev.mu.Lock()
+	after := len(r.dev.sent)
+	r.dev.mu.Unlock()
+	if after != before {
+		t.Errorf("size or a second paste typed during a paste (%d bytes)", after-before)
+	}
+	if n, isErr := r.note(); !isErr || !strings.Contains(n, "ignored: paste in progress") {
+		t.Errorf("note = %q (err %v)", n, isErr)
+	}
+	r.k.stopPaste()
+	r.waitDone(t)
+}
+
+// A terminal's own replies (cursor position, device attributes) arrive on
+// stdin, not from the user: they don't stop a paste.
+func TestTerminalRepliesDontStopAPaste(t *testing.T) {
+	r := newPasteRig(t)
+	r.dev.holdPause = 700 * time.Millisecond
+	r.paste("slow\nuptime\n")
+	r.wait(t, "the paste to reach line 1", func() bool { return len(r.applied()) == 1 })
+	r.k.Input([]byte("\x1b[24;80R"))
+	r.waitDone(t)
+	if got := r.applied(); strings.Join(got, "|") != "slow|uptime" {
+		t.Errorf("device ran %q, want the paste to finish", got)
+	}
+}
+
+// A heredoc shows "> " after its first line. The bar used to stay on
+// "pasting 1/N" for a minute, with the keyboard dropped.
+func TestHeredocPasteDoesNotStall(t *testing.T) {
+	r := newPasteRig(t)
+	lines := []string{"cat > /tmp/example.conf <<'EOF'"}
+	for i := 1; i <= 20; i++ {
+		lines = append(lines, "setting"+strconv.Itoa(i)+" = value")
+	}
+	lines = append(lines, "EOF", "ls")
+	r.paste(strings.Join(lines, "\n") + "\n")
+	deadline := time.Now().Add(10 * time.Second)
+	for r.k.isPasting() {
+		if time.Now().After(deadline) {
+			st := r.state()
+			t.Fatalf("still pasting %d/%d after 10s; device ran %d lines", st.pasteAt, st.pasteN, len(r.applied()))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := r.applied(); strings.Join(got, "|") != strings.Join(lines, "|") {
+		t.Errorf("device ran %d lines, want %d", len(got), len(lines))
+	}
+	if n, isErr := r.note(); isErr || !strings.Contains(n, "pasted 23 lines") {
+		t.Errorf("note = %q (err %v)", n, isErr)
 	}
 }
 
@@ -611,5 +684,23 @@ func TestPasteAtTheLimitIsStillSent(t *testing.T) {
 	defer pl.mu.Unlock()
 	if len(pl.sent) != pasteMax {
 		t.Errorf("sent %d bytes, want %d", len(pl.sent), pasteMax)
+	}
+}
+
+// OOB_DEBUG_PASTE writes a trace of the paste to that file.
+func TestPasteTraceFile(t *testing.T) {
+	path := t.TempDir() + "/trace.log"
+	t.Setenv(traceEnv, path)
+	r := newPasteRig(t)
+	r.paste("echo hello\nls\n")
+	r.waitDone(t)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"TX", "RX", "PACE", "echo hel"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("trace lacks %q:\n%s", want, b)
+		}
 	}
 }
