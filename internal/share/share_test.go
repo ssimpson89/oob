@@ -918,3 +918,46 @@ func TestALateReleaseDoesNotFreeANewerLease(t *testing.T) {
 	reply(t, w, 5)
 	eventually(t, "lease 2 released", func() bool { return !working(win) })
 }
+
+func TestBreakIsRefusedWhileTheLineHoldsTypedInput(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	win.Enqueue([]byte("reboot")) // a prefix of "reboot --help", on the line without Enter
+	eventually(t, "typed", func() bool { return f.got() == "reboot" })
+	err := win.Transport().Link.Break()
+	if !errors.Is(err, ErrLinePending) {
+		t.Fatalf("Break = %v, want ErrLinePending", err)
+	}
+	f.mu.Lock()
+	n := f.breaks
+	f.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d BREAKs went out over a half-typed line", n)
+	}
+	win.Urgent([]byte{0x03})
+	eventually(t, "ctrl+c typed", func() bool { return f.got() == "reboot\x03" })
+	if err := win.Transport().Link.Break(); err != nil {
+		t.Errorf("Break after ctrl+c: %v", err)
+	}
+	// Enter also leaves the line clean.
+	win.Enqueue([]byte("ls\r"))
+	eventually(t, "ls", func() bool { return strings.HasSuffix(f.got(), "ls\r") })
+	if err := win.Transport().Link.Break(); err != nil {
+		t.Errorf("Break after Enter: %v", err)
+	}
+}
+
+func TestBreakIsRefusedWhileInputIsQueued(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.delay = 100 * time.Millisecond // each write takes a while, so the rest stays queued
+	win := host(t, f, Options{NoLinger: true})
+	// A paced paste: the first byte is out, the rest is queued.
+	win.Enqueue([]byte("a\r"))
+	win.Enqueue([]byte("b\r"))
+	err := win.Transport().Link.Break()
+	if !errors.Is(err, ErrLinePending) {
+		t.Fatalf("Break = %v, want ErrLinePending", err)
+	}
+}

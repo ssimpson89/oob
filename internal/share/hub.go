@@ -67,6 +67,10 @@ type hub struct {
 
 	wrote atomic.Int64 // bytes the typer has written to the link
 
+	// lineDirty: the last byte written was neither Enter nor ctrl+c, so the
+	// remote line may hold typed, unsubmitted input.
+	lineDirty atomic.Bool
+
 	keysNoted bool // the link's input note was shown (guarded by mu)
 
 	addr, typ string // which console this is, as the host that opened it resolved it
@@ -144,6 +148,9 @@ func newHub(tr *console.Transport) *hub {
 	h.ty.Progress = h.progress
 	go func() {
 		err := h.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
+			for _, c := range b {
+				h.lineDirty.Store(c != '\r' && c != '\n' && c != 0x03)
+			}
 			err := tr.Link.Send(b)
 			h.wrote.Add(int64(len(b)))
 			return len(b), err
@@ -888,7 +895,14 @@ func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 
 	switch m.Op {
 	case opBreak:
-		h.dropQueued()
+		// A serial BREAK is sent after a carriage return (IPMI SOL's escape
+		// starts with one), which the remote takes as Enter: with a paste part
+		// way through, or text typed on the line, it would run what was typed
+		// ("reboot" out of "reboot --help"). Dropping the queue wouldn't undo
+		// what already went out. So refuse until the line is clean.
+		if h.ty.Queued() > 0 || h.lineDirty.Load() {
+			return ErrLinePending
+		}
 		return h.tr.Link.Break()
 	case opToggle:
 		if h.tr.Toggle == nil {

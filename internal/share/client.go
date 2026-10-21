@@ -42,6 +42,9 @@ var (
 	ErrBusy = errors.New("the console is busy")
 	// ErrStopped means the user took the keyboard back from the AI tool.
 	ErrStopped = errStopped
+	// ErrLinePending means a BREAK was refused: input is typed, or waiting to be
+	// typed, on the console's line, and BREAK's carriage return would run it.
+	ErrLinePending = errors.New("input is pending on the line; clear the line first (ctrl+c)")
 	// ErrNoHub means nobody has the console open.
 	ErrNoHub = errors.New("nobody has this console open")
 	// ErrClosed means the console ended or this client left it.
@@ -440,7 +443,7 @@ func (c *Client) call(ctx context.Context, m msg) (msg, error) {
 		case !ok:
 			return msg{}, ErrClosed
 		case reply.Err != "":
-			for _, e := range []error{ErrPaused, ErrTyping, ErrBusy, errStopped, console.ErrKeysDropped} {
+			for _, e := range []error{ErrPaused, ErrTyping, ErrBusy, errStopped, console.ErrKeysDropped, ErrLinePending} {
 				if reply.Err == e.Error() {
 					return reply, e
 				}
