@@ -244,7 +244,7 @@ func newRoot() *cobra.Command {
 		Run:   func(*cobra.Command, []string) { fmt.Println(AppName, versionString()) },
 	})
 	root.AddCommand(bmcCmds()...)
-	root.AddCommand(statusCmd(), lsCmd(), addCmd(), rmCmd(), editCmd(), importCmd(), completionCmd())
+	root.AddCommand(statusCmd(), lsCmd(), addCmd(), rmCmd(), editCmd(), importCmd(), mcpCmd(), completionCmd())
 	groupCommands(root)
 	root.SetFlagErrorFunc(flagError)
 	recordCommandNames(root)
