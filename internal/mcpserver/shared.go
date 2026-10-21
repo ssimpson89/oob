@@ -18,10 +18,15 @@ import (
 	"github.com/ssimpson89/oob/internal/share"
 )
 
+// beforeKeyboard runs just before a call takes the keyboard; tests use it to
+// change the console in the gap where the call may wait for the user.
+var beforeKeyboard = func(*session) {}
+
 // keyboard takes the keyboard for one tool call. The returned context ends if
 // the user stops the tool; why then says how it was stopped. Call release when
 // done. A console no one else can reach needs no lease.
 func (c *session) keyboard(ctx context.Context) (_ context.Context, why func() string, release func(), err error) {
+	beforeKeyboard(c)
 	if c.sh == nil {
 		return ctx, func() string { return "" }, func() {}, nil
 	}

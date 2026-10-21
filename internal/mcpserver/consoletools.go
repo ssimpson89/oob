@@ -537,6 +537,65 @@ func (c *session) staged() string {
 	return typed
 }
 
+// gate is what an approval depends on: where the console is (a bootloader, the
+// BMC's prompt, just after a BREAK), what is already typed on the line, and
+// whether it is a question waiting for an answer. A call records it before it
+// asks the user and checks it again once it holds the keyboard.
+type gate struct {
+	ctx     string // contextWhy
+	typed   string
+	asking  bool
+	prompts int // which question, when asking
+}
+
+// gateAt is the gate for the cursor line at.
+func (c *session) gateAt(at line) gate {
+	g := gate{ctx: c.contextWhy(at), asking: at.confirming()}
+	if g.asking {
+		g.prompts = at.prompts
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g.typed = at.typed()
+	if pending, unknown := c.typing.pending(at.prompts); len(pending) > len(g.typed) {
+		g.typed = pending
+	} else if unknown && g.typed == "" {
+		g.typed = "a line edited or recalled with cursor, editing or history keys"
+	}
+	return g
+}
+
+// changedWhileWaiting is nil if the console is as the call found it. Taking
+// the keyboard on a shared console can wait for the user, and an approval
+// waits for them too, so the console may have moved on: what was approved was
+// for somewhere else. Then nothing is sent, and the approval is forgotten so
+// the next call asks again.
+func (c *session) changedWhileWaiting(before gate) *mcp.CallToolResult {
+	now := c.gateAt(c.line())
+	if now == before {
+		return nil
+	}
+	c.mu.Lock()
+	c.answersAt = -1
+	c.mu.Unlock()
+	res, _, _ := fail("nothing was sent: the console changed while this call waited for the user's approval or for the keyboard " +
+		"(it was " + describeGate(before) + ", and is now " + describeGate(now) + "). Look at it with read_output and call again, " +
+		"which asks the user afresh.")
+	return res
+}
+
+func describeGate(g gate) string {
+	switch {
+	case g.asking:
+		return "at a question"
+	case g.ctx != "":
+		return "a place where it " + g.ctx
+	case g.typed != "":
+		return "at a prompt with " + strconv.Quote(g.typed) + " typed"
+	}
+	return "at an empty prompt"
+}
+
 // sinceBreak reports whether a BREAK was sent recently enough that the next
 // key may be a SysRq command.
 func (c *session) sinceBreak() bool {
@@ -576,13 +635,9 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	at := c.line()
 	c.mu.Lock()
 	answering := at.confirming() && c.answersAt != at.prompts
-	typed := at.typed()
-	if pending, unknown := c.typing.pending(at.prompts); len(pending) > len(typed) {
-		typed = pending // the echo hasn't caught up
-	} else if unknown && typed == "" {
-		typed = "a line edited or recalled with cursor, editing or history keys"
-	}
 	c.mu.Unlock()
+	before := c.gateAt(at)
+	typed := before.typed
 	if typed != "" && !answering {
 		return fail(fmt.Sprintf("the prompt already has %q typed after it, so nothing was sent. Clear it with send_keys "+
 			"keys [\"ctrl+c\"], or finish it with send_keys", typed))
@@ -605,6 +660,9 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		}
 		shownLines = append(shownLines, l)
 	}
+	if len(whys) > 0 && ctx0 != "" && !slices.Contains(whys, ctx0) {
+		whys = append(whys, ctx0) // where it is typed is part of what is approved
+	}
 	if len(whys) > 0 {
 		if res, err := s.approve(req, c.target(), "type at the console of "+c.host+":\n"+approvalText(shownLines), whys); res != nil || err != nil {
 			if err != nil {
@@ -622,6 +680,9 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		return fail(err)
 	}
 	defer release()
+	if res := c.changedWhileWaiting(before); res != nil {
+		return res, nil, nil
+	}
 	var lastErr error // a failed write says more than that the link dropped
 	stopped := func() (*mcp.CallToolResult, any, error, bool) {
 		if w := why(); w != "" && !(w == "disconnected" && lastErr != nil) {
@@ -768,6 +829,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		steps = append(steps, step{key: k})
 	}
 	at := c.line()
+	before := c.gateAt(at)
 	c.mu.Lock()
 	sim := c.typing
 	answersAt, lastEsc := c.answersAt, c.lastEsc
@@ -847,6 +909,9 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		return fail(err)
 	}
 	defer release()
+	if res := c.changedWhileWaiting(before); res != nil {
+		return res, nil, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack+c.typingBudget([]byte(wire.String())))
 	defer cancel()
 	if len(in.Keys) > 0 {

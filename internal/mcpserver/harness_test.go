@@ -415,6 +415,7 @@ type harness struct {
 	setup   func(*fakeHost)
 	openErr error
 	initial *string // what a console prints when it opens, if not a prompt
+	onAsk   func()  // runs while the user is being asked, before the answer
 
 	mu       sync.Mutex
 	calls    []string
@@ -503,7 +504,11 @@ func startVersion(t *testing.T, opt Options, answer, version string) *harness {
 		copt.ElicitationHandler = func(_ context.Context, r *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 			h.mu.Lock()
 			h.asked = append(h.asked, r.Params.Message)
+			onAsk := h.onAsk
 			h.mu.Unlock()
+			if onAsk != nil {
+				onAsk()
+			}
 			switch answer {
 			case "accept":
 				return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"allow": true}}, nil

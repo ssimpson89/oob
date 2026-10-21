@@ -61,10 +61,12 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 	// The address and type are part of what is approved: the host list is read
 	// again on every call, and an approval for one address must not carry over
 	// to another.
-	call += "\x00" + dev.name + "\x00" + dev.addr + "\x00" + dev.typ + "\x00" + what
-
 	slices.Sort(whys)
 	why := strings.Join(slices.Compact(whys), "; it ")
+	// The reasons are part of what is approved too: the console can move on
+	// between the question and the repeated call (to a bootloader, to the BMC's
+	// prompt), and an approval for a command at a shell must not cover it there.
+	call += "\x00" + dev.name + "\x00" + dev.addr + "\x00" + dev.typ + "\x00" + what + "\x00" + why
 
 	s.askMu.Lock()
 	defer s.askMu.Unlock()
