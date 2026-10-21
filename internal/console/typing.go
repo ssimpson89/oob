@@ -68,6 +68,11 @@ func NewTyper(l Link, p Pacing) *typer.Typer {
 	if p.Line != nil {
 		t.LineDelay = *p.Line
 	}
+	// Both delays off means a plain writer. The ESC gap is part of pacing, so
+	// it goes too, or a zero-delay paste would still stall after every ESC.
+	if t.CharDelay == 0 && t.LineDelay == 0 {
+		t.EscDelay = 0
+	}
 	t.Paced = func() bool {
 		s, ok := l.(serialLink)
 		return ok && s.Serial()

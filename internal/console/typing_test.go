@@ -590,6 +590,12 @@ func TestNewTyperDefaultsAndOverrides(t *testing.T) {
 	if NewTyper(&fakeLink{}, Pacing{}).Paced() {
 		t.Error("a link with no Serial is never paced")
 	}
+	if ty.EscDelay != DefaultEscDelay {
+		t.Errorf("EscDelay = %v with one delay still on, want the default", ty.EscDelay)
+	}
+	if ty := NewTyper(newSerialDev(), PacingMS(intp(0), intp(0))); ty.EscDelay != 0 {
+		t.Errorf("EscDelay = %v with both delays 0, want a plain writer", ty.EscDelay)
+	}
 	if p := PacingMS(nil, nil); p.Char != nil || p.Line != nil {
 		t.Error("unset stays unset")
 	}
@@ -705,4 +711,17 @@ func TestCtrlXClearsEvenIfPendingIsStale(t *testing.T) {
 	if got := g.text(); got != "xz" {
 		t.Errorf("sent %q, want the queue cleared even though pending read 0", got)
 	}
+}
+
+func TestZeroDelaysMakeEscapePasteAPlainWrite(t *testing.T) {
+	zero := time.Duration(0)
+	d := newSerialDev()
+	r := newRig(t, d, Pacing{Char: &zero, Line: &zero}, func(time.Duration) <-chan time.Time {
+		t.Error("typer waited with both delays set to 0")
+		ch := make(chan time.Time, 1)
+		ch <- time.Time{}
+		return ch
+	})
+	r.k.Input([]byte("\x1b:q"))
+	d.waitSent(t, 3)
 }
