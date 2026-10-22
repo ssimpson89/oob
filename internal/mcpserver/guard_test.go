@@ -429,3 +429,48 @@ func (h *harness) unaskedQuestion() {
 		return c.line().confirming()
 	})
 }
+
+// In a batch, each harmless line refreshes the answer exemption: the question
+// raised by the second line is answerable without approval even though the
+// first line produced a new prompt in between.
+func TestBatchLineQuestionNeedsNoApproval(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.send("s1", "uname -r\ndnf install foo"); isErr {
+		t.Fatalf("batch: %q", out)
+	}
+	if out, isErr := h.keys("s1", "y", "enter"); isErr || len(h.asked) != 0 {
+		t.Errorf("answering the batch's question asked or failed: %q %v %v", out, isErr, h.asked)
+	}
+}
+
+// A call that never got the keyboard sent nothing, so it must not leave an
+// answer exemption behind.
+func TestFailedKeyboardLeavesNoAnswerExemption(t *testing.T) {
+	for _, tool := range []string{"send_command", "send_keys"} {
+		t.Run(tool, func(t *testing.T) {
+			h := start(t, Options{}, "")
+			h.connect()
+			old := beforeKeyboard
+			t.Cleanup(func() { beforeKeyboard = old })
+			beforeKeyboard = func(c *session) { beforeKeyboard = old; c.sh.Close() }
+			var out string
+			var isErr bool
+			if tool == "send_command" {
+				out, isErr = h.send("s1", "uname -r")
+			} else {
+				out, isErr = h.keys("s1", "uname -r", "enter")
+			}
+			if !isErr {
+				t.Fatalf("expected the keyboard to fail: %q", out)
+			}
+			c, _ := h.srv.session("s1")
+			c.mu.Lock()
+			at, prompts := c.answersAt, c.prompts
+			c.mu.Unlock()
+			if at == prompts {
+				t.Errorf("answersAt = %d: an exemption was recorded for a command that was never sent", at)
+			}
+		})
+	}
+}

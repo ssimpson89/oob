@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -322,8 +323,16 @@ func (s *server) runBMC(ctx context.Context, timeout time.Duration, fn func() er
 	}
 	ch := make(chan result, 1)
 	started := make(chan struct{})
+	// state decides, once and atomically, whether fn runs: the callback moves
+	// it 0 to 1 (started), expiry moves it 0 to 2 (gave up). Whoever loses
+	// the swap defers to the winner, so errQueued is returned only when fn
+	// provably never runs, and a callback that did start is waited for.
+	var state atomic.Int32
 	go func() {
 		out, err := bmc.Capture(ctx, func() error {
+			if !state.CompareAndSwap(0, 1) {
+				return errQueued // the caller already gave up: do not touch the BMC
+			}
 			close(started)
 			return fn()
 		})
@@ -335,14 +344,14 @@ func (s *server) runBMC(ctx context.Context, timeout time.Duration, fn func() er
 	case r := <-ch:
 		return r.out, r.err
 	case <-ctx.Done():
+		state.CompareAndSwap(0, 2)
 		return "", ctx.Err()
 	case <-queue.C:
-		cancel() // Capture returns without running fn, unless it just got its turn
-		select {
-		case <-started:
-		default:
+		if state.CompareAndSwap(0, 2) {
+			cancel() // Capture returns without running fn
 			return "", errQueued
 		}
+		// fn started just now: let it run and report its real result.
 	case <-started:
 	}
 	run := time.NewTimer(timeout)

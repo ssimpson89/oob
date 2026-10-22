@@ -702,12 +702,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 			}
 			return res, nil, nil
 		}
-		c.mu.Lock()
-		c.answersAt = at.prompts
-		c.mu.Unlock()
-	} else if !at.confirming() {
-		c.noteBenign(at) // nothing here needed approval, so a question it raises doesn't either
 	}
+	// The answer exemption is recorded only once a line was actually sent
+	// (see below), so a failed keyboard lease or write leaves none behind. It
+	// covers an approved batch, and a harmless one typed at a non-question.
+	exempt := len(whys) > 0 || !at.confirming()
 
 	ctx, why, release, err := c.keyboard(ctx)
 	if err != nil {
@@ -741,7 +740,15 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		} else {
 			c.tx.Mark("agent typed: " + l)
 		}
-		err := c.runLine(ctx, l, wait)
+		// Each line that goes out refreshes the exemption with the prompt
+		// count it started at, so a question raised by a later line of the
+		// batch (after an earlier line's prompt) can still be answered.
+		start := c.line()
+		var sent func()
+		if (i == 0 && exempt) || (i > 0 && !start.confirming()) {
+			sent = func() { c.noteBenign(start) }
+		}
+		err := c.runLineSent(ctx, l, wait, sent)
 		lastErr = err
 		if !errors.Is(err, errStuck) {
 			if res, out, e, ok := stopped(); ok {
@@ -767,9 +774,18 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 // runLine types a line and waits for the console to answer: until it is quiet
 // at a prompt or a question, or wait passes.
 func (c *session) runLine(ctx context.Context, l string, wait time.Duration) error {
+	return c.runLineSent(ctx, l, wait, nil)
+}
+
+// runLineSent is runLine that calls sent (if not nil) once the line's bytes
+// were written without error.
+func (c *session) runLineSent(ctx context.Context, l string, wait time.Duration, sent func()) error {
 	changed := c.changes()
 	if err := c.write(ctx, []byte(l+"\r")); err != nil {
 		return err
+	}
+	if sent != nil {
+		sent()
 	}
 	deadline := time.Now().Add(wait) // typing a line paced takes a while; wait_seconds is for the answer
 	for {
@@ -936,12 +952,10 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 			}
 			return res, nil, nil
 		}
-		c.mu.Lock()
-		c.answersAt = at.prompts
-		c.mu.Unlock()
-	} else if !at.confirming() && slices.Contains(in.Keys, "enter") {
-		c.noteBenign(at)
 	}
+	// Recorded only after the bytes went out (below), not before the keyboard
+	// is held: a failed lease or write must leave no exemption behind.
+	exempt := len(whys) > 0 || (!at.confirming() && slices.Contains(in.Keys, "enter"))
 
 	ctx, why, release, err := c.keyboard(ctx)
 	if err != nil {
@@ -966,6 +980,9 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	}
 	c.mu.Lock()
 	c.typing = sim
+	if exempt {
+		c.answersAt = at.prompts
+	}
 	c.mu.Unlock()
 	c.settle(ctx, changed, wait, false)
 	if w := why(); w != "" {

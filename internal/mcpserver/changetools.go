@@ -61,9 +61,9 @@ func (s *server) addChangeTools(srv *mcp.Server) {
 	}, s.boot)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "uid",
-		Description: "Turn the host's identify (UID) LED on or off. Always asks the user to approve first. Exact host name only.",
+		Description: "Turn the host's identify (UID) LED on or off. Harmless, so it does not ask the user. Exact host name only.",
 		InputSchema: schemaFor[uidIn](map[string][]string{"state": uidStates}),
-		Annotations: change,
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: &no, OpenWorldHint: &yes},
 	}, s.uid)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "nmi",

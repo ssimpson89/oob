@@ -3,9 +3,11 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,6 +48,10 @@ func TestToolList(t *testing.T) {
 		case "list_hosts", "status", "sel_list", "sensors", "bmc_info", "read_output":
 			if !tool.Annotations.ReadOnlyHint {
 				t.Errorf("%s should be read-only", tool.Name)
+			}
+		case "uid":
+			if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || strings.Contains(tool.Description, "asks the user") {
+				t.Errorf("uid is harmless and must not be marked destructive or described as asking: %q", tool.Description)
 			}
 		case "power", "boot", "nmi", "sel_clear", "mc_reset", "send_command", "send_keys", "send_break":
 			if tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
@@ -392,4 +398,37 @@ func TestChangeToolsRunOneAtATimeAndStayQuiet(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// If the queue gives up, errQueued must mean fn never ran: expiry and the
+// callback starting are decided atomically.
+func TestRunBMCQueuedMeansNeverRan(t *testing.T) {
+	old := queueTimeout
+	queueTimeout = 3 * time.Millisecond
+	t.Cleanup(func() { queueTimeout = old })
+	s := &server{}
+	for i := 0; i < 300; i++ {
+		release := make(chan struct{})
+		held := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			bmc.Capture(context.Background(), func() error { close(held); <-release; return nil })
+		}()
+		<-held
+		var ran atomic.Bool
+		go func() {
+			time.Sleep(2*time.Millisecond + time.Duration(i%20)*100*time.Microsecond)
+			close(release)
+		}()
+		_, err := s.runBMC(context.Background(), time.Second, func() error { ran.Store(true); return nil })
+		<-done
+		time.Sleep(3 * time.Millisecond) // a late start would show now
+		if errors.Is(err, errQueued) && ran.Load() {
+			t.Fatalf("iteration %d: runBMC said it never started, but fn ran", i)
+		}
+		if err == nil && !ran.Load() {
+			t.Fatalf("iteration %d: success without running fn", i)
+		}
+	}
 }
