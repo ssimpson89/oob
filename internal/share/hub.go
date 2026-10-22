@@ -715,9 +715,19 @@ func (h *hub) readLoop(p *peer) {
 
 // userWrite is a window's typing. While the AI tool has the keyboard, or an
 // exclusive operation on the link (BREAK, toggle) is running, it is dropped, so
-// the console's line never mixes the two; the window is told why.
+// the console's line never mixes the two; the window is told why. ctrl+c is the
+// exception: it always reaches the console, and while the AI tool holds the
+// keyboard it first stops the tool as a pause would (its unsent text is erased
+// and it is told), then goes out urgently.
 func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
-	if len(b) == 0 || p.agent || h.closed || h.windowBlocked(p) {
+	if len(b) == 0 || p.agent || h.closed {
+		return
+	}
+	if h.lease && !h.paused && h.busy == 0 && bytes.IndexByte(b, 0x03) >= 0 {
+		h.pause(p, func(error) { h.userWrite(p, []byte{0x03}, true) })
+		return
+	}
+	if h.windowBlocked(p) {
 		return
 	}
 	h.typeWindow(h.mapUser(p, b), urgent)

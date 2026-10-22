@@ -503,3 +503,47 @@ func TestLinkHangupClosesTheHostedConsole(t *testing.T) {
 		t.Errorf("hangup typed %q", got)
 	}
 }
+
+// A window's ctrl+c always reaches the console. While the AI tool holds the
+// keyboard it counts as a pause: the tool is stopped, its unsent text is
+// erased, and then the ctrl+c goes out.
+func TestWindowCtrlCStopsTheAgentAndReachesTheConsole(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	ai := agent(t)
+	ctx, why, release, err := ai.Lease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := ai.Type(ctx, []byte("sleep 1000")); err != nil {
+		t.Fatal(err)
+	}
+	win.Enqueue([]byte{0x03})
+	select {
+	case <-ctx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the AI tool's lease wasn't ended by the window's ctrl+c")
+	}
+	if got := why(); got != StopCleared {
+		t.Errorf("why = %q, want %q", got, StopCleared)
+	}
+	eventually(t, "erase, then ctrl+c", func() bool { return f.got() == "sleep 1000"+strings.Repeat("\b", 10)+"\x03" })
+	eventually(t, "the AI is paused", func() bool { return ai.Status().Paused })
+
+	// With no lease, ctrl+c is typed like any key.
+	win.Enqueue([]byte{0x03})
+	eventually(t, "a second ctrl+c", func() bool { return strings.HasSuffix(f.got(), "\x03\x03") })
+}
+
+// On an iLO VSP a window's fast Esc, :wq and Enter in one message is a lone ESC
+// and the keys: ESC ESC, then the rest.
+func TestWindowFastEscThenKeysOnAVSP(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	win := host(t, f, Options{NoLinger: true})
+	win.Enqueue([]byte("\x1b:wq\r"))
+	eventually(t, "ESC ESC :wq", func() bool { return f.got() == "\x1b\x1b:wq\r" })
+}
