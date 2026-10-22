@@ -55,6 +55,7 @@ type session struct {
 	stopTy context.CancelFunc
 	txErr  error // guarded by mu
 	wrote  int   // bytes the link has taken, ever; guarded by mu
+	inSend bool  // the typer is inside the link's Send; guarded by mu
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -100,8 +101,12 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 	c.ty = console.NewTyper(tr.Link, tr.Pacing)
 	go func() {
 		_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
+			c.mu.Lock()
+			c.inSend = true
+			c.mu.Unlock()
 			err := tr.Link.Send(b)
 			c.mu.Lock()
+			c.inSend = false
 			if err != nil {
 				c.txErr = err
 			} else {
@@ -143,6 +148,17 @@ func (c *session) drain() {
 			case <-time.After(2 * time.Second):
 			}
 			c.markEnded()
+			// A write still stuck in the link will never finish: the console
+			// is gone, and the typer is not waited on. Close the transport so
+			// the write fails and its goroutine ends. Not waited for, since
+			// closing can be slow; Release and the final Close stay with
+			// closeTransport, which runs the teardown once.
+			c.mu.Lock()
+			stuck := c.inSend
+			c.mu.Unlock()
+			if stuck {
+				go c.trOnce.Do(c.tr.Close)
+			}
 			return
 		}
 	}
@@ -186,7 +202,7 @@ func (c *session) endInput() {
 	}
 	c.mu.Unlock()
 	c.stopTy()
-	c.ty.Clear() // returns once Run has stopped or dropped the queue
+	c.ty.Clear() // drops the queue without waiting on the writer, which may be stuck in Send
 }
 
 // markEnded records that the transport has gone, with its exit status if it
