@@ -328,3 +328,56 @@ func TestQueuedIsExactAfterEnqueueReturns(t *testing.T) {
 		t.Errorf("Queued = %d after Clear, want 0", got)
 	}
 }
+
+// With no per-char delay but a line delay, nothing yields between bytes, so
+// Urgent has to be serviced before each write or ctrl+c waits out the line.
+func TestUrgentLandsBeforeEnterWithZeroCharDelay(t *testing.T) {
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var out []byte
+	ty := &Typer{LineDelay: ld, Wait: func(time.Duration) <-chan time.Time { return make(chan time.Time) }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := writeFn(func(b []byte) (int, error) {
+		mu.Lock()
+		first := len(out) == 0
+		out = append(out, b...)
+		mu.Unlock()
+		if first {
+			<-gate // hold the first byte's write while ctrl+c is requested
+		}
+		return len(b), nil
+	})
+	go func() { _ = ty.Run(ctx, w) }()
+	ty.Enqueue([]byte("reboot\r"))
+	for {
+		mu.Lock()
+		n := len(out)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	go ty.Urgent([]byte{0x03})
+	time.Sleep(50 * time.Millisecond) // Urgent is now blocked sending
+	close(gate)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := string(out)
+		mu.Unlock()
+		if strings.Contains(got, "\x03") {
+			if strings.Contains(got, "\r") {
+				t.Fatalf("wrote %q, ctrl+c must land before Enter", got)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("ctrl+c never written")
+}
+
+type writeFn func([]byte) (int, error)
+
+func (f writeFn) Write(b []byte) (int, error) { return f(b) }
