@@ -706,3 +706,47 @@ func TestCtrlXClearsEvenIfPendingIsStale(t *testing.T) {
 		t.Errorf("sent %q, want the queue cleared even though pending read 0", got)
 	}
 }
+
+// ctrlCGate is a link whose Send of ctrl+c blocks until released, like an
+// interrupt still in flight to the BMC.
+type ctrlCGate struct {
+	fakeLink
+	in      chan struct{}
+	release chan struct{}
+}
+
+func (g *ctrlCGate) Send(b []byte) error {
+	if bytes.Contains(b, []byte{0x03}) {
+		g.in <- struct{}{}
+		<-g.release
+	}
+	return g.fakeLink.Send(b)
+}
+
+func TestLineStaysDirtyWhileCtrlCIsInFlight(t *testing.T) {
+	g := &ctrlCGate{in: make(chan struct{}, 1), release: make(chan struct{})}
+	r := newRig(t, g, Pacing{}, nil)
+	r.k.Input([]byte("reboot"))
+	for deadline := time.Now().Add(5 * time.Second); !r.k.lineDirty.Load(); {
+		if time.Now().After(deadline) {
+			t.Fatal("line never became dirty")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.k.Input([]byte{0x03})
+	select {
+	case <-g.in:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ctrl+c was not sent")
+	}
+	if !r.k.lineDirty.Load() {
+		t.Error("line marked clean before ctrl+c was sent")
+	}
+	close(g.release)
+	for deadline := time.Now().Add(5 * time.Second); r.k.lineDirty.Load(); {
+		if time.Now().After(deadline) {
+			t.Fatal("line still dirty after ctrl+c was sent")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
