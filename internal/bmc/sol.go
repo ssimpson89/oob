@@ -196,7 +196,11 @@ func solExitCode(ee *exec.ExitError, hungUp bool) int {
 // exit code. The console is shared: if another oob (an MCP server, or another
 // window) already has it, this joins it; otherwise this opens it and others
 // can join.
-func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
+//
+// open starts the SOL session when this oob is the one that hosts it (nil: a
+// plain openSOL). It runs under the console's ownership lock, so anything that
+// must clear the BMC's session first belongs in it.
+func solConsole(h config.Host, name string, power func() (string, error), open func(rows, cols int) (*ConsoleTransport, error)) (int, error) {
 	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		return 1, err
@@ -204,7 +208,12 @@ func solConsole(h config.Host, name string, power func() (string, error)) (int, 
 	addr, typ := share.Endpoint(h)
 	c, err := share.Open(context.Background(), share.Options{
 		Host: name, Addr: addr, Type: typ, NoLinger: true,
-		Open: func() (*console.Transport, error) { return openSOL(h, console.RemoteRows(rows), w) },
+		Open: func() (*console.Transport, error) {
+			if open != nil {
+				return open(console.RemoteRows(rows), w)
+			}
+			return openSOL(h, console.RemoteRows(rows), w)
+		},
 	})
 	if err != nil {
 		return 1, err

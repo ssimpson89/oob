@@ -17,6 +17,7 @@ import (
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/detect"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // Only the start of the output counts: up to the first prompt or the first 4KB.
@@ -478,3 +479,26 @@ func TestDriverFor(t *testing.T) {
 }
 
 func typeName(v any) string { return fmt.Sprintf("%T", v) }
+
+// Without a terminal Console has no elected opener to clear the stale session
+// in, so it must hold the ownership lock itself: with another oob sharing the
+// console it refuses instead of ending that session.
+func TestSupermicroConsoleWithoutTerminalDoesNotClearASharedConsole(t *testing.T) {
+	d, err := os.MkdirTemp("/tmp", "oob") // short: socket paths are limited to about 100 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	t.Setenv("XDG_STATE_HOME", d)
+	h := config.Host{IP: "192.0.2.5"}
+	addr, _ := share.Endpoint(h)
+	release, err := share.Exclusive("s", addr) // another oob has the console
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	err = newSupermicroDriver("s", h).Console(SOLOptions{})
+	if err == nil || !strings.Contains(err.Error(), "another oob") {
+		t.Errorf("Console = %v, want a refusal naming the other oob", err)
+	}
+}
