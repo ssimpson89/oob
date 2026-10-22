@@ -195,8 +195,10 @@ func TestProbeNothingDetected(t *testing.T) {
 	if got := typeName(DriverForProbed("node01", h)); got != "*bmc.ipmiDriver" {
 		t.Errorf("driver %s", got)
 	}
-	if typ, _ := savedType(t, p); typ != "" {
-		t.Errorf("saved %q", typ)
+	// A login that works but matches no vendor is saved as plain IPMI, so the
+	// host is not probed again on every command.
+	if typ, _ := savedType(t, p); typ != "ipmi" {
+		t.Errorf("saved %q, want ipmi", typ)
 	}
 	if out.Len() != 0 {
 		t.Errorf("output %q", out.String())

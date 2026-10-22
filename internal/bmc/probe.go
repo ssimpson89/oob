@@ -189,6 +189,11 @@ func Resolve(name string, h config.Host, budget time.Duration) config.Host {
 		return h
 	}
 	if typ == "" {
+		// The login worked but no vendor matched: it is a plain IPMI BMC.
+		// Save that so the host is not probed again on every command.
+		if _, serr := detect.SaveType(name, detect.TypeIPMI, 0); serr != nil && !app.Quiet() {
+			app.Notef(probeW(), "could not save type %s for %s: %v", detect.TypeIPMI, name, serr)
+		}
 		return h
 	}
 	set, serr := detect.SaveType(name, typ, gen)
