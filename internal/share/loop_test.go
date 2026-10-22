@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -238,4 +239,48 @@ func TestUserLineTrackingSpansWrites(t *testing.T) {
 	if h.userTyped != 0 {
 		t.Errorf("userTyped = %d after Enter", h.userTyped)
 	}
+}
+
+// A byte already inside a blocked Send when the user pauses the AI tool still
+// goes out when the link frees. It stays the AI tool's input: the hub counts
+// it, so the AI tool's line is known to hold it.
+func TestPausingKeepsTheOwnerOfAByteInsideABlockedSend(t *testing.T) {
+	env(t)
+	f := newFake()
+	win, err := Open(context.Background(), Options{Host: "node01", NoLinger: true, Open: slowOpen(f)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { win.Close() })
+	h := win.holder.hub
+	ai := agent(t)
+	ctx, _, release, err := ai.Lease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
+	f.set(func() {
+		f.onSend = func([]byte) {
+			once.Do(func() { close(entered); <-gate })
+		}
+	})
+	go func() { _ = ai.Type(ctx, []byte("abc")) }()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first byte never reached Send")
+	}
+	if err := win.Window().TogglePause(); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the pause took effect", func() bool { return ai.Status().Paused })
+	close(gate)
+	eventually(t, "the byte that was in flight is counted as the AI tool's input", func() bool {
+		var chars int
+		h.query(func() { chars = h.agentLine.chars })
+		return chars == 1
+	})
 }

@@ -51,6 +51,7 @@ type Typer struct {
 	accepted int      // bytes ever accepted
 	total    int      // bytes in the current burst
 	urgent   [][]byte // to write next, in order, ahead of q
+	flight   int      // bytes of q inside the write in progress
 	gen      uint64   // bumped when q is dropped, so Run knows a write in flight was dropped
 	report   bool     // Progress is owed
 	stopped  bool
@@ -154,16 +155,22 @@ func (t *Typer) Urgent(b []byte) {
 
 // Clear drops everything queued and returns at once. Nothing dropped is
 // written after it returns, except a byte already inside a blocked Write.
-func (t *Typer) Clear() {
+func (t *Typer) Clear() { t.ClearCount() }
+
+// ClearCount is Clear that says how many bytes it dropped and how many of
+// them were inside a write in progress, which may still reach the writer.
+func (t *Typer) ClearCount() (dropped, inFlight int) {
 	t.init()
 	t.mu.Lock()
 	if t.stopped {
 		t.mu.Unlock()
-		return
+		return 0, 0
 	}
+	dropped, inFlight = len(t.q), t.flight
 	t.dropLocked()
 	t.mu.Unlock()
 	t.poke()
+	return dropped, inFlight
 }
 
 // Run writes queued bytes to w until ctx ends or a write fails, and returns
@@ -248,11 +255,15 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 			}
 			chunk := append([]byte(nil), t.q[:n]...)
 			gen := t.gen
+			t.flight = n
 			t.mu.Unlock()
-			if err := write(chunk); err != nil {
+			err := write(chunk)
+			t.mu.Lock()
+			t.flight = 0
+			if err != nil {
+				t.mu.Unlock()
 				return err
 			}
-			t.mu.Lock()
 			var pending, total int
 			if t.gen == gen { // else the write was dropped while it ran
 				t.q = t.q[n:]

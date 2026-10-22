@@ -371,9 +371,20 @@ func (h *hub) enqueue(b []byte, who int, then func(done <-chan struct{})) {
 // clearQueue drops what is queued. What was written before is accounted for,
 // and nothing dropped is.
 func (h *hub) clearQueue() {
-	h.ty.Clear()
+	dropped, inFlight := h.ty.ClearCount()
 	h.drain()
-	h.segs = nil // all that is left of what the typer had taken is dropped
+	// What was queued is dropped, but a byte already inside a blocked Send
+	// may still go out: its owner is kept until the typer records it, so it
+	// counts as that owner's input when it lands.
+	for drop := dropped - inFlight; drop > 0 && len(h.segs) > 0; {
+		last := &h.segs[len(h.segs)-1]
+		if last.n > drop {
+			last.n -= drop
+			break
+		}
+		drop -= last.n
+		h.segs = h.segs[:len(h.segs)-1]
+	}
 }
 
 // pump shares the console's output until it ends, then tells everyone. It is
