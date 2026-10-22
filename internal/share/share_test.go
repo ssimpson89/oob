@@ -741,9 +741,12 @@ func TestVSPInputIsMappedAtTheHub(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A lone ESC is sent as ESC ESC, from either window.
+	// Each window has its own connection, so their writes can reach the hub in
+	// either order: send the second only once the first is out.
 	win.Enqueue([]byte("\x1b"))
+	eventually(t, "mapped ESC typed", func() bool { return f.got() == "\x1b\x1b" })
 	win2.Enqueue([]byte("a"))
-	eventually(t, "mapped ESC typed", func() bool { return f.got() == "\x1b\x1ba" })
+	eventually(t, "a typed after it", func() bool { return f.got() == "\x1b\x1ba" })
 
 	// An arrow key is dropped, with one note to the windows; typing around it goes on.
 	win.Enqueue([]byte("b\x1b[Ac\x1b[Ad"))
@@ -900,6 +903,17 @@ func reply(t *testing.T, w *wire, id int) msg {
 
 func working(c *Client) bool { return c.Window().Status().Working }
 
+// leaseHeld reads the hub's own lease, which a reply to a lease request already
+// reflects. The window's status is fed by a broadcast that can still be on its
+// way when the reply arrives, so it can't be asserted on right after a reply.
+func leaseHeld(t *testing.T, c *Client) (held bool, id int) {
+	t.Helper()
+	h := hubOf(t, c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lease, h.leaseID
+}
+
 func TestACancelledLeaseDoesNotLeaveTheHubHoldingTheKeyboard(t *testing.T) {
 	env(t)
 	f := newFake()
@@ -935,7 +949,7 @@ func TestAReleaseThatArrivesBeforeItsRequestRefusesTheRequest(t *testing.T) {
 	if r := reply(t, w, 2); r.Err == "" {
 		t.Fatal("a request already released was granted")
 	}
-	if working(win) {
+	if held, _ := leaseHeld(t, win); held {
 		t.Error("the hub is holding the keyboard for a request nobody wants")
 	}
 	// Its id is spent, not the keyboard: a new acquisition works.
@@ -963,12 +977,14 @@ func TestALateReleaseDoesNotFreeANewerLease(t *testing.T) {
 	}
 	_ = w.send(msg{T: tReq, ID: 4, Op: opRelease, Lease: 1}) // a duplicate of the earlier release
 	reply(t, w, 4)
-	if !working(win) {
-		t.Error("an old release freed the keyboard from the lease that followed it")
+	if held, id := leaseHeld(t, win); !held || id != 2 {
+		t.Errorf("an old release freed the keyboard from the lease that followed it (held %v, id %d)", held, id)
 	}
 	_ = w.send(msg{T: tReq, ID: 5, Op: opRelease, Lease: 2})
 	reply(t, w, 5)
-	eventually(t, "lease 2 released", func() bool { return !working(win) })
+	if held, _ := leaseHeld(t, win); held {
+		t.Error("lease 2 is still held after its own release")
+	}
 }
 
 func TestBreakIsRefusedWhileTheLineHoldsTypedInput(t *testing.T) {
@@ -1091,7 +1107,13 @@ func TestAnUnfinishedKeyAtTheHubTimesOutAndTypingGoesOn(t *testing.T) {
 	f.vsp = true
 	win := host(t, f, Options{NoLinger: true})
 	win.Enqueue([]byte("\x1b[1;5")) // the rest never comes
-	time.Sleep(150 * time.Millisecond)
+	// The hub shows its note when it gives up on the key: wait for that, not a guess at how long it takes.
+	h := hubOf(t, win)
+	eventually(t, "the hub gave up on the key", func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.keysNoted
+	})
 	win.Enqueue([]byte("C"))
 	eventually(t, "the next key is typed, not eaten", func() bool { return f.got() == "C" })
 }

@@ -4,6 +4,7 @@ package share
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/ssimpson89/oob/internal/console"
@@ -38,6 +39,11 @@ func (l *link) Break() error { return l.c.Break(context.Background()) }
 func (l *link) Disconnect() error {
 	if l.c.Hosting() {
 		_, err := l.c.call(context.Background(), msg{Op: opDisconnect})
+		if errors.Is(err, ErrClosed) {
+			// Ending the console is what was asked: when it ends before the
+			// hub's reply is read, that is success, not a failure.
+			return nil
+		}
 		return err
 	}
 	l.c.end(console.Result{})
