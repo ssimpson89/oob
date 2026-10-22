@@ -673,3 +673,43 @@ func TestConsoleKeyActions(t *testing.T) {
 		t.Error("input after stop must not be sent")
 	}
 }
+
+type hangLink struct {
+	fakeLink
+	hangups int
+}
+
+func (h *hangLink) Hangup() error { h.mu.Lock(); h.hangups++; h.mu.Unlock(); return nil }
+
+// Disconnect over a dirty line must not type: IPMI SOL's escape starts with a
+// CR, which would run a truncated command ("reboot" out of "reboot --help").
+func TestDisconnectWithPendingInputHangsUp(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "sol", 24, 80)
+	con.Start()
+	defer con.Close()
+	hl := &hangLink{}
+	k := newKeys(&Setup{Link: hl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	esc := string(rune(escapeByte))
+
+	k.Input([]byte("reboot"))
+	deadline := time.Now().Add(2 * time.Second)
+	for !k.lineDirty.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	k.Input([]byte(esc + "."))
+	if hl.hangups != 1 || hl.disconnects != 0 {
+		t.Errorf("dirty line: hangups=%d disconnects=%d, want 1 and 0", hl.hangups, hl.disconnects)
+	}
+
+	// A clean line keeps the normal disconnect.
+	hl2 := &hangLink{}
+	k2 := newKeys(&Setup{Link: hl2}, con, func() {}, make(chan struct{}))
+	k2.start(nil)
+	k2.Input([]byte(esc + "."))
+	if hl2.hangups != 0 || hl2.disconnects != 1 {
+		t.Errorf("clean line: hangups=%d disconnects=%d, want 0 and 1", hl2.hangups, hl2.disconnects)
+	}
+}
