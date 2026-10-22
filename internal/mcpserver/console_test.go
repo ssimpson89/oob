@@ -574,14 +574,16 @@ func TestEOFEndsRunLineWithoutError(t *testing.T) {
 	h := start(t, Options{}, "")
 	f, c := eofWhileRunning(t, h)
 	res := make(chan error, 1)
-	go func() { res <- c.runLine(context.Background(), "echo one", 30*time.Second) }()
+	go func() {
+		res <- leased(c, func(ctx context.Context) error { return c.runLine(ctx, "echo one", 30*time.Second) })
+	}()
 	closeOutputWhenShown(t, f, c)
 	select {
 	case err := <-res:
 		if err != nil {
 			t.Errorf("runLine = %v, want nil", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second): // a shared console gives the exit status endWait (2s) first
 		t.Fatal("runLine kept waiting after the output closed")
 	}
 }
@@ -599,13 +601,14 @@ func TestEOFStopsBatchAndRefusesSends(t *testing.T) {
 	}
 	res := make(chan result, 1)
 	go func() {
-		out, isErr := h.send("s1", "echo one\necho two\necho three")
+		out, isErr := h.call("send_command", map[string]any{"session": "s1", "line": "echo one\necho two\necho three", "wait_seconds": 10}) // outlasts the hub's 2s status wait
 		res <- result{out, isErr}
 	}()
 	closeOutputWhenShown(t, f, c)
 	select {
 	case r := <-res:
-		if !strings.Contains(r.out, "Session ended") || !strings.Contains(r.out, "weren't sent") {
+		// the shared console's hub words the cut-off its own way
+		if !strings.Contains(r.out, "Session ended") && !strings.Contains(r.out, "connection to the console dropped") || !strings.Contains(r.out, "weren't sent") && !strings.Contains(r.out, "nothing more was sent") {
 			t.Errorf("batch cut short by EOF did not say so: %q %v", r.out, r.isErr)
 		}
 	case <-time.After(5 * time.Second):
@@ -643,7 +646,9 @@ func TestEOFWithBlockedSendDoesNotWaitOnTyper(t *testing.T) {
 	}
 	f.setStuck()
 	res := make(chan error, 1)
-	go func() { res <- c.runLine(context.Background(), "uptime", 30*time.Second) }()
+	go func() {
+		res <- leased(c, func(ctx context.Context) error { return c.runLine(ctx, "uptime", 30*time.Second) })
+	}()
 	select {
 	case <-f.blocked: // the typer is inside Send
 	case <-time.After(5 * time.Second):
@@ -652,12 +657,12 @@ func TestEOFWithBlockedSendDoesNotWaitOnTyper(t *testing.T) {
 	f.pw.Close() // output EOF; Done is withheld
 	select {
 	case <-c.eofC:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second): // after the hub's 2s status wait
 		t.Fatal("output EOF not seen: the drain waited on the blocked writer")
 	}
 	select {
 	case <-res:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("the send kept waiting after the output closed")
 	}
 	deadline := time.Now().Add(6 * time.Second) // the 2s status wait, then the end is recorded
@@ -673,4 +678,15 @@ func TestEOFWithBlockedSendDoesNotWaitOnTyper(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// leased runs fn holding the keyboard, as a tool call does: the hub refuses
+// typing from a client that has no lease.
+func leased(c *session, fn func(context.Context) error) error {
+	ctx, _, release, err := c.keyboard(context.Background())
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn(ctx)
 }

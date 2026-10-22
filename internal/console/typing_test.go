@@ -787,6 +787,10 @@ func TestLeavingALocalConsoleStillDropsItsOwnQueue(t *testing.T) {
 	r.paste(strings.Repeat("x", 100))
 	g.held(t)
 	r.k.Input([]byte(string(rune(escapeByte)) + "."))
+	// The typer reports a clear shortly after it returns, not before.
+	for end := time.Now().Add(2 * time.Second); r.con.Pending() != 0 && time.Now().Before(end); {
+		time.Sleep(time.Millisecond)
+	}
 	if r.con.Pending() != 0 || g.disconnects != 1 {
 		t.Errorf("pending %d, disconnects %d; want the local typer cleared and the console disconnected", r.con.Pending(), g.disconnects)
 	}

@@ -71,22 +71,25 @@ type hangupper interface {
 // or query, and the closure runs there, one at a time, in the order posted. So
 // a decision (may this client type? may the AI tool have the keyboard?) and the
 // change it makes are never interleaved with anything else, and no lock is
-// needed for them. Nothing in the loop waits on the network, the link, the
-// typer or a timer: a blocking operation (a link operation, a call into the
-// typer) runs in a goroutine of its own, and posts its result back when it
-// ends. While a link operation or an erase runs the hub is busy, and window
+// needed for them. Nothing in the loop waits on the network, the link or a
+// timer: a blocking operation (a link operation) runs in a goroutine of its
+// own, and posts its result back when it ends. The typer never blocks its
+// callers (a stuck write holds only its own goroutine), so the loop calls it
+// directly. While a link operation or an erase runs the hub is busy, and window
 // input and new leases are refused.
 type hub struct {
-	tr   *console.Transport
-	ty   *typer.Typer
-	stop context.CancelFunc
+	tr      *console.Transport
+	ty      *typer.Typer
+	closeTr func() // closes the transport, once
+	stop    context.CancelFunc
 
 	addr, typ string // which console this is, as the host that opened it resolved it
 
-	ev   chan func()   // closures for the loop
-	quit chan struct{} // closed by shutdown: the loop ends
-	prog chan [2]int   // latest typing progress, for broadcast
-	tx   txLog         // what the typer wrote, from its goroutine to the loop
+	ev      chan func()   // closures for the loop
+	quit    chan struct{} // closed by shutdown: the loop ends
+	prog    chan [2]int   // latest typing progress, for broadcast
+	tx      txLog         // what the typer wrote, from its goroutine to the loop
+	sending atomic.Bool   // the typer is inside the link's Send
 
 	closeOnce   sync.Once
 	releaseOnce sync.Once
@@ -112,12 +115,6 @@ type hub struct {
 	gen       int  // changes whenever the AI tool's keyboard is taken back
 	writing   bool // the AI tool's write is being typed
 	busy      int  // exclusive link operations (BREAK, toggle...) and an agent's erase running; window input and new leases wait for 0
-
-	// The typer is used one operation at a time, outside the loop (a write that
-	// sticks in the link holds the typer, and must not hold the loop): tyq is
-	// what waits for it, tyBusy that an operation is running.
-	tyq    []tyop
-	tyBusy bool
 
 	// What is on the console's line, from the bytes the typer has written.
 	segs      []seg // who queued the bytes the typer has taken and not yet written, in order
@@ -150,28 +147,6 @@ const (
 
 // seg is a run of bytes handed to the typer by one kind of client.
 type seg struct{ who, n int }
-
-// tyop is one operation on the typer.
-type tyop struct {
-	kind int
-	b    []byte
-	who  int
-	// then is told, in the loop, once the typer has taken an enqueue (or at
-	// once if it is dropped first) and gets the channel that closes when the
-	// bytes are written or dropped. after runs in the loop when a clear is done.
-	then  func(done <-chan struct{})
-	after func()
-}
-
-const (
-	tyEnq = iota
-	tyClear
-	tyUrgent
-)
-
-// closedChan stands for the written-or-dropped signal of bytes dropped before
-// the typer had them.
-var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
 
 // escape sequence states of the user's typing.
 const (
@@ -254,12 +229,20 @@ func newHub(tr *console.Transport) *hub {
 	h := &hub{tr: tr, stop: cancel, peers: map[*peer]struct{}{}, kind: tr.Kind,
 		ev: make(chan func()), quit: make(chan struct{}), prog: make(chan [2]int, 1),
 		tx: txLog{wake: make(chan struct{}, 1)}}
+	h.closeTr = sync.OnceFunc(func() {
+		if tr.Close != nil {
+			tr.Close()
+		}
+	})
 	h.ty = console.NewTyper(tr.Link, tr.Pacing)
 	h.ty.Progress = h.progress
 	go h.loop()
 	go func() {
 		err := h.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
-			if err := tr.Link.Send(b); err != nil {
+			h.sending.Store(true)
+			err := tr.Link.Send(b)
+			h.sending.Store(false)
+			if err != nil {
 				// Recorded before the typer is told, so a write waiting on the
 				// dropped bytes sees why; a failed write was not typed.
 				h.tx.add(nil, err)
@@ -383,76 +366,27 @@ func (h *hub) drain() {
 // pending is how much is waiting for the typer, or in it, with the line's
 // state brought up to date with everything that is not.
 func (h *hub) pending() int {
-	n := len(h.tyq) + h.ty.Queued()
-	if h.tyBusy {
-		n++
-	}
+	n := h.ty.Queued()
 	h.drain()
 	return n
 }
 
-// enqueue queues b behind everything already queued.
+// enqueue queues b behind everything already queued. then, if set, gets the
+// channel that closes once b is written or dropped.
 func (h *hub) enqueue(b []byte, who int, then func(done <-chan struct{})) {
-	h.tyq = append(h.tyq, tyop{kind: tyEnq, b: b, who: who, then: then})
-	h.typerNext()
+	h.segs = append(h.segs, seg{who, len(b)})
+	done := h.ty.Enqueue(b)
+	if then != nil {
+		then(done)
+	}
 }
 
-// clearQueue drops what is queued, here and in the typer. What was written
-// before is accounted for, and nothing dropped is; after runs once that is so.
-func (h *hub) clearQueue(after func()) {
-	var keep []tyop // what is urgent goes out whatever is cleared after it
-	var dropped []func(<-chan struct{})
-	for _, op := range h.tyq {
-		switch {
-		case op.kind != tyEnq:
-			keep = append(keep, op)
-		case op.then != nil:
-			dropped = append(dropped, op.then)
-		}
-	}
-	h.tyq = append(keep, tyop{kind: tyClear, after: after})
-	for _, then := range dropped {
-		then(closedChan)
-	}
-	h.typerNext()
-}
-
-// typerNext starts the next operation on the typer, if it is idle.
-func (h *hub) typerNext() {
-	if h.tyBusy || len(h.tyq) == 0 {
-		return
-	}
-	op := h.tyq[0]
-	h.tyq = h.tyq[1:]
-	h.tyBusy = true
-	if op.kind != tyClear {
-		h.segs = append(h.segs, seg{op.who, len(op.b)})
-	}
-	go func() {
-		var done <-chan struct{}
-		switch op.kind {
-		case tyEnq:
-			done = h.ty.Enqueue(op.b)
-		case tyClear:
-			h.ty.Clear()
-		case tyUrgent:
-			h.ty.Urgent(op.b)
-		}
-		h.post(func() {
-			h.tyBusy = false
-			if op.kind == tyClear {
-				h.drain()
-				h.segs = nil // all that is left of what the typer had taken is dropped
-			}
-			if op.then != nil && op.kind == tyEnq {
-				op.then(done)
-			}
-			if op.after != nil {
-				op.after()
-			}
-			h.typerNext()
-		})
-	}()
+// clearQueue drops what is queued. What was written before is accounted for,
+// and nothing dropped is.
+func (h *hub) clearQueue() {
+	h.ty.Clear()
+	h.drain()
+	h.segs = nil // all that is left of what the typer had taken is dropped
 }
 
 // pump shares the console's output until it ends, then tells everyone. It is
@@ -512,6 +446,12 @@ func (h *hub) end(res console.Result) {
 		h.queue(p, msg{T: tEnd, Code: res.Code, Text: text})
 	}
 	h.stop()
+	// A write still stuck in the link will never finish: the console is gone.
+	// Close the transport so it fails and the typer's goroutine ends (shutdown
+	// closes it too, and gets to it first if the host closed the console).
+	if h.sending.Load() {
+		go h.closeTr()
+	}
 }
 
 // Not in the loop.
@@ -523,9 +463,7 @@ func (h *hub) shutdown() {
 	h.closeOnce.Do(func() {
 		res := console.Result{Err: errors.New("the oob that opened this console closed it")}
 		h.query(func() { h.end(res) })
-		if h.tr.Close != nil {
-			h.tr.Close()
-		}
+		h.closeTr()
 		if h.onClose != nil {
 			h.onClose()
 		}
@@ -829,9 +767,9 @@ func (h *hub) typeWindow(b []byte, urgent bool) {
 		h.enqueue(b, byUser, nil)
 		return
 	}
-	h.clearQueue(nil)
-	h.tyq = append(h.tyq, tyop{kind: tyUrgent, b: b, who: byUser})
-	h.typerNext()
+	h.clearQueue()
+	h.segs = append(h.segs, seg{byUser, len(b)})
+	h.ty.Urgent(b)
 }
 
 // agentName is how the AI tool is named to windows.
@@ -898,7 +836,7 @@ func (h *hub) userClear(p *peer) {
 	if p.agent || h.lease || h.busy > 0 || h.closed {
 		return
 	}
-	h.clearQueue(nil)
+	h.clearQueue()
 }
 
 // trackUser follows what the user has typed and not entered, so an AI tool
@@ -991,7 +929,8 @@ func (h *hub) revoke(then func(note, reason string)) {
 	// (gen). Otherwise a window's keys could land in the middle of the erase.
 	h.gen++
 	h.busy++
-	h.clearQueue(func() { h.erase(then) }) // then the line's state is what was typed, no more
+	h.clearQueue() // then the line's state is what was typed, no more
+	h.erase(then)
 }
 
 // erase undoes what revoke found the AI tool had left on the line.
@@ -1316,12 +1255,10 @@ func (h *hub) linkOp(p *peer, m msg, reply func(msg, error)) {
 		dirty, clear = h.pending() > 0 || h.lineDirty, true
 	}
 	h.busy++
-	run := func() { go h.runLinkOp(m, dirty, reply) }
 	if clear {
-		h.clearQueue(run) // typed input is dropped before the link is used
-	} else {
-		run()
+		h.clearQueue() // typed input is dropped before the link is used
 	}
+	go h.runLinkOp(m, dirty, reply)
 }
 
 // runLinkOp uses the link, outside the loop, and posts the result back.

@@ -755,11 +755,14 @@ func (c *Client) Close() error {
 	close(c.done)
 	link, ho := c.link, c.holder
 	c.mu.Unlock()
-	if link != nil {
-		link.Close()
-	}
+	// The hub ends before this client's link drops: the hub's own typing (the
+	// erase of an AI tool's unsent text when it leaves) must not reach a
+	// console that is being closed.
 	if ho != nil && !ho.hub.hostLeft(c.opt.NoLinger) {
 		ho.hub.shutdown()
+	}
+	if link != nil {
+		link.Close()
 	}
 	c.end(console.Result{Err: ErrClosed})
 	return nil
