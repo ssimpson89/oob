@@ -282,3 +282,29 @@ func TestServerExitReleasesAConsoleAWindowIsOn(t *testing.T) {
 		t.Error("the console was left open")
 	}
 }
+
+// A window's switch to the BMC prompt is known from the shared console's state
+// before any output follows, and what the agent types there needs approval.
+func TestAgentTypingAtTheBMCPromptAWindowSwitchedToNeedsApproval(t *testing.T) {
+	h := start(t, Options{}, "decline")
+	h.setup = func(f *fakeHost) { f.toggle, f.silent = true, true }
+	h.connect()
+	w := window(t)
+	if _, _, err := w.Toggle(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the agent's client sees the BMC prompt", func() bool { return c.sh.Status().AtPrompt })
+	if out, isErr := h.send("s1", "uname -r"); !isErr || !strings.Contains(out, "declined") {
+		t.Errorf("send_command at the BMC prompt: %q %v", out, isErr)
+	}
+	if !strings.Contains(h.askedAll(), "BMC's own command line") {
+		t.Errorf("the question: %q", h.askedAll())
+	}
+	if got := h.host("node01").entered(); len(got) != 0 {
+		t.Errorf("the host ran %q", got)
+	}
+}

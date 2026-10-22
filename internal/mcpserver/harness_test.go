@@ -121,6 +121,7 @@ type fakeHost struct {
 	prompt   string
 	asking   string // a question waiting for y or n
 	toggle   bool   // behaves like iLO/iDRAC: has a BMC prompt
+	silent   bool   // the switch to the BMC prompt prints nothing until something is typed
 	atBMC    bool
 	respond  func(f *fakeHost, cmd string) bool // true if it handled the command
 
@@ -386,6 +387,9 @@ func (f *fakeHost) transport() *bmc.ConsoleTransport {
 			f.atBMC = !f.atBMC
 			at := f.atBMC
 			f.mu.Unlock()
+			if f.silent {
+				return map[bool]string{true: "ilo cli", false: "vsp"}[at], at, nil
+			}
 			if at {
 				f.emit("\r\n</>hpiLO-> ")
 				return "ilo cli", true, nil
