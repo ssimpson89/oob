@@ -85,7 +85,9 @@ func (l *logWriter) Write(raw []byte) error {
 // never splits a line: while one is open the marker waits for its end.
 func (l *logWriter) Mark(msg string) error {
 	m := fmt.Sprintf("--- %s %s ---\n", time.Now().Format("15:04:05"), msg)
-	if l.c.Partial() != "" {
+	// Queue behind anything already held too: an erased line leaves Partial()
+	// empty while older markers still wait, and order must be kept.
+	if l.c.Partial() != "" || len(l.held) > 0 {
 		l.held = append(l.held, m...)
 		return nil
 	}

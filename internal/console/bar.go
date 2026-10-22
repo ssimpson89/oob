@@ -400,7 +400,9 @@ func scanSeqs(b []byte) (clobber, pasteOff bool, cut int) {
 				clobber = true
 			}
 		case 'J':
-			if params == "2" || params == "3" {
+			// CSI J (no parameter) and 0J erase through the bottom row, the
+			// bar's, whatever the scroll region is.
+			if params == "" || params == "0" || params == "2" || params == "3" {
 				clobber = true
 			}
 		case 'h', 'l':

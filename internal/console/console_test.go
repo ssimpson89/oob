@@ -217,7 +217,10 @@ func TestClobbers(t *testing.T) {
 		"\x1bc":                 true,
 		"\x1b[2J":               true,
 		"\x1b[3J":               true,
-		"\x1b[J":                false,
+		"\x1b[J":                true,
+		"\x1b[0J":               true,
+		"\x1b[1J":               false,
+		"\x1b[H\x1b[J":          true,
 		"\x1b[!p":               true,
 		"abc\x1b[H\x1b[2;3Hxyz": false,
 	} {
@@ -956,5 +959,38 @@ func TestBarSelectsNormalCharset(t *testing.T) {
 	i, j := strings.Index(s, "\x1b(B\x0f"), strings.Index(s, "\x1b[?7l")
 	if i < 0 || j < i || !strings.HasSuffix(s, "\x1b8") {
 		t.Errorf("repaint order wrong: %q", s)
+	}
+}
+
+func TestEraseToEndOfScreenRepaintsBar(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	out.Reset()
+	c.Output([]byte("\x1b[H\x1b[J"))
+	if !strings.Contains(out.String(), "\x1b[24;1H") {
+		t.Errorf("bar not repainted after CSI H CSI J: %q", out.String())
+	}
+}
+
+func TestLogMarkersKeepOrderAfterErasedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n.log")
+	l, err := openLog(path, "hdr", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Write([]byte("prompt"))
+	_ = l.Mark("first")
+	_ = l.Write([]byte("\r\x1b[2K"))
+	_ = l.Mark("second")
+	_ = l.Write([]byte("done\r\n"))
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	i, j := strings.Index(string(b), "first ---"), strings.Index(string(b), "second ---")
+	if i < 0 || j < 0 || i > j {
+		t.Errorf("markers out of order (first=%d second=%d):\n%s", i, j, b)
 	}
 }
