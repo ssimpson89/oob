@@ -164,11 +164,9 @@ func iloDo(name string, h config.Host, cmd string, timeout time.Duration, noProm
 // errILOSoft explains that the iLO CLI has no graceful shutdown.
 var errILOSoft = errors.New("the iLO CLI has no graceful shutdown (soft). Use Redfish (GracefulShutdown, needs port 443), or `power off` for a hard power off, or enable IPMI over LAN on the iLO (iLO Settings > Access > IPMI/DCMI over LAN) and set the host type to \"ipmi\" (oob edit)")
 
-// errILOCycleCmd is for cycle and reset, which the driver builds from off,
-// wait, on (iloCycle) because the iLO CLI has no single command for them.
-var errILOCycleCmd = errors.New("the iLO CLI has no single cycle or reset command; the driver runs power off, waits for off, then power on")
-
-// iloPowerCmd maps a power action to the iLO CLI command.
+// iloPowerCmd maps a power action to the iLO CLI command. cycle and reset have
+// no single command; the driver builds them from off, wait, on (iloCycle) before
+// it gets here.
 func iloPowerCmd(act string) (string, error) {
 	switch act {
 	case "status":
@@ -177,8 +175,6 @@ func iloPowerCmd(act string) (string, error) {
 		return "power on", nil
 	case "off":
 		return "power off", nil
-	case "cycle", "reset":
-		return "", errILOCycleCmd
 	case "soft":
 		return "", errILOSoft
 	}
