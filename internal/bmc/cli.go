@@ -317,6 +317,12 @@ func (l *cliLink) Disconnect() error {
 	return nil
 }
 
+// Hangup closes the session without sending the console escape or "exit".
+func (l *cliLink) Hangup() error {
+	l.disconnected.Store(true)
+	return l.closeSess()
+}
+
 // Like SOL, the remote shell only learns the size if it is typed at it.
 func (l *cliLink) FitSize(rows, cols int) error {
 	if l.plain {

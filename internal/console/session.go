@@ -34,6 +34,13 @@ type Link interface {
 	SizeIsFree() bool
 }
 
+// hangupper is a link that can end the session without typing anything at the
+// remote. The console uses it instead of Disconnect when the remote line holds
+// unsubmitted input.
+type hangupper interface {
+	Hangup() error
+}
+
 // toggler is a link that can switch between the host console and the BMC's own
 // CLI prompt (c key). It returns the bar label and whether it is at the prompt.
 type toggler interface {
@@ -519,8 +526,17 @@ func (k *consoleKeys) do(a action) {
 		// console's queue is the hub's, with other windows' and the AI tool's
 		// typing in it: a window leaving must not clear it. (The window that
 		// opened the console ends it, and the hub drops the queue itself.)
+		// Decide before clearing: the clean disconnect may type at the remote
+		// (IPMI SOL's escape starts with a CR), and over a dirty line or a
+		// part-sent paste that CR would submit a truncated command.
 		if k.ty != nil {
+			dirty := k.ty.Queued() > 0 || k.lineDirty.Load()
 			k.ty.Clear()
+			if h, ok := cs.Link.(hangupper); ok && dirty {
+				con.Note("input is pending on the line: hanging up without typing", false)
+				_ = h.Hangup()
+				return
+			}
 		}
 		_ = cs.Link.Disconnect()
 	case actAI:

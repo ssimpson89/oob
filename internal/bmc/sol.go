@@ -27,6 +27,21 @@ const solEscape byte = 0x1e // ctrl+^
 type solLink struct {
 	ptmx *os.File
 	cmd  *exec.Cmd
+	// hungUp is set by Hangup: the client was killed, so the BMC may still
+	// hold the session and the caller must run Release.
+	hungUp atomic.Bool
+}
+
+// Hangup ends the client without typing anything at the console. Disconnect's
+// escape starts with a CR, which would submit whatever is on the remote line.
+// Killing ipmitool leaves the BMC holding the session; the caller runs the
+// transport's Release (sol deactivate) afterwards.
+func (s *solLink) Hangup() error {
+	s.hungUp.Store(true)
+	if s.cmd.Process != nil {
+		return s.cmd.Process.Kill()
+	}
+	return nil
 }
 
 func (s *solLink) Send(b []byte) error { _, err := s.ptmx.Write(b); return err }
