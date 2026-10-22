@@ -41,6 +41,10 @@ type hangupper interface {
 	Hangup() error
 }
 
+// disconnectWait bounds how long a disconnect waits for the link's own
+// Disconnect before hanging up. It is a var so tests can shorten it.
+var disconnectWait = 5 * time.Second
+
 // toggler is a link that can switch between the host console and the BMC's own
 // CLI prompt (c key). It returns the bar label and whether it is at the prompt.
 type toggler interface {
@@ -491,13 +495,27 @@ func (k *consoleKeys) do(a action) {
 		// (IPMI SOL's escape starts with a CR), and over a dirty line or a
 		// part-sent paste that CR would submit a truncated command.
 		dirty := k.ty.Queued() > 0 || k.lineDirty.Load()
-		k.ty.Clear()
+		k.ty.Clear() // never waits on the writer, which may be blocked in Send
 		if h, ok := cs.Link.(hangupper); ok && dirty {
 			con.Note("input is pending on the line: hanging up without typing", false)
 			_ = h.Hangup()
 			return
 		}
-		_ = cs.Link.Disconnect()
+		// Disconnect may type at the remote, and a write to a stuck transport
+		// can block for good. Run it aside and, if it has not returned in
+		// time, close the transport out-of-band so the user is never stuck.
+		done := make(chan struct{})
+		go func() {
+			_ = cs.Link.Disconnect()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(disconnectWait):
+			if h, ok := cs.Link.(hangupper); ok {
+				_ = h.Hangup()
+			}
+		}
 	case actHelp:
 		con.Print(helpText())
 	}
