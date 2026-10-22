@@ -6,7 +6,6 @@ import (
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
-	"github.com/ssimpson89/oob/internal/typer"
 	"strings"
 	"testing"
 	"time"
@@ -605,16 +604,26 @@ func TestCtrlUAfterCursorMoveDoesNotClear(t *testing.T) {
 
 // 4342334651: the call's time budget covers every Enter in the payload.
 func TestTypingBudgetCountsEveryEnter(t *testing.T) {
-	c := &session{ty: &typer.Typer{CharDelay: time.Millisecond, LineDelay: 100 * time.Millisecond, Paced: func() bool { return true }}}
+	char, line := time.Millisecond, 100*time.Millisecond
+	link := &fakeSerial{serial: true}
+	c := &session{tr: &console.Transport{Link: link, Pacing: console.Pacing{Char: &char, Line: &line}}}
 	wire := []byte("ab\rcd\ref\r") // 9 bytes, 3 Enters, one more allowed for a pending Enter
 	if got, want := c.typingBudget(wire), 9*time.Millisecond+4*100*time.Millisecond; got != want {
 		t.Errorf("budget %s, want %s", got, want)
 	}
-	c.ty.Paced = func() bool { return false }
+	link.serial = false
 	if got := c.typingBudget(wire); got != 0 {
 		t.Errorf("budget %s on an unpaced console, want 0", got)
 	}
 }
+
+// fakeSerial is a link that says whether it is a serial line.
+type fakeSerial struct {
+	console.Link
+	serial bool
+}
+
+func (l *fakeSerial) Serial() bool { return l.serial }
 
 // 4342334698: a hangup while the queue is pacing drops the rest; the call must
 // say so rather than report success.

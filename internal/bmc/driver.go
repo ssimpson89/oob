@@ -96,13 +96,6 @@ func untestedNoteLater(vendor string) {
 	}
 }
 
-// resetUntestedNote lets tests see the note again.
-func resetUntestedNote() {
-	untestedMu.Lock()
-	untestedDone = false
-	untestedMu.Unlock()
-}
-
 // UnknownPowerError is the error for a power action no driver knows.
 func UnknownPowerError(act string) error { return fmt.Errorf("unknown power action %q", act) }
 
@@ -174,7 +167,7 @@ func (d *ipmiDriver) Console(o SOLOptions) error {
 		}
 	}
 	if !o.Raw && console.UseBar() {
-		return app.Code(solConsole(d.h, d.name, d.ConsolePower()))
+		return app.Code(solConsole(d.h, d.name, d.ConsolePower(), nil))
 	}
 	fmt.Fprintln(os.Stderr, "Connecting to SOL on "+d.name+". Disconnect with ~. (tilde, dot) at the start of a line (~~. inside an outer ssh session).")
 	return app.Code(RunIPMI(d.h, "sol", "activate"))

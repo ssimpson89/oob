@@ -729,6 +729,73 @@ func TestZeroDelaysMakeEscapePasteAPlainWrite(t *testing.T) {
 	d.waitSent(t, 3)
 }
 
+// recQueue is a shared console's queue as a window sees it: it records what
+// the window asked of it.
+type recQueue struct {
+	mu         sync.Mutex
+	enq        [][]byte
+	urgent     [][]byte
+	clears     int
+	onProgress func(pending, total int)
+}
+
+func (q *recQueue) Enqueue(b []byte) <-chan struct{} {
+	q.mu.Lock()
+	q.enq = append(q.enq, append([]byte(nil), b...))
+	q.mu.Unlock()
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+func (q *recQueue) Urgent(b []byte) { q.mu.Lock(); q.urgent = append(q.urgent, b); q.mu.Unlock() }
+func (q *recQueue) Clear()          { q.mu.Lock(); q.clears++; q.mu.Unlock() }
+func (q *recQueue) OnProgress(f func(pending, total int)) {
+	q.mu.Lock()
+	q.onProgress = f
+	q.mu.Unlock()
+}
+func (q *recQueue) cleared() int { q.mu.Lock(); defer q.mu.Unlock(); return q.clears }
+
+func TestLeavingASharedWindowDoesNotClearTheHubsQueue(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&outLocked{w: &out}, "node01", "sol", 24, 80)
+	con.Start()
+	t.Cleanup(func() { con.Close() })
+	q := &recQueue{}
+	fl := &fakeLink{}
+	k := newKeys(&Setup{Link: fl, Queue: q}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	esc := string(rune(escapeByte))
+	k.Input([]byte(esc + ".")) // disconnect: a joined window just leaves
+	if fl.disconnects != 1 {
+		t.Fatalf("disconnects = %d", fl.disconnects)
+	}
+	if n := q.cleared(); n != 0 {
+		t.Errorf("leaving cleared the hub's queue %d times; it holds other windows' and the AI tool's typing", n)
+	}
+	// The explicit clear key still does: that is the user asking for it.
+	k.Input([]byte(esc + "x"))
+	if n := q.cleared(); n != 1 {
+		t.Errorf("ctrl+] x cleared %d times, want 1", n)
+	}
+}
+
+func TestLeavingALocalConsoleStillDropsItsOwnQueue(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	r.paste(strings.Repeat("x", 100))
+	g.held(t)
+	r.k.Input([]byte(string(rune(escapeByte)) + "."))
+	// The typer reports a clear shortly after it returns, not before.
+	for end := time.Now().Add(2 * time.Second); r.con.Pending() != 0 && time.Now().Before(end); {
+		time.Sleep(time.Millisecond)
+	}
+	if r.con.Pending() != 0 || g.disconnects != 1 {
+		t.Errorf("pending %d, disconnects %d; want the local typer cleared and the console disconnected", r.con.Pending(), g.disconnects)
+	}
+}
+
 // ctrlCGate is a link whose Send of ctrl+c blocks until released, like an
 // interrupt still in flight to the BMC.
 type ctrlCGate struct {

@@ -280,7 +280,7 @@ func sshExec(name string, h config.Host, cmd string, timeout time.Duration) (str
 	}
 	app.Progressf("connecting to %s via SSH...", name)
 	det := detect.NewDetector(name, h)
-	cl, err := sshx.ConnectOpts(h, kh, det.Banner)
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner})
 	if err != nil {
 		return "", fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}

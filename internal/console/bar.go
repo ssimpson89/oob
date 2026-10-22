@@ -107,6 +107,13 @@ type barState struct {
 	noteErr  bool
 	// sending is "1.2k/4k" while a big queue is being typed, else "".
 	sending string
+	// shared is the console's other users, as "shared · AI connected"; "" when
+	// the console is shared with nobody, or not shared.
+	shared string
+	// sharing: the console is shared, so the i key does something.
+	sharing bool
+	// aiPaused: the i key resumes the AI tool.
+	aiPaused bool
 }
 
 // commandLayouts builds the command-mode bar: all hints first, then one fewer
@@ -124,6 +131,10 @@ func commandLayouts(st barState) []layout {
 			keys[i].short = "auto-size off"
 		case keys[i].act == actStop && st.sending == "":
 			keys[i].short = ""
+		case keys[i].act == actAI && !st.sharing:
+			keys[i].short = ""
+		case keys[i].act == actAI && st.aiPaused:
+			keys[i].short = "resume AI"
 		}
 	}
 	dropped := 0
@@ -191,6 +202,9 @@ func barLine(st barState, w int) string {
 	if st.logging {
 		log = []seg{{"  [log]", false}}
 	}
+	if st.shared != "" {
+		log = append(log, seg{"  [" + st.shared + "]", false})
+	}
 	var note, noteShort []seg
 	switch {
 	case st.sending != "":
@@ -217,7 +231,6 @@ func barLine(st barState, w int) string {
 	}
 	layouts = append(layouts,
 		layout{slices.Concat(name, log), quit},
-		layout{slices.Concat(name, log), keys},
 		layout{slices.Concat(name, log), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}, log, noteShort), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}, log), keys},

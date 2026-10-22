@@ -15,9 +15,9 @@ import (
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/detect"
+	"github.com/ssimpson89/oob/internal/share"
 	"github.com/ssimpson89/oob/internal/sshx"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 // The generic SSH CLI console shared by the vendor drivers: an interactive
@@ -231,7 +231,7 @@ func cliDial(name string, h config.Host, sp cliSpec, rows, cols int) (*cliSessio
 		return nil, nil, nil, err
 	}
 	det := detect.NewDetector(name, h)
-	cl, err := sshx.ConnectOpts(h, kh, det.Banner)
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}
@@ -348,6 +348,24 @@ func (l *cliLink) Serial() bool {
 	return !l.atPrompt
 }
 
+// MapInput fits what is typed to a console that reads ESC as a two-byte
+// escape (iLO VSP), in the console only: at the BMC's own prompt, on a plain
+// ssh session and on every other vendor the bytes go through as they are.
+// The console's own escape (Toggle, Disconnect) goes through Send, not here,
+// so it is the only way ESC ( is ever sent.
+func (l *cliLink) MapInput(b []byte) ([]byte, string) {
+	if !l.sp.vspEsc || l.plain {
+		return b, ""
+	}
+	l.mu.Lock()
+	at := l.atPrompt
+	l.mu.Unlock()
+	if at {
+		return b, ""
+	}
+	return console.MapVSPInput(b)
+}
+
 func (l *cliLink) SizeIsFree() bool { return l.plain }
 
 // stateLocked returns the bar label for where the session is now. The caller
@@ -453,7 +471,10 @@ type cliSpec struct {
 	start      []string       // commands typed at the prompt; the last one starts the console
 	esc        []byte         // console escape sequence: console -> CLI prompt
 	breakMsg   string
-	label      string // for the progress line
+	// vspEsc: the console reads ESC with the byte after it (iLO VSP), so input
+	// is mapped. See MapInput.
+	vspEsc bool
+	label  string // for the progress line
 }
 
 // consoleStartWait is how long cliOpen waits for a console to say it started.
@@ -506,22 +527,16 @@ func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTr
 	}, nil
 }
 
-// cliConsole opens the CLI, starts the console and hands over to the bar.
+// cliConsole opens the CLI, starts the console and hands over to the bar. The
+// console is shared: if another oob already has it open (an iLO allows one VSP
+// session, so a second connection couldn't work), this joins it instead.
 func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, error)) (int, error) {
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return 1, err
-	}
-	app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
-	tr, err := cliOpen(name, h, sp, console.RemoteRows(rows), w)
-	if err != nil {
-		return 1, err
-	}
-	defer tr.Close()
-	return console.Run(console.Setup{
-		Host: name, Kind: sp.kind,
-		Link: tr.Link, Out: tr.Out, Done: tr.Done,
-		Power: power, Pacing: tr.Pacing,
+	return share.RunConsole(h, name, share.Console{
+		Power: power,
+		Open: func(rows, cols int) (*ConsoleTransport, error) {
+			app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
+			return cliOpen(name, h, sp, rows, cols)
+		},
 	})
 }
 

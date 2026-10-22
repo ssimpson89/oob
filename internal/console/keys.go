@@ -29,6 +29,7 @@ const (
 	actPower
 	actDisconnect
 	actHelp
+	actAI          // pause the AI tool, or let it type again
 	actCancel      // left command mode with nothing done (unknown key, n)
 	actStop        // clear the typing queue (x, or esc in command mode)
 	actPaste       // bracketed paste finished: action.text is the pasted text
@@ -73,6 +74,7 @@ var commandKeys = []binding{
 	{"b", actBreak, "break", "Send BREAK", 7, true},
 	{"c", actBMC, "bmc prompt", "Toggle between the host console and the BMC's own CLI prompt (iLO, iDRAC, Supermicro SSH SOL; not IPMI SOL)", 3, true},
 	{"r", actSysrq, "r+key", "SysRq: BREAK, then the next key (r then b reboots a Linux console)", 6, true},
+	{"i", actAI, "pause AI", "Pause the AI tool using this shared console, or let it type again", 5, false},
 	{"x", actStop, "clear queue", "Drop what is still queued to be typed, such as a big paste (esc does the same)", 1, false},
 	{"p", actPower, "power cycle", "Power cycle the machine (asks y/n; ipmitool, or off then on over a second SSH connection on an iLO)", 5, true},
 	{"]", actLiteral, "send ^]", "Send ctrl+] itself", 2, true},
@@ -344,6 +346,8 @@ func (p *keyParser) command(c byte) []action {
 		return nil
 	case ']', escapeByte: // ctrl+] twice also sends it, as in telnet
 		return []action{{act: actLiteral}}
+	case 'i':
+		return []action{{act: actAI}}
 	case 'x':
 		return []action{{act: actStop}}
 	case 'p':

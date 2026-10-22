@@ -778,13 +778,13 @@ func TestDisconnectDoesNotWaitOnBlockedSend(t *testing.T) {
 	}
 }
 
-// A clean-line Disconnect that itself blocks is bounded: after disconnectWait
+// A clean-line Disconnect that itself blocks is bounded: after linkWait
 // the link is hung up.
 func TestDisconnectHangsUpWhenLinkDisconnectBlocks(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	old := disconnectWait
-	disconnectWait = 50 * time.Millisecond
-	defer func() { disconnectWait = old }()
+	old := linkWait
+	linkWait = 50 * time.Millisecond
+	defer func() { linkWait = old }()
 	var out bytes.Buffer
 	con := newConsole(&out, "h", "sol", 24, 80)
 	con.Start()
@@ -807,3 +807,42 @@ type stuckDisconnect struct {
 
 func (s *stuckDisconnect) Disconnect() error { <-s.closed; return nil }
 func (s *stuckDisconnect) Hangup() error     { close(s.closed); return nil }
+
+// A switch to the BMC prompt that never returns doesn't hold the input loop: it
+// is bounded, and the link is hung up.
+func TestToggleHangsUpWhenTheLinkDoesNotAnswer(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	old := linkWait
+	linkWait = 50 * time.Millisecond
+	defer func() { linkWait = old }()
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "ilo", 24, 80)
+	con.Start()
+	defer con.Close()
+	tl := &stuckToggle{closed: make(chan struct{})}
+	k := newKeys(&Setup{Link: tl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	done := make(chan struct{})
+	go func() { k.Input([]byte(string(rune(escapeByte)) + "c")); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the input loop waited on the stuck toggle")
+	}
+	select {
+	case <-tl.closed:
+	default:
+		t.Error("the link was not hung up")
+	}
+}
+
+type stuckToggle struct {
+	hangLink
+	closed chan struct{}
+}
+
+func (s *stuckToggle) Toggle() (string, bool, error) {
+	<-s.closed
+	return "", false, errors.New("closed")
+}
+func (s *stuckToggle) Hangup() error { close(s.closed); return nil }

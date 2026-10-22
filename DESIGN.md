@@ -90,6 +90,18 @@ The console runs headless through `Driver.OpenConsole`, which returns a `bmc.Con
 exit, optional BMC-prompt toggle). `oob sol` builds the same transports (`openSOL`, `cliOpen`) and adds the bar
 on top. `console.Transcript` keeps the 10000-line history, the read position and the optional log.
 
+## Shared consoles
+An iLO allows one VSP session, so the user's window and the agent can't hold separate connections. `internal/share`
+(adapted from bauddy's `internal/share`) makes one process own the console: a flock on
+`$XDG_STATE_HOME/oob/share/<host>.lock` elects it, and it runs a hub on `<host>.sock`. Every client, the owner's own
+included, talks to the hub through `share.Client` (the owner over an in-memory pipe). The hub owns the
+`console.Transport` and one paced `typer`, so input from all clients is serialized; output is fanned out. The AI
+client takes a lease per tool call and the hub refuses it while the user paused it or is typing, as in bauddy.
+Differences from bauddy: no takeover when the owner exits (reopening means a BMC login, a race with the BMC's own
+timeout for the old session), so the others are told the console closed; an MCP owner keeps the hub until the last
+window leaves; the AI's writes are requests answered once typed, because the typer is slow and the tools wait on it.
+`oob sol` and `oob mcp` both go through `share.Open`; a console no one else uses behaves as before.
+
 ## Console scrollback
 The bar uses a DECSTBM scroll region on the normal screen (not the alternate screen), so lines
 that scroll off the top stay in the terminal's native scrollback. Checked in a plain terminal;

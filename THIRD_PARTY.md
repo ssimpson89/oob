@@ -14,6 +14,10 @@ typed-text tracking behind it (`risk.go`, from bauddy's `internal/paste` and `gu
 model, read position and output shaping (`session.go`). Those files carry a header pointing here.
 The plain-text cleaner (`internal/termtext`, used by `internal/console`) is copied from bauddy's
 `internal/termtext`. That file carries a header pointing here.
+The shared console (`internal/share`: `hub.go`, `client.go`, `proto.go`, `lock_unix.go` and their tests) is adapted
+from bauddy's `internal/share`, and `internal/mcpserver/shared.go` from bauddy's `internal/mcpserver/shared.go`:
+the hub and client split, the lease, pause and typing rules, the replay rules and the lock file that elects the owner.
+Those files carry a header pointing here.
 bauddy is by the same author and under the same license as oob (see LICENSE), so this
 notice is for provenance rather than a separate obligation.
 

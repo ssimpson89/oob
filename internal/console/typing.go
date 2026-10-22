@@ -96,14 +96,23 @@ func pasteBytes(text string) []byte {
 // newKeys is a consoleKeys with its typing queue made but not yet running.
 func newKeys(cs *Setup, con *console, cleanup func(), stop <-chan struct{}) *consoleKeys {
 	k := &consoleKeys{cs: cs, con: con, cleanup: cleanup, stop: stop}
+	if cs.Queue != nil {
+		k.q = cs.Queue
+		cs.Queue.OnProgress(con.SetSend)
+		return k
+	}
 	k.ty = NewTyper(cs.Link, cs.Pacing)
 	k.ty.Progress = con.SetSend
+	k.q = k.ty
 	return k
 }
 
 // start runs the typing queue until the session ends. tr, if not nil, records
 // the bytes it writes.
 func (k *consoleKeys) start(tr *trace) {
+	if k.ty == nil { // shared: the hub runs the typer
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-k.stop
@@ -131,11 +140,19 @@ func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 // typeKeys queues keystrokes. ctrl+c is the exception: it jumps the queue,
 // dropping what was waiting, because nothing typed before an interrupt matters.
 func (k *consoleKeys) typeKeys(b []byte) {
+	b, note := k.filter.Map(k.cs.Link, b)
+	k.showKeysNote(note)
 	if i := bytes.LastIndexByte(b, 0x03); i >= 0 {
-		k.ty.Urgent([]byte{0x03})
+		k.q.Urgent([]byte{0x03})
 		b = b[i+1:]
 	}
-	k.ty.Enqueue(b)
+	k.q.Enqueue(b)
+}
+
+func (k *consoleKeys) showKeysNote(note string) {
+	if note != "" && k.noted.CompareAndSwap(false, true) { // once per session
+		k.con.Note(note, false)
+	}
 }
 
 // fitSize makes the remote agree with rows x cols: where that means typing
@@ -143,7 +160,7 @@ func (k *consoleKeys) typeKeys(b []byte) {
 func (k *consoleKeys) fitSize(rows, cols int) error {
 	if sl, ok := k.cs.Link.(sizeLiner); ok {
 		if line, ok := sl.SizeLine(rows, cols); ok {
-			k.ty.Enqueue([]byte(line + "\r"))
+			k.q.Enqueue([]byte(line + "\r"))
 			return nil
 		}
 	}

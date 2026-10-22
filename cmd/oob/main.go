@@ -174,7 +174,7 @@ func doSSH(h config.Host, name string, reset bool, remote []string) error {
 			return err
 		}
 	}
-	cl, err := sshx.ConnectOpts(h, kh, detect.NewDetector(name, h).Banner)
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: detect.NewDetector(name, h).Banner})
 	if err != nil {
 		return fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}

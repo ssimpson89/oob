@@ -18,6 +18,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 const (
@@ -265,6 +266,10 @@ func pattern(q string) *regexp.Regexp {
 	return regexp.MustCompile(expr)
 }
 
+// beforeShareOpen is a test hook that runs after the approval and before the
+// console is joined or opened.
+var beforeShareOpen = func() {}
+
 func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in connectIn) (*mcp.CallToolResult, any, error) {
 	name, h, err := s.hostFor(in.Host, true)
 	if err != nil {
@@ -280,9 +285,22 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	}
 	s.mu.Unlock()
 
-	if in.Force {
-		if res, err := s.approve(req, target{name: name, addr: h.IP, typ: h.Type}, "end any other SOL session on "+name+" and take it over",
-			[]string{whyForce}); res != nil || err != nil {
+	// Joining a console the user has open in an oob window puts the agent in
+	// their live session, so it needs approval. Opening a fresh console doesn't.
+	addr, typ := share.Endpoint(h)
+	joining := share.Exists(name, addr)
+	var what string
+	var whys []string
+	switch {
+	case joining:
+		what = "join the console of " + name + " that your oob window has open: your live session will be shared with the agent"
+		whys = []string{whyJoin}
+	case in.Force:
+		what = "end any other SOL session on " + name + " and take it over"
+		whys = []string{whyForce}
+	}
+	if len(whys) > 0 {
+		if res, err := s.approve(req, target{name: name, addr: h.IP, typ: h.Type}, what, whys); res != nil || err != nil {
 			if err != nil {
 				return fail(err)
 			}
@@ -308,31 +326,50 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	}()
 
 	type opened struct {
-		tr  *bmc.ConsoleTransport
+		cl  *share.Client
 		err error
 	}
+	beforeShareOpen()
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	ch := make(chan opened, 1)
+	who := clientName(req)
 	go func() {
-		tr, err := s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
-		ch <- opened{tr, err}
+		// Join the console if the user already has it open in an oob window (an
+		// iLO allows one VSP session, so a second connection couldn't work);
+		// otherwise open it here, and a window opened later joins this one.
+		cl, err := share.Open(ctx, share.Options{Host: name, Addr: addr, Type: typ, Agent: true, Name: who,
+			Open: func() (*bmc.ConsoleTransport, error) {
+				if joining { // the approval was for joining, not for taking the console over
+					return nil, errors.New("the shared console closed; call connect again")
+				}
+				return s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
+			}})
+		ch <- opened{cl, err}
 	}()
-	var tr *bmc.ConsoleTransport
+	var cl *share.Client
 	select {
 	case o := <-ch:
 		if o.err != nil {
-			return fail("can't open the console on "+name+": ", o.err)
+			return fail("can't open the console on "+name+": ", shareError(o.err))
 		}
-		tr = o.tr
+		cl = o.cl
 	case <-ctx.Done():
 		go func() { // it may still finish; don't leave it open
-			if o := <-ch; o.tr != nil {
-				o.tr.Close()
+			if o := <-ch; o.cl != nil {
+				o.cl.Close()
 			}
 		}()
 		return fail(errTimeout("opening the console on "+name, connectTimeout, false))
 	}
+	if cl.Joined() && !joining {
+		// The user's window opened the console after the check above, so the
+		// approval for joining wasn't asked. Leave, and let the next call ask.
+		cl.Close()
+		return fail("the console on " + name + " was just opened in the user's oob window, so nothing was done. " +
+			"Call connect again: joining it needs the user's approval")
+	}
+	tr := cl.Transport()
 
 	tx := console.NewTranscript(name, tr.Kind)
 	logNote := "Not logging."
@@ -346,7 +383,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	s.mu.Lock()
 	s.nextID++
 	id := fmt.Sprintf("s%d", s.nextID)
-	c := newSession(id, name, tr, tx)
+	c := newSession(id, name, tr, tx, cl)
 	c.addr, c.typ = h.IP, h.Type // what was connected to, whatever the host list says later
 	s.sessions[id] = c
 	s.mu.Unlock()
@@ -374,7 +411,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	}
 	if ended {
 		why := c.output()
-		if tr.Tail != nil {
+		if tr.Tail != nil && !cl.Joined() {
 			why = lastLines(tr.Tail(), 6)
 		}
 		s.forget(c, "the console ended right after connecting")
@@ -387,6 +424,10 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		quiet = "The console has printed nothing yet. send_keys with keys [\"enter\"] usually brings up the prompt."
 	}
 	head := fmt.Sprintf("Connected to %s as session %s (%s console).", name, id, tr.Kind)
+	if cl.Joined() {
+		head = fmt.Sprintf("Joined %s as session %s (%s console), which the user already has open in an oob window. "+
+			"They see everything you type and can pause you. You see the line the cursor is on, not what came before.", name, id, tr.Kind)
+	}
 	return text(false, head+" "+logNote, out, quiet), nil, nil
 }
 
@@ -524,18 +565,78 @@ func (c *session) staged() string {
 	return typed
 }
 
+// gate is what an approval depends on: where the console is (a bootloader, the
+// BMC's prompt, just after a BREAK), what is already typed on the line, and
+// whether it is a question waiting for an answer. A call records it before it
+// asks the user and checks it again once it holds the keyboard.
+type gate struct {
+	ctx     string // contextWhy
+	typed   string
+	asking  bool
+	prompts int // which question, when asking
+}
+
+// gateAt is the gate for the cursor line at.
+func (c *session) gateAt(at line) gate {
+	g := gate{ctx: c.contextWhy(at), asking: at.confirming()}
+	if g.asking {
+		g.prompts = at.prompts
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g.typed = at.typed()
+	if pending, unknown := c.typing.pending(at.prompts); len(pending) > len(g.typed) {
+		g.typed = pending
+	} else if unknown && g.typed == "" {
+		g.typed = "a line edited or recalled with cursor, editing or history keys"
+	}
+	return g
+}
+
+// changedWhileWaiting is nil if the console is as the call found it. Taking
+// the keyboard on a shared console can wait for the user, and an approval
+// waits for them too, so the console may have moved on: what was approved was
+// for somewhere else. Then nothing is sent, and the approval is forgotten so
+// the next call asks again.
+func (c *session) changedWhileWaiting(before gate) *mcp.CallToolResult {
+	now := c.gateAt(c.line())
+	if now == before {
+		return nil
+	}
+	c.mu.Lock()
+	c.answersAt = -1
+	c.mu.Unlock()
+	res, _, _ := fail("nothing was sent: the console changed while this call waited for the user's approval or for the keyboard " +
+		"(it was " + describeGate(before) + ", and is now " + describeGate(now) + "). Look at it with read_output and call again, " +
+		"which asks the user afresh.")
+	return res
+}
+
+func describeGate(g gate) string {
+	switch {
+	case g.asking:
+		return "at a question"
+	case g.ctx != "":
+		return "a place where it " + g.ctx
+	case g.typed != "":
+		return "at a prompt with " + strconv.Quote(g.typed) + " typed"
+	}
+	return "at an empty prompt"
+}
+
 // sinceBreak reports whether a BREAK was sent recently enough that the next
 // key may be a SysRq command.
 func (c *session) sinceBreak() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return !c.breakAt.IsZero() && time.Since(c.breakAt) < afterBreak
+	at := c.sh.BreakAt() // a BREAK from a window counts the same
+	return !at.IsZero() && time.Since(at) < afterBreak
 }
 
+// onBMC reports whether the console is at the BMC's own command line, by the
+// shared console's state: it follows a window's switch (which may print
+// nothing) as well as the output, so a cached answer from the output alone
+// could be stale.
 func (c *session) onBMC() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.atBMC
+	return c.sh.Status().AtPrompt
 }
 
 func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in commandIn) (*mcp.CallToolResult, any, error) {
@@ -563,13 +664,9 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 	at := c.line()
 	c.mu.Lock()
 	answering := at.confirming() && c.answersAt != at.prompts
-	typed := at.typed()
-	if pending, unknown := c.typing.pending(at.prompts); len(pending) > len(typed) {
-		typed = pending // the echo hasn't caught up
-	} else if unknown && typed == "" {
-		typed = "a line edited or recalled with cursor, editing or history keys"
-	}
 	c.mu.Unlock()
+	before := c.gateAt(at)
+	typed := before.typed
 	if typed != "" && !answering {
 		return fail(fmt.Sprintf("the prompt already has %q typed after it, so nothing was sent. Clear it with send_keys "+
 			"keys [\"ctrl+c\"], or finish it with send_keys", typed))
@@ -592,6 +689,9 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		}
 		shownLines = append(shownLines, l)
 	}
+	if len(whys) > 0 && ctx0 != "" && !slices.Contains(whys, ctx0) {
+		whys = append(whys, ctx0) // where it is typed is part of what is approved
+	}
 	if len(whys) > 0 {
 		if res, err := s.approve(req, c.target(), "type at the console of "+c.host+":\n"+approvalText(shownLines), whys); res != nil || err != nil {
 			if err != nil {
@@ -604,6 +704,21 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		c.mu.Unlock()
 	}
 
+	ctx, why, release, err := c.keyboard(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	defer release()
+	if res := c.changedWhileWaiting(before); res != nil {
+		return res, nil, nil
+	}
+	var lastErr error // a failed write says more than that the link dropped
+	stopped := func() (*mcp.CallToolResult, any, error, bool) {
+		if w := why(); w != "" && !(w == "disconnected" && lastErr != nil) {
+			return text(true, c.output(), stoppedText(w)), nil, nil, true
+		}
+		return nil, nil, nil, false
+	}
 	for i, l := range lines {
 		// The approval covered the context the batch started in. Each line
 		// after the first is typed where the earlier ones left the console: if
@@ -616,8 +731,19 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 					"nothing will replay:\n"+strings.Join(lines[i:], "\n")+"\nSend them with a new send_command, which will ask the user."), nil, nil
 			}
 		}
-		c.tx.Mark("agent typed: " + l)
-		if err := c.runLine(ctx, l, wait); err != nil {
+		if console.SecretPrompt.MatchString(c.line().cursor) {
+			c.tx.Mark("agent answered a login prompt") // what was typed there isn't logged
+		} else {
+			c.tx.Mark("agent typed: " + l)
+		}
+		err := c.runLine(ctx, l, wait)
+		lastErr = err
+		if !errors.Is(err, errStuck) {
+			if res, out, e, ok := stopped(); ok {
+				return res, out, e
+			}
+		}
+		if err != nil {
 			s.stuck(c, err)
 			return fail(c.output(), "Sending stopped: "+err.Error())
 		}
@@ -654,7 +780,7 @@ func (c *session) runLine(ctx context.Context, l string, wait time.Duration) err
 		default:
 		}
 		cur := c.line().cursor
-		if looksLikePrompt(cur) || confirming.MatchString(cur) || paging.MatchString(cur) || loginPrompt.MatchString(cur) {
+		if looksLikePrompt(cur) || confirming.MatchString(cur) || console.Pager.MatchString(cur) || console.SecretPrompt.MatchString(cur) {
 			return nil
 		}
 		changed = c.changes() // still running: wait for more
@@ -685,9 +811,9 @@ func (c *session) stopAdvice(mid bool) string {
 	switch {
 	case confirming.MatchString(cur):
 		return "The console is asking a question. Answer with send_keys: text y and keys [\"enter\"] to go ahead, text n to cancel."
-	case paging.MatchString(cur):
+	case console.Pager.MatchString(cur):
 		return "The console is paging: send_keys keys [\"space\"] shows the next page, text q stops. Paging off, or head and grep, avoids this."
-	case loginPrompt.MatchString(cur):
+	case console.SecretPrompt.MatchString(cur):
 		if mid {
 			return "The console is at a login or password prompt, so the lines after it would be typed in as a name or a password. " +
 				"Ask the user to log in or to give you credentials; don't guess."
@@ -738,6 +864,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		steps = append(steps, step{key: k})
 	}
 	at := c.line()
+	before := c.gateAt(at)
 	c.mu.Lock()
 	sim := c.typing
 	answersAt, lastEsc := c.answersAt, c.lastEsc
@@ -753,6 +880,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	}
 	cur := at.cursor
 	var wire strings.Builder
+	var units [][]byte // the text and each key on their own, for the console to map one by one
 	for i, st := range steps {
 		if st.text == "" && st.key == "" {
 			continue
@@ -784,6 +912,7 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		}
 		lastEsc = st.key == "esc"
 		wire.WriteString(st.text + keyBytes[st.key])
+		units = append(units, []byte(st.text), []byte(keyBytes[st.key]))
 	}
 	if c.onBMC() && (in.Text != "" || slices.Contains(in.Keys, "enter")) {
 		add(whyBMC)
@@ -807,13 +936,24 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		c.mu.Unlock()
 	}
 
+	ctx, why, release, err := c.keyboard(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	defer release()
+	if res := c.changedWhileWaiting(before); res != nil {
+		return res, nil, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, wait+toolSlack+c.typingBudget([]byte(wire.String())))
 	defer cancel()
 	if len(in.Keys) > 0 {
 		c.tx.Mark("agent pressed " + strings.Join(in.Keys, ", "))
 	}
 	changed := c.changes()
-	if err := c.write(ctx, []byte(wire.String())); err != nil {
+	if err := c.writeUnits(ctx, units); err != nil {
+		if w := why(); w != "" && w != "disconnected" && !errors.Is(err, errStuck) {
+			return text(true, c.output(), stoppedText(w)), nil, nil
+		}
 		s.stuck(c, err)
 		return fail(err)
 	}
@@ -821,6 +961,9 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 	c.typing = sim
 	c.mu.Unlock()
 	c.settle(ctx, changed, wait, false)
+	if w := why(); w != "" {
+		return text(true, c.output(), stoppedText(w)), nil, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
@@ -857,11 +1000,8 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 	changed := c.changes()
 	if err := c.guarded(ctx, c.tr.Link.Break); err != nil {
 		s.stuck(c, err)
-		return fail("the BREAK wasn't sent: ", err)
+		return fail("the BREAK wasn't sent: ", shareError(err))
 	}
-	c.mu.Lock()
-	c.breakAt = time.Now()
-	c.mu.Unlock()
 	c.tx.Mark("BREAK sent")
 	c.settle(ctx, changed, keysWait, false)
 	if err := ctx.Err(); err != nil {
@@ -916,7 +1056,7 @@ func (s *server) bmcPrompt(ctx context.Context, _ *mcp.CallToolRequest, in bmcPr
 	c.kind, c.atBMC = kind, at
 	c.mu.Unlock()
 	if err != nil {
-		return fail("couldn't switch: ", err)
+		return fail("couldn't switch: ", shareError(err))
 	}
 	c.tx.Mark("switched to " + kind)
 	c.settle(ctx, changed, keysWait, false)
