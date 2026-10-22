@@ -447,9 +447,8 @@ func (h *harness) host(name string) *fakeHost {
 }
 
 // start connects a client to a server. With answer set, the client can ask the
-// user to approve things, and the user answers: "accept" ticks "Allow it" and
-// accepts, "unticked" accepts without ticking, anything else is the action,
-// such as "decline".
+// user to approve things, and the user answers with that action ("accept",
+// "decline", "cancel").
 // shareState points the share sockets at a fresh short folder: a unix socket
 // path is limited to about 100 bytes, which t.TempDir often exceeds.
 func shareState(t *testing.T) string {
@@ -517,12 +516,6 @@ func startVersion(t *testing.T, opt Options, answer, version string) *harness {
 			h.mu.Unlock()
 			if onAsk != nil {
 				onAsk()
-			}
-			switch answer {
-			case "accept":
-				return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"allow": true}}, nil
-			case "unticked":
-				return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"allow": false}}, nil
 			}
 			return &mcp.ElicitResult{Action: answer}, nil
 		}
