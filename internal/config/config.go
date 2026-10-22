@@ -26,6 +26,11 @@ type Host struct {
 	Type   string   `json:"type,omitempty"`    // "" = generic IPMI (auto-detects the vendor over SSH), "ilo", "idrac", "supermicro", "ipmi" = generic, no detection
 	ILOGen int      `json:"ilo_gen,omitempty"` // iLO generation (5, 6, 7) when seen in the SSH banner
 	Tags   []string `json:"tags,omitempty"`
+	// CharDelayMS and LineDelayMS set the gap between typed bytes on a serial
+	// console, and after Enter. Unset keeps the built-in 10 and 200; 0 turns
+	// the delay off.
+	CharDelayMS *int `json:"char_delay_ms,omitempty"`
+	LineDelayMS *int `json:"line_delay_ms,omitempty"`
 
 	// Name is the host's name in the config. It is set by Lookup, never saved,
 	// and only used to name the host in messages.
@@ -202,6 +207,12 @@ func (c *Config) merge(h Host) Host {
 	}
 	if h.Cipher == "" {
 		h.Cipher = c.Defaults.Cipher
+	}
+	if h.CharDelayMS == nil {
+		h.CharDelayMS = c.Defaults.CharDelayMS
+	}
+	if h.LineDelayMS == nil {
+		h.LineDelayMS = c.Defaults.LineDelayMS
 	}
 	return h
 }

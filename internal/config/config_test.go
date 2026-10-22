@@ -164,3 +164,31 @@ func TestLookupExactAndSelect(t *testing.T) {
 		}
 	}
 }
+
+func TestTypingDelaysComeFromTheFileAndDefaults(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "hosts.json")
+	doc := `{"defaults":{"line_delay_ms":300},"hosts":{"a":{"ip":"192.0.2.1","char_delay_ms":20},"b":{"ip":"192.0.2.2","char_delay_ms":0,"line_delay_ms":0}}}`
+	if err := os.WriteFile(p, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, a, _ := c.Lookup("a")
+	if a.CharDelayMS == nil || *a.CharDelayMS != 20 || a.LineDelayMS == nil || *a.LineDelayMS != 300 {
+		t.Errorf("a = %v, %v; want its own 20 and the default 300", a.CharDelayMS, a.LineDelayMS)
+	}
+	_, b, _ := c.Lookup("b")
+	if b.CharDelayMS == nil || *b.CharDelayMS != 0 || b.LineDelayMS == nil || *b.LineDelayMS != 0 {
+		t.Errorf("b = %v, %v; an explicit 0 must stay 0, not fall back", b.CharDelayMS, b.LineDelayMS)
+	}
+	c.Defaults.CharDelayMS = nil
+	if err := c.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(p)
+	if !strings.Contains(string(raw), `"char_delay_ms": 0`) {
+		t.Errorf("an explicit 0 was dropped on save: %s", raw)
+	}
+}

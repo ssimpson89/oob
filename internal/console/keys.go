@@ -30,8 +30,7 @@ const (
 	actDisconnect
 	actHelp
 	actCancel      // left command mode with nothing done (unknown key, n)
-	actRaw         // toggle raw (unpaced) paste
-	actStop        // stop a paste in progress (x, or esc in command mode)
+	actStop        // clear the typing queue (x, or esc in command mode)
 	actPaste       // bracketed paste finished: action.text is the pasted text
 	actPasteTooBig // a paste over pasteMax: none of it is sent
 )
@@ -41,7 +40,7 @@ type action struct {
 	act  act
 	arg  byte
 	text string // actPaste: what was pasted
-	at   int    // actPaste: how many of the forwarded bytes came before it
+	at   int    // how many of the forwarded bytes came before it
 }
 
 // keyMode is where the key parser is.
@@ -74,8 +73,7 @@ var commandKeys = []binding{
 	{"b", actBreak, "break", "Send BREAK", 7, true},
 	{"c", actBMC, "bmc prompt", "Toggle between the host console and the BMC's own CLI prompt (iLO, iDRAC, Supermicro SSH SOL; not IPMI SOL)", 3, true},
 	{"r", actSysrq, "r+key", "SysRq: BREAK, then the next key (r then b reboots a Linux console)", 6, true},
-	{"w", actRaw, "raw paste", "Toggle raw paste: send a paste all at once instead of paced and echo-checked (serial consoles; paced is the default)", 1, false},
-	{"x", actStop, "stop paste", "Stop a paste in progress (esc does the same)", 1, false},
+	{"x", actStop, "clear queue", "Drop what is still queued to be typed, such as a big paste (esc does the same)", 1, false},
 	{"p", actPower, "power cycle", "Power cycle the machine (asks y/n; ipmitool, or off then on over a second SSH connection on an iLO)", 5, true},
 	{"]", actLiteral, "send ^]", "Send ctrl+] itself", 2, true},
 	{".", actDisconnect, "disconnect", "Disconnect", keepAlways, false},
@@ -180,7 +178,17 @@ func (p *keyParser) Feed(b []byte) (fwd []byte, acts []action) {
 }
 
 func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
+	// Every action records how many forwarded bytes precede it, so the caller
+	// can run actions and type bytes in the order the user pressed the keys.
+	stamped := 0
+	stamp := func() {
+		for ; stamped < len(acts); stamped++ {
+			acts[stamped].at = len(fwd)
+		}
+	}
+	defer stamp()
 	for i := 0; i < len(b); i++ {
+		stamp()
 		c := b[i]
 		if c == 0x1b {
 			n, partial := markerAt(b[i:])
@@ -276,7 +284,7 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 			prev := p.mode
 			p.mode = modeConsole
 			if prev == modeCommand {
-				acts = append(acts, action{act: actStop}) // esc: back to the console, and stops a paste
+				acts = append(acts, action{act: actStop}) // esc: back to the console, and clears the queue
 			} else {
 				acts = append(acts, action{act: actCancel})
 			}
@@ -323,8 +331,6 @@ func (p *keyParser) command(c byte) []action {
 		return nil
 	case ']', escapeByte: // ctrl+] twice also sends it, as in telnet
 		return []action{{act: actLiteral}}
-	case 'w':
-		return []action{{act: actRaw}}
 	case 'x':
 		return []action{{act: actStop}}
 	case 'p':

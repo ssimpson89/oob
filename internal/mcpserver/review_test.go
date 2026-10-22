@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
+	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/typer"
 	"strings"
 	"testing"
 	"time"
@@ -598,5 +600,47 @@ func TestCtrlUAfterCursorMoveDoesNotClear(t *testing.T) {
 	}
 	if got := h.host("node01").entered(); len(got) != 0 {
 		t.Errorf("entered %q", got)
+	}
+}
+
+// 4342334651: the call's time budget covers every Enter in the payload.
+func TestTypingBudgetCountsEveryEnter(t *testing.T) {
+	c := &session{ty: &typer.Typer{CharDelay: time.Millisecond, LineDelay: 100 * time.Millisecond, Paced: func() bool { return true }}}
+	wire := []byte("ab\rcd\ref\r") // 9 bytes, 3 Enters, one more allowed for a pending Enter
+	if got, want := c.typingBudget(wire), 9*time.Millisecond+4*100*time.Millisecond; got != want {
+		t.Errorf("budget %s, want %s", got, want)
+	}
+	c.ty.Paced = func() bool { return false }
+	if got := c.typingBudget(wire); got != 0 {
+		t.Errorf("budget %s on an unpaced console, want 0", got)
+	}
+}
+
+// 4342334698: a hangup while the queue is pacing drops the rest; the call must
+// say so rather than report success.
+func TestSendKeysReportsAHangupDuringPacing(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) {
+		ms := 20 * time.Millisecond
+		f.serial, f.pacing = true, console.Pacing{Char: &ms, Line: &ms}
+	}
+	h.connect()
+	f := h.host("node01")
+	go func() {
+		for {
+			f.mu.Lock()
+			n := len(f.sent)
+			f.mu.Unlock()
+			if n >= 3 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		f.pw.Close() // the remote hangs up; Send itself keeps working
+		f.done <- console.Result{}
+	}()
+	out, isErr := h.keys("s1", strings.Repeat("a", 60))
+	if !isErr || !strings.Contains(out, "ended") {
+		t.Errorf("got %q %v, want the connection-ended error", out, isErr)
 	}
 }

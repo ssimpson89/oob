@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,15 +29,16 @@ func TestKeyParser(t *testing.T) {
 		{"plain", []string{"ls\r"}, "ls\r", nil, modeConsole},
 		{"size", []string{esc + "s"}, "", []action{{act: actSize}}, modeConsole},
 		{"split chunks", []string{esc, "l"}, "", []action{{act: actLog}}, modeConsole},
-		{"text around", []string{"a" + esc + "bz"}, "az", []action{{act: actBreak}}, modeConsole},
+		{"text around", []string{"a" + esc + "bz"}, "az", []action{{act: actBreak, at: 1}}, modeConsole},
 		{"auto", []string{esc + "a"}, "", []action{{act: actAuto}}, modeConsole},
 		{"literal", []string{esc + "]"}, "", []action{{act: actLiteral}}, modeConsole},
 		{"double escape", []string{esc + esc}, "", []action{{act: actLiteral}}, modeConsole},
 		{"disconnect", []string{esc + "."}, "", []action{{act: actDisconnect}}, modeConsole},
 		{"help", []string{esc + "?"}, "", []action{{act: actHelp}}, modeConsole},
-		{"esc stops a paste", []string{esc + "\x1b"}, "", []action{{act: actStop}}, modeConsole},
-		{"x stops a paste", []string{esc + "x"}, "", []action{{act: actStop}}, modeConsole},
-		{"w toggles raw paste", []string{esc + "w"}, "", []action{{act: actRaw}}, modeConsole},
+		{"esc clears the queue", []string{esc + "\x1b"}, "", []action{{act: actStop}}, modeConsole},
+		{"x clears the queue", []string{esc + "x"}, "", []action{{act: actStop}}, modeConsole},
+		{"actions record where they fall among forwarded bytes", []string{"a" + esc + "xbc" + esc + "sd"}, "abcd", []action{{act: actStop, at: 1}, {act: actSize, at: 3}}, modeConsole},
+		{"w is no longer a key", []string{esc + "w"}, "", []action{{act: actCancel}}, modeConsole},
 		{"unknown key cancels", []string{esc + "z"}, "", []action{{act: actCancel}}, modeConsole},
 		{"pending command", []string{esc}, "", nil, modeCommand},
 		{"arrow key swallowed", []string{esc + "\x1b[A" + "s"}, "", []action{{act: actSize}}, modeConsole},
@@ -48,15 +50,15 @@ func TestKeyParser(t *testing.T) {
 		{"power yes", []string{esc + "py"}, "", []action{{act: actPower}}, modeConsole},
 		{"power no", []string{esc + "pn"}, "", []action{{act: actCancel}}, modeConsole},
 		{"power other key", []string{esc + "px"}, "", []action{{act: actCancel}}, modeConsole},
-		{"~. at line start after CR", []string{"\r~."}, "\r", []action{{act: actDisconnect}}, modeConsole},
+		{"~. at line start after CR", []string{"\r~."}, "\r", []action{{act: actDisconnect, at: 1}}, modeConsole},
 		{"~. at session start", []string{"~."}, "", []action{{act: actDisconnect}}, modeConsole},
 		{"~. split across reads", []string{"ls\n~", "."}, "ls\n", []action{{act: actDisconnect}}, modeConsole},
 		{"~~ sends one", []string{"\n~~"}, "\n~", nil, modeConsole},
 		{"~x sends both", []string{"~x"}, "~x", nil, modeConsole},
-		{"~ then CR sends both", []string{"~\r~."}, "~\r", []action{{act: actDisconnect}}, modeConsole},
+		{"~ then CR sends both", []string{"~\r~."}, "~\r", []action{{act: actDisconnect, at: 2}}, modeConsole},
 		{"mid-line ~. passes through", []string{"a~."}, "a~.", nil, modeConsole},
 		{"~ is held until next byte", []string{"\r~"}, "\r", nil, modeConsole},
-		{"~ then menu key sends ~", []string{"~" + esc + "s"}, "~", []action{{act: actSize}}, modeConsole},
+		{"~ then menu key sends ~", []string{"~" + esc + "s"}, "~", []action{{act: actSize, at: 1}}, modeConsole},
 		{"after ~~ line is mid-line", []string{"~~.x"}, "~.x", nil, modeConsole},
 		{"ESC then CSI in separate reads is swallowed", []string{esc + "\x1b", "[A", "s"}, "", []action{{act: actSize}}, modeConsole},
 		{"CSI split mid-sequence is swallowed", []string{esc + "\x1b[1", ";5A", "s"}, "", []action{{act: actSize}}, modeConsole},
@@ -70,7 +72,7 @@ func TestKeyParser(t *testing.T) {
 		{"paste with ~. at line start", []string{"\r\x1b[200~~.\x1b[201~"}, "\r", []action{{act: actPaste, text: "~.", at: 1}}, modeConsole},
 		{"paste at session start with ~.", []string{"\x1b[200~~.rm\x1b[201~"}, "", []action{{act: actPaste, text: "~.rm"}}, modeConsole},
 		{"ctrl+] inside paste is literal", []string{"\x1b[200~a" + esc + "sb\x1b[201~"}, "", []action{{act: actPaste, text: "a" + esc + "sb"}}, modeConsole},
-		{"markers split every way", []string{"\x1b", "[2", "00~x", "~.\x1b[20", "1", "~", "\r~."}, "\r", []action{{act: actPaste, text: "x~."}, {act: actDisconnect}}, modeConsole},
+		{"markers split every way", []string{"\x1b", "[2", "00~x", "~.\x1b[20", "1", "~", "\r~."}, "\r", []action{{act: actPaste, text: "x~."}, {act: actDisconnect, at: 1}}, modeConsole},
 		{"keys work after paste", []string{"\x1b[200~x\x1b[201~" + esc + "s"}, "", []action{{act: actPaste, text: "x"}, {act: actSize}}, modeConsole},
 		{"stray end marker stripped", []string{"a\x1b[201~b"}, "ab", nil, modeConsole},
 		{"paste during command mode cancels it", []string{esc + "\x1b[200~s\x1b[201~"}, "", []action{{act: actCancel}, {act: actPaste, text: "s"}}, modeConsole},
@@ -591,7 +593,8 @@ func TestConsoleKeyActions(t *testing.T) {
 	powered := make(chan struct{})
 	cs := &Setup{Link: fl, Power: func() (string, error) { close(powered); return "ok\n", nil }}
 	stop := make(chan struct{})
-	k := &consoleKeys{cs: cs, con: con, cleanup: func() {}, stop: stop}
+	k := newKeys(cs, con, func() {}, stop)
+	k.start(nil)
 	esc := string(rune(escapeByte))
 
 	k.Input([]byte(esc + "s"))
@@ -660,3 +663,136 @@ func TestConsoleKeyActions(t *testing.T) {
 		t.Error("input after stop must not be sent")
 	}
 }
+
+type hangLink struct {
+	fakeLink
+	hangups int
+}
+
+func (h *hangLink) Hangup() error { h.mu.Lock(); h.hangups++; h.mu.Unlock(); return nil }
+
+// Disconnect over a dirty line must not type: IPMI SOL's escape starts with a
+// CR, which would run a truncated command ("reboot" out of "reboot --help").
+func TestDisconnectWithPendingInputHangsUp(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "sol", 24, 80)
+	con.Start()
+	defer con.Close()
+	hl := &hangLink{}
+	k := newKeys(&Setup{Link: hl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	esc := string(rune(escapeByte))
+
+	k.Input([]byte("reboot"))
+	deadline := time.Now().Add(2 * time.Second)
+	for !k.lineDirty.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	k.Input([]byte(esc + "."))
+	if hl.hangups != 1 || hl.disconnects != 0 {
+		t.Errorf("dirty line: hangups=%d disconnects=%d, want 1 and 0", hl.hangups, hl.disconnects)
+	}
+
+	// A clean line keeps the normal disconnect.
+	hl2 := &hangLink{}
+	k2 := newKeys(&Setup{Link: hl2}, con, func() {}, make(chan struct{}))
+	k2.start(nil)
+	k2.Input([]byte(esc + "."))
+	if hl2.hangups != 0 || hl2.disconnects != 1 {
+		t.Errorf("clean line: hangups=%d disconnects=%d, want 0 and 1", hl2.hangups, hl2.disconnects)
+	}
+}
+
+// blockLink's Send blocks until the link is closed (Hangup), like a BMC that
+// stopped accepting input.
+type blockLink struct {
+	hangLink
+	closed  chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *blockLink) Send(p []byte) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.closed
+	return errors.New("link closed")
+}
+
+func (b *blockLink) Hangup() error {
+	_ = b.hangLink.Hangup()
+	select {
+	case <-b.closed:
+	default:
+		close(b.closed)
+	}
+	return nil
+}
+
+// Disconnect must not wait for a writer stuck in Send: it stops the queue and
+// closes the transport itself.
+func TestDisconnectDoesNotWaitOnBlockedSend(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "sol", 24, 80)
+	con.Start()
+	defer con.Close()
+	bl := &blockLink{closed: make(chan struct{}), entered: make(chan struct{})}
+	k := newKeys(&Setup{Link: bl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	esc := string(rune(escapeByte))
+
+	k.Input([]byte("reboot\r"))
+	select {
+	case <-bl.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send never reached the link")
+	}
+	done := make(chan struct{})
+	go func() { k.Input([]byte(esc + ".")); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("disconnect waited on the blocked writer")
+	}
+	select {
+	case <-bl.closed:
+	default:
+		t.Error("transport was not closed")
+	}
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	if bl.hangups != 1 {
+		t.Errorf("hangups = %d, want 1", bl.hangups)
+	}
+}
+
+// A clean-line Disconnect that itself blocks is bounded: after disconnectWait
+// the link is hung up.
+func TestDisconnectHangsUpWhenLinkDisconnectBlocks(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	old := disconnectWait
+	disconnectWait = 50 * time.Millisecond
+	defer func() { disconnectWait = old }()
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "sol", 24, 80)
+	con.Start()
+	defer con.Close()
+	dl := &stuckDisconnect{closed: make(chan struct{})}
+	k := newKeys(&Setup{Link: dl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	k.Input([]byte(string(rune(escapeByte)) + "."))
+	select {
+	case <-dl.closed:
+	default:
+		t.Error("transport was not closed")
+	}
+}
+
+type stuckDisconnect struct {
+	hangLink
+	closed chan struct{}
+}
+
+func (s *stuckDisconnect) Disconnect() error { <-s.closed; return nil }
+func (s *stuckDisconnect) Hangup() error     { close(s.closed); return nil }

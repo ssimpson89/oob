@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ssimpson89/oob/internal/app"
-	"github.com/ssimpson89/oob/internal/paste"
 )
 
 // Minimum terminal height for the bar: the bar row plus a few usable rows.
@@ -57,12 +56,12 @@ type console struct {
 	// next repaint (0 for none).
 	staleRow int
 
-	st   barState
-	hist *history
-	taps paste.Hub // copies of the remote output for a paste pacer
-	log  *logWriter
-	logs []string
-	note *time.Timer
+	st      barState
+	hist    *history
+	pending int // bytes still queued to type at the remote
+	log     *logWriter
+	logs    []string
+	note    *time.Timer
 	// sticky is true while the bar note is a "connecting" message that stays
 	// until the remote first outputs.
 	sticky bool
@@ -187,7 +186,6 @@ func (c *console) Output(b []byte) {
 		return
 	}
 	_, _ = c.out.Write(b)
-	c.taps.Feed(b)
 	if c.sticky {
 		c.sticky, c.st.note = false, ""
 		c.dirty = true
@@ -269,14 +267,6 @@ func (c *console) Note(msg string, isErr bool) {
 
 func (c *console) noteLocked(msg string, isErr bool) { c.noteTTLLocked(msg, isErr, noteTTL) }
 
-// NoteFor is Note with its own time on the bar, for messages worth reading
-// twice, such as why a paste stopped.
-func (c *console) NoteFor(msg string, isErr bool, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.noteTTLLocked(msg, isErr, ttl)
-}
-
 func (c *console) noteTTLLocked(msg string, isErr bool, ttl time.Duration) {
 	if c.note != nil {
 		c.note.Stop()
@@ -291,32 +281,28 @@ func (c *console) noteTTLLocked(msg string, isErr bool, ttl time.Duration) {
 	c.repaint()
 }
 
-// SetPaste shows paste progress on the bar: line at of n. n == 0 clears it.
-func (c *console) SetPaste(at, n int) {
+// SetSend is told how much is still queued to be typed and how much the
+// queue held in all. The bar shows it, for a queue big enough that it takes a
+// while; a few keystrokes need no meter.
+func (c *console) SetSend(pending, total int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.st.pasteAt != at || c.st.pasteN != n {
-		c.st.pasteAt, c.st.pasteN = at, n
+	c.pending = pending
+	label := ""
+	if pending > sendShowMin {
+		label = sendLabel(total-pending, total)
+	}
+	if c.st.sending != label {
+		c.st.sending = label
 		c.repaint()
 	}
 }
 
-// SetRaw shows whether pastes go out raw.
-func (c *console) SetRaw(on bool) {
+// Pending is how many bytes are still queued to be typed.
+func (c *console) Pending() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.st.raw = on
-	c.repaint()
-}
-
-// Tap starts a copy of the remote's output and returns it with the cursor
-// line as it is at that moment, taken together so no output is missed or
-// counted twice.
-func (c *console) Tap() (rx <-chan []byte, untap func(), cursor string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	rx, untap = c.taps.Tap()
-	return rx, untap, c.hist.Partial()
+	return c.pending
 }
 
 // Sticky shows msg on the bar until the remote first outputs something.

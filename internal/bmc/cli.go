@@ -240,16 +240,23 @@ func (l *cliLink) Break() error {
 
 // Disconnect leaves the console if it is in it (the console's escape), then
 // sends "exit" to log out. At the CLI prompt it only sends "exit".
+// disconnectPromptWait is how long Disconnect waits for the BMC prompt after
+// the console escape before giving up and hanging up.
+var disconnectPromptWait = 3 * time.Second
+
 func (l *cliLink) Disconnect() error {
 	l.disconnected.Store(true)
 	l.mu.Lock()
 	at := l.atPrompt
 	l.mu.Unlock()
 	if !at {
-		if l.Send(l.sp.esc) != nil {
+		// Only type "exit" once the BMC's own prompt is back. If the escape
+		// didn't take, "exit" would land on the server's console instead (at
+		// a login prompt it becomes a username), so just hang up.
+		l.expect()
+		if l.Send(l.sp.esc) != nil || !l.waitPrompt(disconnectPromptWait) {
 			return l.closeSess()
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
 	if l.Send([]byte("exit\r")) != nil {
 		return l.closeSess()
@@ -257,6 +264,12 @@ func (l *cliLink) Disconnect() error {
 	// If the BMC doesn't hang up, don't leave the user stuck.
 	time.AfterFunc(2*time.Second, func() { _ = l.closeSess() })
 	return nil
+}
+
+// Hangup closes the session without sending the console escape or "exit".
+func (l *cliLink) Hangup() error {
+	l.disconnected.Store(true)
+	return l.closeSess()
 }
 
 // Like SOL, the remote shell only learns the size if it is typed at it.
@@ -268,7 +281,7 @@ func (l *cliLink) FitSize(rows, cols int) error {
 }
 
 // SizeLine is the command FitSize types, when it types one: the console
-// types it paced and echo-checked instead of calling FitSize. A plain ssh
+// sends it through its typing queue instead of calling FitSize. A plain ssh
 // session sends a window change and types nothing.
 func (l *cliLink) SizeLine(rows, cols int) (string, bool) {
 	if l.plain {
@@ -428,6 +441,7 @@ func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTr
 	return &ConsoleTransport{
 		Kind: sp.kind, Link: l, Out: newSkipEcho(s, sp.start[len(sp.start)-1]), Done: done,
 		Toggle: l.Toggle, Observe: l.Observe, Close: s.Close,
+		Pacing: console.PacingMS(h.CharDelayMS, h.LineDelayMS),
 	}, nil
 }
 
@@ -446,7 +460,7 @@ func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, er
 	return console.Run(console.Setup{
 		Host: name, Kind: sp.kind,
 		Link: tr.Link, Out: tr.Out, Done: tr.Done,
-		Power: power,
+		Power: power, Pacing: tr.Pacing,
 	})
 }
 

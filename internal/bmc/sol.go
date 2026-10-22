@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -26,6 +27,21 @@ const solEscape byte = 0x1e // ctrl+^
 type solLink struct {
 	ptmx *os.File
 	cmd  *exec.Cmd
+	// hungUp is set by Hangup: the client was killed, so the BMC may still
+	// hold the session and the caller must run Release.
+	hungUp atomic.Bool
+}
+
+// Hangup ends the client without typing anything at the console. Disconnect's
+// escape starts with a CR, which would submit whatever is on the remote line.
+// Killing ipmitool leaves the BMC holding the session; the caller runs the
+// transport's Release (sol deactivate) afterwards.
+func (s *solLink) Hangup() error {
+	s.hungUp.Store(true)
+	if s.cmd.Process != nil {
+		return s.cmd.Process.Kill()
+	}
+	return nil
 }
 
 func (s *solLink) Send(b []byte) error { _, err := s.ptmx.Write(b); return err }
@@ -56,8 +72,8 @@ func (s *solLink) FitSize(rows, cols int) error {
 	return s.Send([]byte(line + "\r"))
 }
 
-// SizeLine is the command FitSize types. The console types it paced and
-// echo-checked instead of calling FitSize.
+// SizeLine is the command FitSize types. The console sends it through its
+// typing queue instead of calling FitSize.
 func (s *solLink) SizeLine(rows, cols int) (string, bool) {
 	return sttyLine(rows, cols), true
 }
@@ -111,6 +127,7 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start ipmitool: %w", err)
 	}
+	link := &solLink{ptmx: ptmx, cmd: cmd}
 	done := make(chan console.Result, 1)
 	// refused is set when ipmitool itself gave up with a non-zero exit status
 	// (for instance "SOL payload already active": someone else holds the
@@ -130,18 +147,19 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 			if ee.ExitCode() > 0 {
 				refused.Store(true)
 			}
-			done <- console.Result{Code: exitCodeOf(ee)}
+			done <- console.Result{Code: solExitCode(ee, link.hungUp.Load())}
 		default:
 			done <- console.Result{Code: 1, Err: err}
 		}
 	}()
 	tail := &tailBuf{}
 	return &ConsoleTransport{
-		Kind: "sol",
-		Link: &solLink{ptmx: ptmx, cmd: cmd},
-		Out:  io.TeeReader(ptmx, tail),
-		Done: done,
-		Tail: tail.String,
+		Kind:   "sol",
+		Pacing: console.PacingMS(h.CharDelayMS, h.LineDelayMS),
+		Link:   link,
+		Out:    io.TeeReader(ptmx, tail),
+		Done:   done,
+		Tail:   tail.String,
 		Close: func() {
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
@@ -163,6 +181,16 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	}, nil
 }
 
+// solExitCode is ipmitool's exit code, except that the SIGKILL of an
+// intentional hangup is a clean exit: the user chose to leave. Anything else,
+// including a real error after a hangup, keeps its code.
+func solExitCode(ee *exec.ExitError, hungUp bool) int {
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && hungUp && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
+		return 0
+	}
+	return exitCodeOf(ee)
+}
+
 // solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
 // exit code.
 func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
@@ -175,12 +203,19 @@ func solConsole(h config.Host, name string, power func() (string, error)) (int, 
 		return 1, err
 	}
 	defer tr.Close()
+	// A hangup kills the client without the escape; end the BMC's session.
+	defer func() {
+		if sl, ok := tr.Link.(*solLink); ok && sl.hungUp.Load() && tr.Release != nil {
+			tr.Release()
+		}
+	}()
 	code, err := console.Run(console.Setup{
 		Host: name, Kind: "sol",
 		Link:       tr.Link,
 		Out:        tr.Out,
 		Done:       tr.Done,
 		Power:      power,
+		Pacing:     tr.Pacing,
 		Connecting: "connecting to " + name + " via IPMI...",
 	})
 	// The terminal is restored now. Repeat any ipmitool error below the bar's

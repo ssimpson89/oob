@@ -7,11 +7,13 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/ssimpson89/oob/internal/app"
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
+	"github.com/ssimpson89/oob/internal/console"
 )
 
 // destructiveActions is the one list of commands that change or erase state
@@ -74,7 +76,9 @@ func bmcCmds() []*cobra.Command {
 
 	// sol
 	var o bmc.SOLOptions
-	sol := &cobra.Command{
+	var charDelay, lineDelay time.Duration
+	var sol *cobra.Command
+	sol = &cobra.Command{
 		Use:   "sol <name>",
 		Short: "The server's own console: login prompt, GRUB, BIOS (ctrl+] for keys)",
 		Long: "The server's own serial console (the machine itself, not the BMC): its login prompt,\n" +
@@ -87,15 +91,26 @@ func bmcCmds() []*cobra.Command {
 			"`console com2`; disconnecting leaves the console and logs out. Neither has BREAK.\n" +
 			"A Supermicro host (type supermicro, untested) uses ipmitool, clearing any stale session first;\n" +
 			"--ssh uses its SMASH-CLP shell instead.\n" +
+			"Everything you type or paste goes through one queue, sent a byte at a time with a short gap\n" +
+			"(--char-delay) and a longer one after Enter (--line-delay), so the BMC's small buffer never\n" +
+			"overruns. Set 0 for no delay; the host's char_delay_ms and line_delay_ms set them per host.\n" +
 			"Like ssh, ~. at the start of a line also disconnects and ~~ sends a single ~.\n" +
 			"Inside an outer ssh session the outer ssh eats the first tilde, so type ~~. to reach oob.\n" +
 			"With --raw, or when stdout is not a terminal, ipmitool runs directly and its own ~. applies.",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: hostCompletion,
 		RunE: withHost(func(name string, h config.Host, _ []string) error {
+			if sol.Flags().Changed("char-delay") {
+				h.CharDelayMS = ptrMS(charDelay)
+			}
+			if sol.Flags().Changed("line-delay") {
+				h.LineDelayMS = ptrMS(lineDelay)
+			}
 			return bmc.DriverForProbed(name, h).Console(o)
 		}),
 	}
+	sol.Flags().DurationVar(&charDelay, "char-delay", console.DefaultCharDelay, "gap after each typed byte on a serial console (0 for none)")
+	sol.Flags().DurationVar(&lineDelay, "line-delay", console.DefaultLineDelay, "gap after Enter on a serial console (0 for none)")
 	sol.Flags().BoolVar(&o.Force, "force", false, "deactivate any stale SOL session first")
 	sol.Flags().BoolVar(&o.Deact, "deactivate", false, "only deactivate the SOL session")
 	sol.Flags().BoolVar(&o.Raw, "raw", false, "plain ipmitool passthrough: no bottom bar, ~. disconnects")
@@ -288,3 +303,9 @@ func riskyIpmiArgs(args []string) (string, bool) {
 }
 
 var riskyPower = map[string]bool{"off": true, "cycle": true, "reset": true, "soft": true, "diag": true}
+
+// ptrMS is a delay in the host config's unit: whole milliseconds.
+func ptrMS(d time.Duration) *int {
+	ms := int(max(0, d).Milliseconds())
+	return &ms
+}

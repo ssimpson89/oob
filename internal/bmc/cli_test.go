@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 )
 
 // fakeBMC records what is typed and answers with out(typed) as remote output.
@@ -111,10 +112,27 @@ func TestCLILinkDisconnect(t *testing.T) {
 	if strings.Join(f.sent, "|") != "exit\r" {
 		t.Errorf("at prompt sent %q, want only exit", f.sent)
 	}
-	l, f = newFakeCLI(iloSpec, false, "")
+	l, f = newFakeCLI(iloSpec, false, "hpeiLO-> ")
 	_ = l.Disconnect()
 	if strings.Join(f.sent, "|") != "\x1b(|exit\r" {
 		t.Errorf("in console sent %q, want escape then exit", f.sent)
+	}
+}
+
+// If the escape doesn't bring the BMC prompt back, "exit" must not be typed:
+// it would land on the server's console (at a login prompt, as a username).
+func TestCLILinkDisconnectWithoutPromptHangsUp(t *testing.T) {
+	defer func(d time.Duration) { disconnectPromptWait = d }(disconnectPromptWait)
+	disconnectPromptWait = 50 * time.Millisecond
+	l, f := newFakeCLI(iloSpec, false, "") // escape produces no prompt
+	closed := false
+	l.closeSess = func() error { closed = true; return nil }
+	_ = l.Disconnect()
+	if strings.Join(f.sent, "|") != "\x1b(" {
+		t.Errorf("sent %q, want only the escape", f.sent)
+	}
+	if !closed {
+		t.Error("session not closed")
 	}
 }
 
