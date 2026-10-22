@@ -36,6 +36,12 @@ type Typer struct {
 
 	queued atomic.Int64 // bytes accepted by Enqueue and not yet written or dropped
 
+	// gen counts cancellations. Urgent and Clear bump it before they ask Run
+	// to drop the queue; an Enqueue that captured an older value is blocked
+	// handing its text over and is discarded by Run, since the cancellation
+	// covers everything submitted before it.
+	gen atomic.Uint64
+
 	once    sync.Once
 	in      chan item
 	urgent  chan []byte
@@ -45,6 +51,7 @@ type Typer struct {
 
 type item struct {
 	b    []byte
+	gen  uint64
 	done chan struct{}
 }
 
@@ -72,9 +79,10 @@ func (t *Typer) Enqueue(b []byte) <-chan struct{} {
 		close(done)
 		return done
 	}
+	gen := t.gen.Load()
 	t.queued.Add(int64(len(b))) // counted before Run can see it, so Queued never under-reports
 	select {
-	case t.in <- item{b, done}:
+	case t.in <- item{b, gen, done}:
 	case <-t.stopped:
 		t.queued.Add(-int64(len(b)))
 		close(done)
@@ -88,12 +96,14 @@ func (t *Typer) Enqueue(b []byte) <-chan struct{} {
 func (t *Typer) Queued() int { return int(t.queued.Load()) }
 
 // Urgent drops everything queued and writes b now, for ctrl+c and the like:
-// whatever was waiting is stale once the user has interrupted.
+// whatever was waiting is stale once the user has interrupted. That includes
+// text whose Enqueue has not returned yet; it is dropped, never written.
 func (t *Typer) Urgent(b []byte) {
 	t.init()
 	if len(b) == 0 {
 		return
 	}
+	t.gen.Add(1)
 	select {
 	case t.urgent <- append([]byte(nil), b...):
 	case <-t.stopped:
@@ -101,10 +111,12 @@ func (t *Typer) Urgent(b []byte) {
 }
 
 // Clear drops everything queued, and returns once that is done: nothing
-// dropped is written after it, and Progress has been told.
+// dropped, including text from an Enqueue still in flight, is written after
+// it, and Progress has been told.
 func (t *Typer) Clear() {
 	t.init()
 	ack := make(chan struct{})
+	t.gen.Add(1)
 	select {
 	case t.clear <- ack:
 		<-ack
@@ -230,6 +242,11 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case it := <-t.in:
+			if it.gen != t.gen.Load() { // submitted before an Urgent or Clear: stale
+				t.queued.Add(-int64(len(it.b)))
+				close(it.done)
+				continue
+			}
 			if len(q) == 0 {
 				total = 0
 			}

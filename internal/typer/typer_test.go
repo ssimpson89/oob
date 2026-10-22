@@ -369,3 +369,68 @@ func TestUrgentLandsBeforeEnterWithZeroCharDelay(t *testing.T) {
 type writeFn func([]byte) (int, error)
 
 func (f writeFn) Write(b []byte) (int, error) { return f(b) }
+
+// A submission already counted by Enqueue but still blocked handing its text
+// to Run (because Run is stuck in a write) must not be written after Urgent or
+// Clear, whichever of them Run services first.
+func TestCancelDropsSubmissionBlockedInEnqueue(t *testing.T) {
+	for _, name := range []string{"urgent", "clear"} {
+		t.Run(name, func(t *testing.T) {
+			gate := make(chan struct{})
+			var mu sync.Mutex
+			var out []string
+			entered := make(chan struct{})
+			ty := &Typer{}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w := writeFn(func(b []byte) (int, error) {
+				mu.Lock()
+				out = append(out, string(b))
+				first := len(out) == 1
+				mu.Unlock()
+				if first {
+					close(entered)
+					<-gate
+				}
+				return len(b), nil
+			})
+			go func() { _ = ty.Run(ctx, w) }()
+			ty.Enqueue([]byte("first"))
+			<-entered // Run is inside the write, so it cannot take from t.in
+			var old <-chan struct{}
+			enq := make(chan struct{})
+			go func() { old = ty.Enqueue([]byte("OLD")); close(enq) }()
+			for ty.Queued() != len("first")+len("OLD") {
+				time.Sleep(time.Millisecond) // counted, so the producer is committed
+			}
+			time.Sleep(20 * time.Millisecond) // and parked on t.in
+			cancelled := make(chan struct{})
+			go func() {
+				if name == "urgent" {
+					ty.Urgent([]byte{0x03})
+				} else {
+					ty.Clear()
+				}
+				close(cancelled)
+			}()
+			for ty.gen.Load() == 0 {
+				time.Sleep(time.Millisecond)
+			}
+			close(gate)
+			<-cancelled
+			<-enq
+			isClosed(t, old)
+			ty.Clear() // a barrier: Run has seen everything sent so far
+			if got := ty.Queued(); got != 0 {
+				t.Errorf("Queued = %d, want 0", got)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, s := range out {
+				if strings.Contains(s, "OLD") {
+					t.Fatalf("stale submission was written: %q", out)
+				}
+			}
+		})
+	}
+}
