@@ -281,9 +281,22 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 	}
 	s.mu.Unlock()
 
-	if in.Force {
-		if res, err := s.approve(req, target{name: name, addr: h.IP, typ: h.Type}, "end any other SOL session on "+name+" and take it over",
-			[]string{whyForce}); res != nil || err != nil {
+	// Joining a console the user has open in an oob window puts the agent in
+	// their live session, so it needs approval. Opening a fresh console doesn't.
+	addr, typ := share.Endpoint(h)
+	joining := share.Exists(name, addr)
+	var what string
+	var whys []string
+	switch {
+	case joining:
+		what = "join the console of " + name + " that your oob window has open: your live session will be shared with the agent"
+		whys = []string{whyJoin}
+	case in.Force:
+		what = "end any other SOL session on " + name + " and take it over"
+		whys = []string{whyForce}
+	}
+	if len(whys) > 0 {
+		if res, err := s.approve(req, target{name: name, addr: h.IP, typ: h.Type}, what, whys); res != nil || err != nil {
 			if err != nil {
 				return fail(err)
 			}
@@ -320,7 +333,6 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		// Join the console if the user already has it open in an oob window (an
 		// iLO allows one VSP session, so a second connection couldn't work);
 		// otherwise open it here, and a window opened later joins this one.
-		addr, typ := share.Endpoint(h)
 		cl, err := share.Open(ctx, share.Options{Host: name, Addr: addr, Type: typ, Agent: true, Name: who,
 			Open: func() (*bmc.ConsoleTransport, error) {
 				return s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
@@ -341,6 +353,13 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 			}
 		}()
 		return fail(errTimeout("opening the console on "+name, connectTimeout, false))
+	}
+	if cl.Joined() && !joining {
+		// The user's window opened the console after the check above, so the
+		// approval for joining wasn't asked. Leave, and let the next call ask.
+		cl.Close()
+		return fail("the console on " + name + " was just opened in the user's oob window, so nothing was done. " +
+			"Call connect again: joining it needs the user's approval")
 	}
 	tr := cl.Transport()
 

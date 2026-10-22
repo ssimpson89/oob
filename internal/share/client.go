@@ -123,6 +123,23 @@ type holder struct {
 	lock *os.File
 }
 
+// Exists reports whether another oob has a hub for host, by reaching its
+// socket and hanging up (the hub ignores that). It takes no lock and never
+// touches the console. Open joins such a console, which an AI tool should be
+// approved for first.
+func Exists(host, addr string) bool {
+	sock, _, ok := paths(host, addr)
+	if !ok || checkSocket(sock) != nil {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", sock, 200*time.Millisecond)
+	if err != nil {
+		return false // nobody, or a socket left by an oob that died
+	}
+	conn.Close()
+	return true
+}
+
 // ErrShared is what Exclusive returns when another oob has the console.
 var ErrShared = errors.New("this console is open in another oob")
 

@@ -87,9 +87,10 @@ func TestAgentDisconnectLeavesTheConsoleForTheUsersWindow(t *testing.T) {
 	eventually(t, "the console closes with the last window", f.isClosed)
 }
 
-func TestAgentJoinsTheUsersConsole(t *testing.T) {
-	h := start(t, Options{}, "")
-	// The user's oob sol opens it first.
+// userConsole is the console the user's oob sol opened first, for the agent to
+// find when it connects.
+func userConsole(t *testing.T) {
+	t.Helper()
 	f := newFakeHost(t, "node01")
 	user, err := share.Open(context.Background(), share.Options{Host: "node01", Addr: "192.0.2.11:22", Type: "ipmi", NoLinger: true,
 		Open: func() (*bmc.ConsoleTransport, error) { return f.transport(), nil }})
@@ -97,12 +98,41 @@ func TestAgentJoinsTheUsersConsole(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { user.Close() })
-	out, _ := h.call("connect", map[string]any{"host": "node01"})
-	if !strings.Contains(out, "Joined node01") {
-		t.Errorf("connect: %q", out)
+}
+
+// Joining the console the user has open puts the agent in their live session:
+// it is only done once they approve, and the question says so.
+func TestAgentJoinsTheUsersConsoleOnlyWithApproval(t *testing.T) {
+	for _, c := range []struct {
+		answer, want string
+		joins        bool
+	}{{"", "can't ask", false}, {"decline", "the user declined", false}, {"accept", "Joined node01", true}} {
+		t.Run(c.answer, func(t *testing.T) {
+			h := start(t, Options{}, c.answer)
+			userConsole(t)
+			out, _ := h.call("connect", map[string]any{"host": "node01"})
+			if !strings.Contains(out, c.want) {
+				t.Errorf("connect: %q, want %q", out, c.want)
+			}
+			if c.answer != "" && !strings.Contains(h.askedAll(), "live session will be shared") {
+				t.Errorf("the question didn't say the live session is shared: %q", h.askedAll())
+			}
+			got, isErr := h.send("s1", "uname -r")
+			if c.joins != (!isErr && strings.Contains(got, "5.14.0-test")) {
+				t.Errorf("send_command: %q %v, joins = %v", got, isErr, c.joins)
+			}
+		})
 	}
-	if got, isErr := h.send("s1", "uname -r"); isErr || !strings.Contains(got, "5.14.0-test") {
-		t.Errorf("send_command on a joined console: %q %v", got, isErr)
+}
+
+// Hosting a fresh console takes no approval: nobody else is on it.
+func TestAgentHostingAFreshConsoleAsksNothing(t *testing.T) {
+	h := start(t, Options{}, "decline")
+	if out, isErr := h.call("connect", map[string]any{"host": "node01"}); isErr || !strings.Contains(out, "Connected to node01") {
+		t.Fatalf("connect: %q %v", out, isErr)
+	}
+	if asked := h.askedAll(); asked != "" {
+		t.Errorf("the user was asked: %q", asked)
 	}
 }
 

@@ -613,7 +613,7 @@ func TestSocketAndFolderArePrivate(t *testing.T) {
 	if ds.Mode().Perm() != 0o700 {
 		t.Errorf("folder mode %v", ds.Mode().Perm())
 	}
-	if !socketUp("node01", "") || socketUp("other", "") {
+	if !Exists("node01", "") || Exists("other", "") {
 		t.Error("Exists is wrong")
 	}
 }
@@ -632,7 +632,7 @@ func TestASocketThatIsntOursIsRefused(t *testing.T) {
 	if err := checkSocket(sock); err == nil {
 		t.Error("a regular file was accepted as a socket")
 	}
-	if socketUp("node01", "") {
+	if Exists("node01", "") {
 		t.Error("Exists trusted a non-socket")
 	}
 }
@@ -654,7 +654,7 @@ func TestStaleSocketAndLockAreRecovered(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "node01.lock"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if socketUp("node01", "") {
+	if Exists("node01", "") {
 		t.Error("a dead socket counted as a hub")
 	}
 	f := newFake()
@@ -836,7 +836,7 @@ func TestTheSameNameAtAnotherAddressIsAnotherConsole(t *testing.T) {
 	if err != nil || !w.Joined() {
 		t.Fatalf("same address: joined %v, %v", w != nil && w.Joined(), err)
 	}
-	if socketUp("node01", "192.0.2.3") || !socketUp("node01", "192.0.2.1") {
+	if Exists("node01", "192.0.2.3") || !Exists("node01", "192.0.2.1") {
 		t.Error("Exists must look at the address too")
 	}
 	if _, err := join(t, Options{Addr: "192.0.2.3"}); !errors.Is(err, ErrNoHub) {
@@ -1111,7 +1111,7 @@ func TestAnOrphanedHubWhoseConsoleEndedStillReleasesItsSocketAndLock(t *testing.
 		t.Fatal(err)
 	}
 	owner.Close() // the AI disconnects; the hub stays for the window
-	if f.isClosed() || !socketUp("node01", "") {
+	if f.isClosed() || !Exists("node01", "") {
 		t.Fatal("the hub didn't linger for the window")
 	}
 	// The server's console ends while the window is on it.
@@ -1125,7 +1125,7 @@ func TestAnOrphanedHubWhoseConsoleEndedStillReleasesItsSocketAndLock(t *testing.
 	win.Close() // the last window leaves a hub that is already marked closed
 	eventually(t, "the transport closed", f.isClosed)
 	eventually(t, "released at the BMC's end", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.released })
-	eventually(t, "the socket is gone", func() bool { return !socketUp("node01", "") })
+	eventually(t, "the socket is gone", func() bool { return !Exists("node01", "") })
 	// And the lock: this oob can host the console again.
 	f2 := newFake()
 	again := host(t, f2, Options{Agent: true, Name: "Claude"})
@@ -1319,19 +1319,4 @@ func TestWindowClearIsRefusedWhileBusy(t *testing.T) {
 	inHub(t, h, func() { h.busy-- })
 	other.Clear()
 	eventually(t, "the clear goes through once idle", func() bool { return h.ty.Queued() == 0 })
-}
-
-// socketUp reports whether another oob has a hub for host, by reaching its
-// socket and hanging up (the hub ignores that).
-func socketUp(host, addr string) bool {
-	sock, _, ok := paths(host, addr)
-	if !ok || checkSocket(sock) != nil {
-		return false
-	}
-	conn, err := net.DialTimeout("unix", sock, 200*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
 }

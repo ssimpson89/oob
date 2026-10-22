@@ -150,6 +150,7 @@ const (
 	whyBMC     = "is typed at the BMC's own command line, where commands can power off or reset the server or the BMC"
 	whyEscape  = "leaves the host console for the BMC's own command line"
 	whyForce   = "ends another SOL session on this host"
+	whyJoin    = "joins the console the user is working in, in their own oob window, so what it types goes into their live session"
 )
 
 // extras are risks checked on top of dangerousRE, each with its reason. They
