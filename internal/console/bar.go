@@ -336,12 +336,47 @@ func (t *escTracker) Idle() bool { return t.state == trkText && t.utf == 0 }
 // (CSI ! p), clear screen (CSI 2J or 3J), or switching the alternate screen
 // (CSI ? 47, 1047 or 1049 h or l). Full-screen programs do these.
 func clobbers(b []byte) bool {
+	clob, _, _ := scanSeqs(b)
+	return clob
+}
+
+// tailMax caps the cut-off sequence start kept between reads.
+const tailMax = 64
+
+// clobberScan runs clobbers across chunk boundaries: the start of a sequence
+// cut off at the end of one read is kept and rescanned with the next, so a
+// split ESC [ 2 and J is still seen. It also reports bracketed paste being
+// turned off (CSI ? 2004 l), which bash 5.1+ does around each command.
+type clobberScan struct{ tail []byte }
+
+// Feed scans b after any held-over start of a sequence.
+func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
+	buf := b
+	if len(s.tail) > 0 {
+		buf = append(s.tail, b...)
+	}
+	clobber, pasteOff, cut := scanSeqs(buf)
+	s.tail = nil
+	if cut >= 0 && len(buf)-cut <= tailMax {
+		s.tail = append([]byte(nil), buf[cut:]...)
+	}
+	return clobber, pasteOff
+}
+
+// scanSeqs looks through b for sequences that clobber the bar and for ?2004l.
+// cut is where a sequence cut off by the end of b starts, or -1.
+func scanSeqs(b []byte) (clobber, pasteOff bool, cut int) {
+	cut = -1
 	for i := 0; i < len(b); i++ {
-		if b[i] != 0x1b || i+1 >= len(b) {
+		if b[i] != 0x1b {
 			continue
 		}
+		if i+1 >= len(b) {
+			cut = i
+			break
+		}
 		if b[i+1] == 'c' {
-			return true
+			clobber = true
 		}
 		if b[i+1] != '[' {
 			continue
@@ -351,32 +386,40 @@ func clobbers(b []byte) bool {
 			j++
 		}
 		if j >= len(b) {
+			cut = i
 			break
 		}
 		params := string(b[i+2 : j])
 		switch b[j] {
 		case 'r':
 			if !strings.HasPrefix(params, "?") {
-				return true
+				clobber = true
 			}
 		case 'p':
 			if params == "!" {
-				return true
+				clobber = true
 			}
 		case 'J':
 			if params == "2" || params == "3" {
-				return true
+				clobber = true
 			}
 		case 'h', 'l':
 			if rest, ok := strings.CutPrefix(params, "?"); ok {
 				for _, p := range strings.Split(rest, ";") {
-					if n, err := strconv.Atoi(p); err == nil && (n == 47 || n == 1047 || n == 1049) {
-						return true
+					n, err := strconv.Atoi(p)
+					if err != nil {
+						continue
+					}
+					if n == 47 || n == 1047 || n == 1049 {
+						clobber = true
+					}
+					if n == 2004 && b[j] == 'l' {
+						pasteOff = true
 					}
 				}
 			}
 		}
 		i = j
 	}
-	return false
+	return clobber, pasteOff, cut
 }

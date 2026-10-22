@@ -38,6 +38,12 @@ const (
 	pasteOff = "\x1b[?2004l"
 )
 
+// remoteModeResets undoes terminal modes the remote may have left set when the
+// session ends: alternate screen, hidden cursor, mouse reporting (X10 modes,
+// button and any-motion tracking, SGR encoding), focus reporting, application
+// cursor keys and keypad, and a charset left in line-drawing or shifted out.
+const remoteModeResets = "\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?1l\x1b>\x1b(B\x0f"
+
 // console owns the bottom row of the terminal. It stays on the normal screen:
 // a DECSTBM scroll region covers rows 1..H-1, so output scrolls as usual and
 // lines leave the top into the terminal's own scrollback, while row H holds
@@ -53,6 +59,10 @@ type console struct {
 	tr      escTracker
 	lastOut time.Time
 	dirty   bool // the region or bar needs repainting once the stream is idle
+	scan    clobberScan
+	// pasteLost: the remote turned bracketed paste off; turn it back on at the
+	// next repaint.
+	pasteLost bool
 	// staleRow is the row an old, shorter window's bar was on, to blank at the
 	// next repaint (0 for none).
 	staleRow int
@@ -85,9 +95,12 @@ func (c *console) regionSeq() string {
 }
 
 // paintSeq draws the bar on the last row and puts the cursor back. Autowrap
-// is turned off so filling the last column can't leave a pending wrap.
+// is turned off so filling the last column can't leave a pending wrap. The
+// normal charset is selected first, or a remote left in line-drawing mode would
+// turn the bar's letters into boxes; every caller wraps the paint in ESC 7 and
+// ESC 8, which save and restore the remote's charset along with the cursor.
 func (c *console) paintSeq() string {
-	return fmt.Sprintf("\x1b[%d;1H\x1b[?7l%s\x1b[?7h", c.rows, barLine(c.st, c.cols))
+	return fmt.Sprintf("\x1b[%d;1H\x1b(B\x0f\x1b[?7l%s\x1b[?7h", c.rows, barLine(c.st, c.cols))
 }
 
 // Start reserves the bottom row and starts the periodic repaint.
@@ -117,7 +130,12 @@ func (c *console) reassert() {
 		return
 	}
 	c.dirty = false
-	seq := "\x1b7"
+	seq := ""
+	if c.pasteLost {
+		c.pasteLost = false
+		seq = pasteOn
+	}
+	seq += "\x1b7"
 	if c.staleRow > 0 {
 		seq += fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.staleRow)
 		c.staleRow = 0
@@ -170,7 +188,9 @@ func (c *console) tickOnce(now time.Time) {
 		c.tr.Reset()
 		c.dirty = true
 	}
-	if c.tr.Idle() && quiet > idleRepaint {
+	// Repaint only when something changed: a repaint every second would jump
+	// the terminal back to the bottom while the user reads scrollback.
+	if c.dirty && c.tr.Idle() && quiet > idleRepaint {
 		c.reassert()
 	}
 }
@@ -199,8 +219,12 @@ func (c *console) Output(b []byte) {
 			c.stopLogLocked("log write failed, logging stopped: " + err.Error())
 		}
 	}
-	if clobbers(b) {
+	clob, paste := c.scan.Feed(b)
+	if clob || paste {
 		c.dirty = true
+	}
+	if paste {
+		c.pasteLost = true
 	}
 	if c.dirty && c.tr.Idle() {
 		c.reassert()
@@ -398,7 +422,7 @@ func (c *console) Close() []string {
 		_ = c.log.Close()
 		c.log, c.st.logging = nil, false
 	}
-	c.write(pasteOff + "\x1b[0m\x1b7\x1b[r" + fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.rows) + "\x1b8\r\n")
+	c.write(remoteModeResets + pasteOff + "\x1b[0m\x1b7\x1b[r" + fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.rows) + "\x1b8\r\n")
 	return c.logs
 }
 
