@@ -92,8 +92,8 @@ type hub struct {
 	atPrompt  bool
 	agent     *peer
 	lease     bool
-	leaseID   int         // which acquisition holds the keyboard, while lease is set
-	cancelled map[int]int // lease ids released before their request arrived, in order seen
+	leaseID   int               // which acquisition holds the keyboard, while lease is set
+	cancelled map[cancelKey]int // lease ids released before their request arrived, per client, in order seen
 	cancelSeq int
 	paused    bool
 	gen       int // changes whenever the AI tool's keyboard is taken back
@@ -101,7 +101,7 @@ type hub struct {
 	breakAt   time.Time // the last BREAK that went out, from any client
 	userTyped int
 	agentLine typing
-	busy      bool
+	busy      int // exclusive link operations (BREAK, toggle...) and an agent's erase running; window input and new leases wait for 0
 	closed    bool
 	orphan    bool // the host's own client left; the hub ends with its last window
 	lastDrop  time.Time
@@ -111,7 +111,15 @@ type hub struct {
 	finishOnce  sync.Once
 	closeOnce   sync.Once
 	releaseOnce sync.Once
-	onClose     func() // the host's: stop listening, let go of the lock
+	onClose     func() // the host's: stop listening
+	unlock      func() // the host's: let go of the ownership lock
+	unlockOnce  sync.Once
+}
+
+// cancelKey names a lease request by the client that made it: ids count per client.
+type cancelKey struct {
+	p  *peer
+	id int
 }
 
 // flight is the AI tool's write that is being typed.
@@ -126,6 +134,11 @@ type typing struct {
 	ctrl    bool
 	text    []byte
 	entered bool
+	// sensitive: the line was started at a login or password prompt. Decided
+	// before the first byte is sent, from where the cursor was then, since
+	// what the console prints in answer can change the cursor line before the
+	// typing is accounted for.
+	sensitive bool
 }
 
 // peer is one connected client.
@@ -158,16 +171,27 @@ func newHub(tr *console.Transport) *hub {
 	h.ty.Progress = h.progress
 	go func() {
 		err := h.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
+			if err := tr.Link.Send(b); err != nil {
+				// Recorded before the typer is told, so a write waiting on
+				// the dropped bytes sees why; a failed write was not typed.
+				h.mu.Lock()
+				if h.txErr == nil {
+					h.txErr = err
+				}
+				h.mu.Unlock()
+				return 0, err
+			}
 			for _, c := range b {
 				h.lineDirty.Store(c != '\r' && c != '\n' && c != 0x03)
 			}
-			err := tr.Link.Send(b)
 			h.wrote.Add(int64(len(b)))
-			return len(b), err
+			return len(b), nil
 		}))
 		if ctx.Err() == nil && err != nil {
 			h.mu.Lock()
-			h.txErr = err
+			if h.txErr == nil {
+				h.txErr = err
+			}
 			h.note("typing stopped: " + err.Error())
 			h.mu.Unlock()
 		}
@@ -285,15 +309,52 @@ func (h *hub) shutdown() {
 		if h.onClose != nil {
 			h.onClose()
 		}
+		// The ownership lock stays until the BMC-side release has run: with it
+		// let go first, another oob could open the console and have the
+		// release deactivate its session. A transport with a Release is let go
+		// by release; if nobody calls it, the lock goes after releaseWait.
+		if h.tr.Release == nil {
+			h.unlockHost()
+		} else {
+			time.AfterFunc(2*releaseWaitFor(), h.unlockHost)
+		}
 	})
 }
 
-// release ends the session at the BMC's end, once, after the transport is closed.
+// releaseWait bounds the BMC-side release, in nanoseconds. Atomic so tests can
+// shorten it while a hub from an earlier test is still finishing.
+var releaseWait atomic.Int64
+
+func init() { releaseWait.Store(int64(5 * time.Second)) }
+
+func releaseWaitFor() time.Duration { return time.Duration(releaseWait.Load()) }
+
+// unlockHost lets go of the host's ownership lock, once.
+func (h *hub) unlockHost() {
+	h.unlockOnce.Do(func() {
+		if h.unlock != nil {
+			h.unlock()
+		}
+	})
+}
+
+// release ends the session at the BMC's end, once, after the transport is
+// closed, and only then lets go of the ownership lock. It waits at most
+// releaseWait for the BMC.
 func (h *hub) release() {
 	h.releaseOnce.Do(func() {
 		if h.tr.Release != nil {
-			h.tr.Release()
+			rel := make(chan struct{})
+			go func() {
+				defer close(rel)
+				h.tr.Release()
+			}()
+			select {
+			case <-rel:
+			case <-time.After(releaseWaitFor()):
+			}
 		}
+		h.unlockHost()
 	})
 }
 
@@ -440,6 +501,11 @@ func (h *hub) leave(p *peer) {
 		return
 	}
 	delete(h.peers, p)
+	for k := range h.cancelled {
+		if k.p == p {
+			delete(h.cancelled, k)
+		}
+	}
 	wasAgent := p == h.agent
 	needRevoke := wasAgent && (h.lease || h.agentLine.chars > 0)
 	h.mu.Unlock()
@@ -516,26 +582,50 @@ func (h *hub) dropQueued() (typed []byte) {
 	return typed
 }
 
-// userWrite is a window's typing. While the AI tool has the keyboard it is
-// dropped, so the console's line never mixes the two; the window is told why.
+// userWrite is a window's typing. While the AI tool has the keyboard, or an
+// exclusive operation on the link (BREAK, toggle) is running, it is dropped, so
+// the console's line never mixes the two; the window is told why. The check and
+// the queueing happen under enqMu and mu together, and so do the start of an
+// exclusive operation and a lease grant: neither can begin in between.
 func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
 	if len(b) == 0 {
 		return
 	}
+	h.enqMu.Lock()
+	defer h.enqMu.Unlock()
 	h.mu.Lock()
 	if p.agent || h.closed {
 		h.mu.Unlock()
 		return
 	}
-	if h.lease {
-		if h.now().Sub(h.lastDrop) > dropNoteEvery {
-			h.lastDrop = h.now()
-			h.queue(p, msg{T: tNote, Text: h.agent.name + " is working · {keys} i pauses it"})
-		}
+	if h.windowBlocked(p) {
 		h.mu.Unlock()
 		return
 	}
 	b = h.mapUser(p, b)
+	h.typeWindow(b, urgent) // releases mu
+}
+
+// windowBlocked drops a window's input if the keyboard isn't theirs now, and
+// tells the window why (not too often). Call with mu held.
+func (h *hub) windowBlocked(p *peer) bool {
+	if !h.lease && h.busy == 0 {
+		return false
+	}
+	if h.now().Sub(h.lastDrop) > dropNoteEvery {
+		h.lastDrop = h.now()
+		if h.lease {
+			h.queue(p, msg{T: tNote, Text: h.agentName() + " is working · {keys} i pauses it"})
+		} else {
+			h.queue(p, msg{T: tNote, Text: "the console is busy · keys dropped"})
+		}
+	}
+	return true
+}
+
+// typeWindow tracks and queues a window's bytes. Call with enqMu and mu held;
+// it releases mu.
+func (h *hub) typeWindow(b []byte, urgent bool) {
 	if len(b) == 0 {
 		h.mu.Unlock()
 		return
@@ -544,13 +634,20 @@ func (h *hub) userWrite(p *peer, b []byte, urgent bool) {
 	h.trackUser(b)
 	h.mu.Unlock()
 	if !urgent {
-		h.enq(b)
+		h.enqCount += int64(len(b))
+		h.ty.Enqueue(b)
 		return
 	}
-	h.enqMu.Lock()
 	h.ty.Urgent(b)
 	h.enqCount = h.wrote.Load() + int64(len(b))
-	h.enqMu.Unlock()
+}
+
+// agentName is how the AI tool is named to windows. Call with mu held.
+func (h *hub) agentName() string {
+	if h.agent != nil {
+		return h.agent.name
+	}
+	return "the AI tool"
 }
 
 // fragWait is how long a window's unfinished escape sequence waits for its
@@ -582,12 +679,20 @@ func (h *hub) keysNote(note string) {
 }
 
 // dropFragment gives up on a window's unfinished escape sequence.
+// What it held is dropped while the link maps input; if the link has stopped
+// mapping since, it was ordinary input and is typed.
 func (h *hub) dropFragment(p *peer) {
+	h.enqMu.Lock()
+	defer h.enqMu.Unlock()
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, note := p.filter.Flush(h.tr.Link)
+	out, note := p.filter.Flush(h.tr.Link)
 	h.keysNote(note)
 	p.frag = nil
+	if len(out) == 0 || h.closed || h.windowBlocked(p) {
+		h.mu.Unlock()
+		return
+	}
+	h.typeWindow(out, false)
 }
 
 // userClear is the window's x key: drop what is queued to be typed.
@@ -643,9 +748,11 @@ func (h *hub) trackAgent(b []byte) {
 		switch {
 		case c == '\r' || c == '\n':
 			if len(t.text) > 0 {
-				h.markCommand(string(t.text))
+				h.markCommand(string(t.text), t.sensitive)
 			}
-			*t = typing{entered: true}
+			// What follows in the same write answers whatever this line
+			// opened: after a login line, a password.
+			*t = typing{entered: true, sensitive: t.sensitive}
 		case c == 0x03 || c == 0x15:
 			*t = typing{}
 		case c >= 0x20 && c != 0x7f:
@@ -660,9 +767,10 @@ func (h *hub) trackAgent(b []byte) {
 }
 
 // markCommand puts the AI tool's command in the windows' history and log,
-// except an answer to a password prompt. Call with mu held.
-func (h *hub) markCommand(text string) {
-	if h.atLogin() {
+// except an answer to a login or password prompt (sensitive: decided before the
+// line was sent, see typing). Call with mu held.
+func (h *hub) markCommand(text string, sensitive bool) {
+	if sensitive {
 		text = "answered a login prompt"
 	} else {
 		text = "typed: " + text
@@ -688,7 +796,10 @@ const (
 func (h *hub) revoke(bool) (note, reason string) {
 	h.mu.Lock()
 	h.gen++
-	h.lease, h.leaseID = false, 0
+	// The keyboard isn't given back until the cleanup below is typed: window
+	// input and a new lease wait (busy), and what it had in flight is stopped
+	// (gen). Otherwise a window's keys could land in the middle of the erase.
+	h.busy++
 	h.mu.Unlock()
 	partial := h.dropQueued()
 	h.mu.Lock()
@@ -711,17 +822,33 @@ func (h *hub) revoke(bool) (note, reason string) {
 	}
 	h.mu.Unlock()
 	if erase > 0 {
-		h.enq(bytes.Repeat([]byte{'\b'}, erase)) // backspace is understood almost everywhere; ctrl+u isn't
+		done := h.enq(bytes.Repeat([]byte{'\b'}, erase)) // backspace is understood almost everywhere; ctrl+u isn't
+		select {
+		case <-done:
+		case <-time.After(sendTimeout): // the typer stopped: don't hold the keyboard for it
+		}
 	}
+	h.mu.Lock()
+	h.busy--
+	h.lease, h.leaseID = false, 0
+	h.broadcastState()
+	h.mu.Unlock()
 	return note, reason
 }
 
 var (
 	errStopped = errors.New("stopped by the user")
 	errNoLease = errors.New("the AI tool doesn't have the keyboard")
+	errGone    = errors.New("this client has left the console")
 )
 
 func (h *hub) request(p *peer, m msg) {
+	h.mu.Lock()
+	_, here := h.peers[p]
+	h.mu.Unlock()
+	if !here { // it has left: nobody to answer, and nothing it asks is done
+		return
+	}
 	reply := msg{T: tReply, ID: m.ID}
 	var err error
 	switch m.Op {
@@ -789,10 +916,10 @@ func (h *hub) refuse(p *peer) error {
 	switch {
 	case p.agent && h.paused:
 		return ErrPaused
-	case h.busy:
+	case h.busy > 0:
 		return ErrBusy
 	case !p.agent && h.lease:
-		return errors.New(h.agent.name + " is working · {keys} i pauses it")
+		return errors.New(h.agentName() + " is working · {keys} i pauses it")
 	case p.agent && (h.userTyped > 0 || h.now().Sub(h.lastKey) < typingWindow):
 		return ErrTyping
 	}
@@ -806,9 +933,18 @@ const cancelledMax = 64
 // Each acquisition carries an id, so a release names the acquisition it ends:
 // a late one can't free a newer lease, and a request its client gave up on
 // (the release can arrive first) is refused instead of granted to nobody.
+//
+// Everything is decided under enqMu and mu together: that the client is still
+// here and the hub open, that nothing is waiting in the typer, and that no
+// window's input is between its check and its queueing.
 func (h *hub) agentOp(p *peer, m msg) error {
+	h.enqMu.Lock()
+	defer h.enqMu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, here := h.peers[p]; !here || (p.agent && h.agent != p) {
+		return errGone
+	}
 	switch {
 	case !p.agent:
 		return errors.New("only an AI tool takes the keyboard")
@@ -821,15 +957,16 @@ func (h *hub) agentOp(p *peer, m msg) error {
 			// Not held now: either long over, or its request is still on the
 			// way. Remember it, so the request is refused when it arrives.
 			if h.cancelled == nil {
-				h.cancelled = map[int]int{}
+				h.cancelled = map[cancelKey]int{}
 			}
 			h.cancelSeq++
-			h.cancelled[m.Lease] = h.cancelSeq
+			h.cancelled[cancelKey{p, m.Lease}] = h.cancelSeq
 			if len(h.cancelled) > cancelledMax {
-				oldest, at := 0, 0
-				for id, seq := range h.cancelled {
+				var oldest cancelKey
+				at := 0
+				for k, seq := range h.cancelled {
 					if at == 0 || seq < at {
-						oldest, at = id, seq
+						oldest, at = k, seq
 					}
 				}
 				delete(h.cancelled, oldest)
@@ -839,12 +976,18 @@ func (h *hub) agentOp(p *peer, m msg) error {
 	case h.lease:
 		return ErrBusy
 	}
-	if _, gone := h.cancelled[m.Lease]; gone && m.Lease != 0 {
-		delete(h.cancelled, m.Lease)
+	if _, gone := h.cancelled[cancelKey{p, m.Lease}]; gone && m.Lease != 0 {
+		delete(h.cancelled, cancelKey{p, m.Lease})
 		return errors.New("the lease request was cancelled")
+	}
+	if h.closed {
+		return ErrClosed
 	}
 	if err := h.refuse(p); err != nil {
 		return err
+	}
+	if h.ty.Queued() > 0 { // the user's typing (or an erase) is still going out: not yet the AI tool's line
+		return ErrTyping
 	}
 	h.lease, h.leaseID, h.agentLine.entered = true, m.Lease, false
 	h.broadcastState()
@@ -890,6 +1033,13 @@ func (h *hub) agentWrite(p *peer, b []byte, cuts []int) error {
 		err = ErrPaused
 	case !h.lease:
 		err = errStopped
+	case h.busy > 0: // being stopped, or an exclusive operation is running
+		err = ErrBusy
+	}
+	if err == nil && h.agentLine.chars == 0 && len(h.agentLine.text) == 0 {
+		// A new line starts with this write: whether it is for a login or a
+		// password is decided now, before anything is sent.
+		h.agentLine.sensitive = h.atLogin()
 	}
 	gen := h.gen
 	h.mu.Unlock()
@@ -933,9 +1083,9 @@ func (h *hub) agentWrite(p *peer, b []byte, cuts []int) error {
 func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 	h.mu.Lock()
 	local := p == h.local
+	h.mu.Unlock()
 	switch m.Op {
 	case opSizeLine:
-		h.mu.Unlock()
 		if !local || p.agent { // like resize and fit: a joined window doesn't change the host's console, and typing this line would
 			return nil
 		}
@@ -945,24 +1095,16 @@ func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 		return nil
 	case opResize, opFit, opDisconnect:
 		if !local || p.agent { // a joined window doesn't change the host's console
-			h.mu.Unlock()
 			if m.Op == opDisconnect {
 				return errors.New("only the oob that opened the console can end it")
 			}
 			return nil
 		}
 	}
-	if err := h.refuse(p); err != nil && m.Op != opDisconnect {
-		h.mu.Unlock()
+	if err := h.beginLinkOp(p, m.Op); err != nil {
 		return err
 	}
-	h.busy = true
-	h.mu.Unlock()
-	defer func() {
-		h.mu.Lock()
-		h.busy = false
-		h.mu.Unlock()
-	}()
+	defer h.endLinkOp()
 
 	switch m.Op {
 	case opBreak:
@@ -1005,6 +1147,27 @@ func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 		return h.tr.Link.FitSize(m.Rows, m.Cols)
 	}
 	return errors.New("unknown operation " + m.Op)
+}
+
+// beginLinkOp admits an exclusive operation on the link and marks the hub busy.
+// It takes enqMu as well as mu, so no window's input is between its check and
+// its queueing when the operation starts, and BREAK's look at the queue sees it.
+func (h *hub) beginLinkOp(p *peer, op string) error {
+	h.enqMu.Lock()
+	defer h.enqMu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.refuse(p); err != nil && op != opDisconnect {
+		return err
+	}
+	h.busy++
+	return nil
+}
+
+func (h *hub) endLinkOp() {
+	h.mu.Lock()
+	h.busy--
+	h.mu.Unlock()
 }
 
 // Messages to clients. Call these with mu held.

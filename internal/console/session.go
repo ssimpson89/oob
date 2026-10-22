@@ -349,8 +349,9 @@ func (k *consoleKeys) Input(b []byte) bool {
 func (k *consoleKeys) Flush() bool {
 	fwd, acts := k.parser.Flush()
 	ok := k.apply(fwd, acts)
-	_, note := k.filter.Flush(k.cs.Link) // what it held is a cut-off key: dropped
+	out, note := k.filter.Flush(k.cs.Link) // a cut-off key is dropped; input the link no longer maps is typed
 	k.showKeysNote(note)
+	k.q.Enqueue(out)
 	return ok
 }
 

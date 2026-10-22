@@ -42,6 +42,12 @@ type fakeConsole struct {
 	atBMC    bool
 	toggle   bool
 	vsp      bool // maps input like an iLO VSP
+
+	sendErr     error          // Send fails with this
+	onSend      func(b []byte) // runs inside Send, after b is recorded
+	breakGate   chan struct{}  // Break waits for it to close, if set
+	inBreak     chan struct{}  // closed when Break starts, if set
+	releaseGate chan struct{}  // the transport's Release waits for it to close, if set
 }
 
 func newFake() *fakeConsole {
@@ -59,11 +65,29 @@ func (f *fakeConsole) Send(b []byte) error {
 	defer f.inSend.Add(-1)
 	time.Sleep(f.delay)
 	f.mu.Lock()
-	f.sent = append(f.sent, b...)
+	err, hook := f.sendErr, f.onSend
+	if err == nil {
+		f.sent = append(f.sent, b...)
+	}
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(b)
+	}
+	return err
+}
+
+func (f *fakeConsole) Break() error {
+	if f.inBreak != nil {
+		close(f.inBreak)
+	}
+	if f.breakGate != nil {
+		<-f.breakGate
+	}
+	f.mu.Lock()
+	f.breaks++
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeConsole) Break() error                     { f.mu.Lock(); f.breaks++; f.mu.Unlock(); return nil }
 func (f *fakeConsole) Disconnect() error                { f.done <- console.Result{}; f.pw.Close(); return nil }
 func (f *fakeConsole) Resize(rows, cols int) error      { return nil }
 func (f *fakeConsole) FitSize(rows, cols int) error     { return nil }
@@ -104,7 +128,14 @@ func (f *fakeConsole) transport() *console.Transport {
 			default:
 			}
 		},
-		Release: func() { f.mu.Lock(); f.released = true; f.mu.Unlock() },
+		Release: func() {
+			if f.releaseGate != nil {
+				<-f.releaseGate
+			}
+			f.mu.Lock()
+			f.released = true
+			f.mu.Unlock()
+		},
 	}
 	if f.toggle {
 		t.Toggle = func() (string, bool, error) {

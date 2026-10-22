@@ -256,3 +256,58 @@ func TestConsoleKeysDropAFragmentedArrowWhole(t *testing.T) {
 		t.Errorf("typed %q, want abde", got)
 	}
 }
+
+// togglingLink is a VSP mapper that can stop mapping, like the iLO link at the
+// BMC's own prompt.
+type togglingLink struct {
+	fakeLink
+	off bool
+}
+
+func (l *togglingLink) MapInput(b []byte) ([]byte, string) {
+	if l.off {
+		return b, ""
+	}
+	return MapVSPInput(b)
+}
+
+func TestInputFilterHoldsNothingWhileTheLinkIsNotMapping(t *testing.T) {
+	l := &togglingLink{off: true}
+	var f InputFilter
+	if out, _ := f.Map(l, []byte("\x1b[1;5")); string(out) != "\x1b[1;5" || f.Pending() {
+		t.Errorf("unmapped link: out %q pending %v, want the bytes through and nothing held", out, f.Pending())
+	}
+	// Held while mapping, then the link stops mapping: the held keys are
+	// forwarded, not dropped.
+	l.off = false
+	if out, _ := f.Map(l, []byte("\x1b[1;5")); len(out) != 0 || !f.Pending() {
+		t.Fatalf("mapped link: out %q pending %v", out, f.Pending())
+	}
+	l.off = true
+	if out, note := f.Flush(l); string(out) != "\x1b[1;5" || note != "" || f.Pending() {
+		t.Errorf("flush after the mapping ended: out %q note %q", out, note)
+	}
+	l.off = false
+	f.Map(l, []byte("\x1b["))
+	l.off = true
+	if out, _ := f.Map(l, []byte("A")); string(out) != "\x1b[A" || f.Pending() {
+		t.Errorf("next input after the mapping ended: %q", out)
+	}
+}
+
+func TestConsoleKeysForwardAHeldKeyWhenTheLinkStopsMapping(t *testing.T) {
+	fl := &togglingLink{}
+	k, _ := vspKeys(t, fl)
+	k.Input([]byte("\x1b[1;"))
+	if !k.filter.Pending() {
+		t.Fatal("an unfinished key is not held")
+	}
+	fl.off = true
+	k.Flush()
+	for i := 0; i < 200 && len(fl.sentCopy()) < 4; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := string(fl.sentCopy()); got != "\x1b[1;" {
+		t.Errorf("sent %q, want the held bytes forwarded", got)
+	}
+}

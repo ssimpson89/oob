@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -492,5 +493,36 @@ func TestSendKeysEscThenEnterKeepsTheKeysApartOnAnILOVSP(t *testing.T) {
 	}
 	if got := f.rawSent(); got != before {
 		t.Errorf("a refused call still typed %q", got[len(before):])
+	}
+}
+
+// A console whose output hangs up with no exit status must end runLine at
+// once, not spin until wait_seconds passes.
+func TestRunLineStopsWhenOutputClosed(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.emit("compiling...") // cursor not at a prompt, so only EOF can end the wait
+	time.Sleep(100 * time.Millisecond)
+	f.pw.Close() // output EOF; Done is never sent
+	select {
+	case <-c.eofC:
+	case <-time.After(10 * time.Second): // a shared console waits endWait for the exit status first
+		t.Fatal("output EOF not seen")
+	}
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- c.runLine(context.Background(), "uptime", 5*time.Second) }()
+	select {
+	case <-done:
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("runLine took %v after output closed", d)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runLine kept waiting after the output closed")
 	}
 }

@@ -71,16 +71,24 @@ func confirmDestructive(cmd, name string, h config.Host, rest []string) error {
 	return nil
 }
 
+// takeConsole is for --raw, --force and --deactivate, which act on the BMC's
+// session directly and would take the console from whoever has it. It takes the
+// same ownership lock a sharing oob holds, so the check and the operation can't
+// be split by another oob opening the console in between: release it when the
+// operation is over. If another oob has the console, it says so.
+func takeConsole(name string, h config.Host) (release func(), err error) {
+	addr, _ := share.Endpoint(h)
+	release, err = share.Exclusive(name, addr)
+	if errors.Is(err, share.ErrShared) {
+		return nil, fmt.Errorf("%s's console is open in another oob and shared; --raw, --force and --deactivate would take it from them. Run `%s sol %s` to join it", name, app.Name, name)
+	}
+	return release, err
+}
+
 // joinSharedConsole joins the console another oob has open for name, as a
 // window. joined is false when nobody has it, and the caller opens it itself.
 func joinSharedConsole(name string, h config.Host, o bmc.SOLOptions, drv bmc.Driver) (joined bool, err error) {
 	addr, typ := share.Endpoint(h)
-	if o.Raw || o.Deact || o.Force {
-		if share.Exists(name, addr) {
-			return true, fmt.Errorf("%s's console is open in another oob and shared; --raw, --force and --deactivate would take it from them. Run `%s sol %s` to join it", name, app.Name, name)
-		}
-		return false, nil
-	}
 	if !console.UseBar() {
 		return false, nil
 	}
@@ -136,6 +144,14 @@ func bmcCmds() []*cobra.Command {
 				h.LineDelayMS = ptrMS(lineDelay)
 			}
 			drv := bmc.DriverForProbed(name, h)
+			if o.Raw || o.Deact || o.Force {
+				release, err := takeConsole(name, h)
+				if err != nil {
+					return err
+				}
+				defer release() // held through the operation
+				return drv.Console(o)
+			}
 			if joined, err := joinSharedConsole(name, h, o, drv); joined {
 				return err
 			}

@@ -137,6 +137,60 @@ func Exists(host, addr string) bool {
 	return true
 }
 
+// ErrShared is what Exclusive returns when another oob has the console.
+var ErrShared = errors.New("this console is open in another oob")
+
+// Exclusive takes the ownership lock of host's console, the one Open elects a
+// host with, and holds it until release is called. It is for an operation that
+// acts on the BMC's console session directly (sol --force, --deactivate,
+// --raw): with the lock held no other oob can open or host the console, and if
+// another already has it, the answer is ErrShared. Checking for a socket
+// instead would leave a window between the check and the operation. A console
+// that can't be shared here has no lock to take, and release does nothing.
+func Exclusive(host, addr string) (release func(), err error) {
+	_, lockPath, ok := paths(host, addr)
+	if !ok {
+		return func() {}, nil
+	}
+	f, err := lock(lockPath)
+	switch {
+	case err == nil:
+		heldMu.Lock()
+		held[lockPath] = f
+		heldMu.Unlock()
+		return func() {
+			heldMu.Lock()
+			g, ok := held[lockPath]
+			if ok && g == f {
+				delete(held, lockPath)
+			}
+			heldMu.Unlock()
+			if ok && g == f { // not handed to a hub by Open meanwhile
+				unlock(f)
+			}
+		}, nil
+	case errors.Is(err, errHeld):
+		return nil, ErrShared
+	}
+	return func() {}, nil // no lock to be had: like Open, go on unshared
+}
+
+var (
+	heldMu sync.Mutex
+	held   = map[string]*os.File{} // locks taken by Exclusive and not yet handed on or released
+)
+
+// takeHeld hands the lock Exclusive took at path to the caller, which opens the
+// console under it: the operation that took it goes on to host the console
+// (sol --force clears the session, then shares the new one) without a gap.
+func takeHeld(path string) *os.File {
+	heldMu.Lock()
+	defer heldMu.Unlock()
+	f := held[path]
+	delete(held, path)
+	return f
+}
+
 // Open joins the console for opt.Host if another oob has it open, or else
 // opens it with opt.Open and shares it.
 func Open(ctx context.Context, opt Options) (*Client, error) {
@@ -150,7 +204,14 @@ func Open(ctx context.Context, opt Options) (*Client, error) {
 	}
 	deadline := time.Now().Add(joinWait)
 	for {
-		f, err := lock(lockPath)
+		var f *os.File
+		var err error
+		if opt.Open != nil {
+			f = takeHeld(lockPath)
+		}
+		if f == nil {
+			f, err = lock(lockPath)
+		}
 		switch {
 		case err == nil:
 			if opt.Open == nil {
@@ -236,9 +297,9 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 		if ho.ln != nil {
 			ho.ln.Close()
 		}
-		if ho.lock != nil {
-			unlock(ho.lock)
-		}
+	}
+	if ho.lock != nil {
+		h.unlock = func() { unlock(ho.lock) }
 	}
 	mine, theirs := net.Pipe()
 	go h.serve(theirs, true)
@@ -250,6 +311,7 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 		c.holder = nil
 		c.mu.Unlock()
 		h.shutdown()
+		h.unlockHost() // nothing was typed or opened at the BMC for anyone: no release to wait for
 		return err
 	}
 	go c.run()

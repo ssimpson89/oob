@@ -749,6 +749,8 @@ func (c *session) runLine(ctx context.Context, l string, wait time.Duration) err
 		select {
 		case <-c.doneC:
 			return nil
+		case <-c.eofC: // output hung up: settle returns at once now, so looping would spin
+			return nil
 		default:
 		}
 		cur := c.line().cursor

@@ -121,8 +121,17 @@ func (f *InputFilter) Pending() bool { return len(f.held) > 0 }
 // Map is MapInput for the stream's next bytes.
 func (f *InputFilter) Map(l Link, b []byte) (out []byte, note string) {
 	m, ok := l.(InputMapper)
-	if !ok {
-		return b, ""
+	if !ok || !mappingActive(m) {
+		// No mapping now (not a VSP, or the BMC's own prompt): nothing is held,
+		// and anything held from before the link changed goes out with b.
+		if held := f.held; len(held) > 0 {
+			f.held = nil
+			b = append(held, b...)
+		}
+		if !ok {
+			return b, ""
+		}
+		return m.MapInput(b)
 	}
 	if len(f.held) == 0 && bytes.IndexByte(b, 0x1b) < 0 {
 		return m.MapInput(b)
@@ -136,8 +145,21 @@ func (f *InputFilter) Map(l Link, b []byte) (out []byte, note string) {
 	return m.MapInput(data)
 }
 
-// Flush gives up on a held sequence: it is dropped whole, with the link's
-// note for dropped keys, and the stream goes on from the next byte.
+// mappingProbe is a key that a mapping link drops (an Alt-key) and any other
+// link passes as it is.
+var mappingProbe = []byte{0x1b, 'x'}
+
+// mappingActive reports whether m changes input right now. A link can
+// implement InputMapper and still pass everything through (the iLO CLI's own
+// prompt, a plain ssh session), and then no sequence is worth holding.
+func mappingActive(m InputMapper) bool {
+	out, _ := m.MapInput(bytes.Clone(mappingProbe))
+	return !bytes.Equal(out, mappingProbe)
+}
+
+// Flush gives up on a held sequence: with the mapping in force it is dropped
+// whole, with the link's note for dropped keys; if the link has stopped
+// mapping since, out is what to type. The stream goes on from the next byte.
 func (f *InputFilter) Flush(l Link) (out []byte, note string) {
 	data := f.held
 	f.held = nil
