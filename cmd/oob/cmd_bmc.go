@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -88,19 +87,13 @@ func takeConsole(name string, h config.Host) (release func(), err error) {
 // joinSharedConsole joins the console another oob has open for name, as a
 // window. joined is false when nobody has it, and the caller opens it itself.
 func joinSharedConsole(name string, h config.Host, o bmc.SOLOptions, drv bmc.Driver) (joined bool, err error) {
-	addr, typ := share.Endpoint(h)
 	if !console.UseBar() {
 		return false, nil
 	}
-	c, err := share.Open(context.Background(), share.Options{Host: name, Addr: addr, Type: typ, NoLinger: true})
+	code, err := share.RunConsole(h, name, share.Console{Power: drv.ConsolePower()})
 	if errors.Is(err, share.ErrNoHub) {
 		return false, nil
 	}
-	if err != nil {
-		return true, err
-	}
-	defer c.Close()
-	code, err := share.RunWindow(c, name, drv.ConsolePower(), "")
 	return true, app.Code(code, err)
 }
 

@@ -15,7 +15,6 @@ import (
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/share"
-	"golang.org/x/term"
 )
 
 // solEscape is the SOL escape character handed to ipmitool with -e. ipmitool
@@ -201,34 +200,13 @@ func solExitCode(ee *exec.ExitError, hungUp bool) int {
 // plain openSOL). It runs under the console's ownership lock, so anything that
 // must clear the BMC's session first belongs in it.
 func solConsole(h config.Host, name string, power func() (string, error), open func(rows, cols int) (*ConsoleTransport, error)) (int, error) {
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return 1, err
+	if open == nil {
+		open = func(rows, cols int) (*ConsoleTransport, error) { return openSOL(h, rows, cols) }
 	}
-	addr, typ := share.Endpoint(h)
-	c, err := share.Open(context.Background(), share.Options{
-		Host: name, Addr: addr, Type: typ, NoLinger: true,
-		Open: func() (*console.Transport, error) {
-			if open != nil {
-				return open(console.RemoteRows(rows), w)
-			}
-			return openSOL(h, console.RemoteRows(rows), w)
-		},
+	// Repeat any ipmitool error below the bar's old row so it is still on screen
+	// after the console is torn down.
+	return share.RunConsole(h, name, share.Console{
+		Open: open, Power: power, Connecting: "connecting to " + name + " via IPMI...",
+		Failed: func(c *share.Client) { reportIpmiFailure(c.Tail(), h) },
 	})
-	if err != nil {
-		return 1, err
-	}
-	defer c.Release() // after Close: ends the BMC's session if this oob opened it
-	defer c.Close()
-	connecting := "connecting to " + name + " via IPMI..."
-	if c.Joined() {
-		connecting = ""
-	}
-	code, err := share.RunWindow(c, name, power, connecting)
-	// The terminal is restored now. Repeat any ipmitool error below the bar's
-	// old row so it is still on screen after the console is torn down.
-	if code != 0 && c.Hosting() {
-		reportIpmiFailure(c.Tail(), h)
-	}
-	return code, err
 }

@@ -2,7 +2,6 @@ package bmc
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +18,6 @@ import (
 	"github.com/ssimpson89/oob/internal/share"
 	"github.com/ssimpson89/oob/internal/sshx"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 // The generic SSH CLI console shared by the vendor drivers: an interactive
@@ -533,23 +531,13 @@ func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTr
 // console is shared: if another oob already has it open (an iLO allows one VSP
 // session, so a second connection couldn't work), this joins it instead.
 func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, error)) (int, error) {
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return 1, err
-	}
-	addr, typ := share.Endpoint(h)
-	c, err := share.Open(context.Background(), share.Options{
-		Host: name, Addr: addr, Type: typ, NoLinger: true,
-		Open: func() (*console.Transport, error) {
+	return share.RunConsole(h, name, share.Console{
+		Power: power,
+		Open: func(rows, cols int) (*ConsoleTransport, error) {
 			app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
-			return cliOpen(name, h, sp, console.RemoteRows(rows), w)
+			return cliOpen(name, h, sp, rows, cols)
 		},
 	})
-	if err != nil {
-		return 1, err
-	}
-	defer c.Close()
-	return share.RunWindow(c, name, power, "")
 }
 
 // cliSpecFor is the console spec for a host type, for toggling inside oob ssh.
