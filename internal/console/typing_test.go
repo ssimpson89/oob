@@ -404,16 +404,28 @@ func TestCtrlCJumpsTheQueue(t *testing.T) {
 	}
 }
 
-func TestChordWritesDropTheQueueFirst(t *testing.T) {
+// ctrl+] ] sends the literal byte behind what is already queued; it must not
+// throw away a paste in progress.
+func TestLiteralChordKeepsTheQueue(t *testing.T) {
 	g := newGated()
 	r := newRig(t, g, Pacing{}, g.wait)
+	want := strings.Repeat("y", 100) + "\x1d"
 	r.paste(strings.Repeat("y", 100))
-	g.held(t)
+	first := g.held(t)
 	r.k.Input([]byte(string(rune(escapeByte)) + "]"))
-	<-g.wrote
-	<-g.wrote
-	if got := g.text(); got != "y\x1d" {
-		t.Errorf("sent %q, want the literal ctrl+] out at once after the queue was dropped", got)
+	first <- time.Now()
+	deadline := time.After(10 * time.Second)
+	for len(g.text()) < len(want) {
+		select {
+		case ch := <-g.waits:
+			ch <- time.Now()
+		case <-g.wrote:
+		case <-deadline:
+			t.Fatalf("sent %d bytes, want %d", len(g.text()), len(want))
+		}
+	}
+	if got := g.text(); got != want {
+		t.Errorf("sent %q, want the paste intact and the literal ctrl+] after it", got)
 	}
 }
 
