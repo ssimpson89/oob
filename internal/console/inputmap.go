@@ -35,9 +35,11 @@ func MapInput(l Link, b []byte) (out []byte, note string) {
 
 // MapVSPInput is the iLO VSP's mapping, for a link that is in the console:
 // a lone ESC is typed as ESC ESC (the only way one gets through); a CSI
-// sequence (ESC [ ... final), an SS3 sequence (ESC O x) and an Alt-key
-// (ESC x) are dropped with VSPKeysNote, since the VSP would drop the ESC and
-// the next byte anyway, or leave for the iLO CLI on ESC (. Focus reports
+// sequence (ESC [ ... final) and an SS3 sequence (ESC O x) are dropped with
+// VSPKeysNote, since the VSP would drop the ESC and the next byte anyway. ESC
+// followed by a printable byte is a lone ESC and that key: a fast "<Esc>:wq"
+// arrives in one read, and the VSP can't pass an Alt-key whichever it was. ESC
+// ( is the exception, dropped, since it leaves for the iLO CLI. Focus reports
 // (ESC [ I, ESC [ O) are dropped silently. An ESC at the end of b is lone: the
 // key parser only hands one over by itself after the key had time to be a
 // whole key. Two ESCs in a row are two lone ESCs.
@@ -71,7 +73,9 @@ func MapVSPInput(b []byte) (out []byte, note string) {
 			} else {
 				i++ // a cut-off ESC O: ctrl+c after it is still typed
 			}
-		default: // Alt-key
+		case rest[0] >= 0x20 && rest[0] < 0x7f && rest[0] != '(': // a lone ESC, then that key
+			out = append(out, 0x1b, 0x1b)
+		default: // ESC ( and other Alt-keys
 			note = VSPKeysNote
 			i++
 		}

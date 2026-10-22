@@ -23,7 +23,8 @@ func TestMapVSPInput(t *testing.T) {
 		{"csi cut off", "a" + esc + "[1;", "a", true},
 		{"ss3", esc + "OP", "", true},
 		{"ss3 cut off", esc + "O", "", true},
-		{"alt key", esc + "x", "", true},
+		{"esc then a printable key", esc + "x", esc + esc + "x", false},
+		{"fast esc :wq", esc + ":wq\r", esc + esc + ":wq\r", false},
 		{"alt paren is never sent", esc + "(", "", true},
 		{"text around an arrow", "a" + esc + "[Ab", "ab", true},
 		{"focus in", esc + "[I", "", false},
@@ -126,7 +127,7 @@ func TestConsoleKeysOnAVSPLink(t *testing.T) {
 	con.st.note = ""
 	con.mu.Unlock()
 	k.Input([]byte("\x1bOP"))
-	k.Input([]byte("\x1bxc"))
+	k.Input([]byte("\x1b(c")) // ESC ( is dropped, never typed
 	wait("\x1b\x1babc")
 	if n := barNote(con); n != "" {
 		t.Errorf("the note showed twice: %q", n)
@@ -135,6 +136,10 @@ func TestConsoleKeysOnAVSPLink(t *testing.T) {
 	// A paste has its escape sequences stripped, and types the rest.
 	k.Input([]byte("\x1b[200~echo \x1b[31mhi\x1b[201~"))
 	wait("\x1b\x1babcecho hi")
+
+	// A fast Esc, :wq and Enter in one read is a lone ESC and the keys.
+	k.Input([]byte("\x1b:wq\r"))
+	wait("\x1b\x1babcecho hi\x1b\x1b:wq\r")
 }
 
 func TestConsoleKeysOnANonVSPLinkAreUnchanged(t *testing.T) {
