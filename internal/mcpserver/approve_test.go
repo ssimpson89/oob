@@ -35,7 +35,7 @@ func TestApprovalOutcomesAreTold(t *testing.T) {
 		{"answer for another id", mcp.InputResponseMap{"other": &mcp.ElicitResult{Action: "accept"}}, false, "no answer", "refused", "no answer"},
 		{"declined", mcp.InputResponseMap{approvalID: &mcp.ElicitResult{Action: "decline"}}, false, "the user declined", "no answer", "declined"},
 		{"cancelled", mcp.InputResponseMap{approvalID: &mcp.ElicitResult{Action: "cancel"}}, false, "dismissed", "the user declined", "dismissed"},
-		{"accepted unticked", mcp.InputResponseMap{approvalID: &mcp.ElicitResult{Action: "accept", Content: map[string]any{"allow": false}}}, false, "without \"Allow it\" ticked", "no answer", "without Allow it"},
+		{"accepted with no content", mcp.InputResponseMap{approvalID: &mcp.ElicitResult{Action: "accept"}}, true, "", "", "user approved"},
 		{"accepted", mcp.InputResponseMap{approvalID: &mcp.ElicitResult{Action: "accept", Content: map[string]any{"allow": true}}}, true, "", "", "user approved"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

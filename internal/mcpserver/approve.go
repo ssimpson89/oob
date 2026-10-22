@@ -96,10 +96,8 @@ func (s *server) approve(req *mcp.CallToolRequest, dev target, what string, whys
 			Message: fmt.Sprintf("An AI agent wants to do this on %s:\n\n%s\n\nIt %s.", visible(dev.label()), visible(what), why),
 			RequestedSchema: &jsonschema.Schema{
 				Type: "object",
-				Properties: map[string]*jsonschema.Schema{
-					"allow": {Type: "boolean", Title: "Allow it", Default: json.RawMessage("false")},
-				},
-				Required: []string{"allow"},
+				// No fields: the prompt is just allow (accept) or deny (decline).
+				Properties: map[string]*jsonschema.Schema{},
 			},
 		}},
 		RequestState: state,
@@ -158,13 +156,9 @@ func (s *server) answered(resp mcp.InputResponse, dev target, what, why string) 
 			"client that supports MCP elicitation, or run it with the oob command line", why)
 	}
 	switch {
-	case r.Action == "accept" && r.Content["allow"] == true:
+	case r.Action == "accept":
 		dev.note("user approved: " + visible(what))
 		return nil
-	case r.Action == "accept":
-		dev.note("approval accepted without Allow it ticked (it " + why + "): " + visible(what))
-		return fmt.Errorf("the approval prompt was answered without \"Allow it\" ticked, so nothing was done (the call needed approval "+
-			"because it %s). Don't do it another way; ask the user how they want to go on", why)
 	case r.Action == "decline":
 		dev.note("user declined (it " + why + "): " + visible(what))
 		return fmt.Errorf("the user declined, so nothing was done (the call needed approval because it %s). Don't do it another way; "+
