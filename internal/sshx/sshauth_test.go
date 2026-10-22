@@ -229,6 +229,34 @@ func TestAuthAgentOnly(t *testing.T) {
 	})
 }
 
+// With a password and no key, the password goes before the agent's keys, so an
+// agent with many keys cannot trigger "too many authentication failures".
+func TestAuthPasswordBeforeAgentKeys(t *testing.T) {
+	noAgentEnv(t)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	startAgent(t, priv)
+	sp, _ := ssh.NewSignerFromKey(priv)
+
+	t.Run("password accepted: agent never tried", func(t *testing.T) {
+		as, _, port := newAuthServer(t, sp.PublicKey())
+		if err := dialTest(t, config.Host{Pass: "pw"}, port); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(as.tried(), ","); got != "none,password" {
+			t.Errorf("methods = %s", got)
+		}
+	})
+	t.Run("password rejected: agent key is the fallback", func(t *testing.T) {
+		as, _, port := newAuthServer(t, sp.PublicKey())
+		if err := dialTest(t, config.Host{Pass: "wrong"}, port); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(as.tried(), ","); got != "none,password,publickey" {
+			t.Errorf("methods = %s", got)
+		}
+	})
+}
+
 func TestAuthPasswordOnly(t *testing.T) {
 	noAgentEnv(t)
 	as, _, port := newAuthServer(t)

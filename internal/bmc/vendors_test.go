@@ -216,13 +216,17 @@ func TestIDRACParsing(t *testing.T) {
 }
 
 type fakeRacadm struct {
-	cmds []string
-	out  map[string]string
-	err  error
+	cmds      []string
+	timeouts  []time.Duration
+	noPrompts []bool
+	out       map[string]string
+	err       error
 }
 
-func (f *fakeRacadm) run(cmd string, _ time.Duration) (string, error) {
+func (f *fakeRacadm) run(cmd string, to time.Duration, noPrompt bool) (string, error) {
 	f.cmds = append(f.cmds, cmd)
+	f.timeouts = append(f.timeouts, to)
+	f.noPrompts = append(f.noPrompts, noPrompt)
 	return f.out[cmd], f.err
 }
 
@@ -239,6 +243,10 @@ func TestIDRACCommands(t *testing.T) {
 	d := newFakeIDRAC(f)
 	if r := d.PowerStatus(time.Second); r.Failed || r.Text != "Chassis Power is on" {
 		t.Errorf("%+v", r)
+	}
+	// The status read passes its budget on and never prompts; actions may.
+	if len(f.timeouts) != 1 || f.timeouts[0] != time.Second || !f.noPrompts[0] {
+		t.Errorf("status run: timeouts %v noPrompts %v", f.timeouts, f.noPrompts)
 	}
 	for _, c := range []struct {
 		do   func() error
@@ -500,5 +508,19 @@ func TestSupermicroConsoleWithoutTerminalDoesNotClearASharedConsole(t *testing.T
 	err = newSupermicroDriver("s", h).Console(SOLOptions{})
 	if err == nil || !strings.Contains(err.Error(), "another oob") {
 		t.Errorf("Console = %v, want a refusal naming the other oob", err)
+	}
+}
+
+// The untested-vendor note and the racreset note go to the captured output, so
+// an MCP caller sees them, not only the terminal.
+func TestIDRACNotesAreCaptured(t *testing.T) {
+	swap(t, &untestedDone, false)
+	d := newFakeIDRAC(&fakeRacadm{out: map[string]string{}})
+	out, err := Capture(context.Background(), func() error { return d.MCReset("cold") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no warm or cold choice") || !strings.Contains(out, "support is untested") {
+		t.Errorf("captured output %q", out)
 	}
 }

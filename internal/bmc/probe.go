@@ -76,10 +76,19 @@ func probeVendor(name string, h config.Host, dial, read time.Duration) (string, 
 	if typ != "" {
 		return typ, gen, nil
 	}
-	if expired.Load() && err != nil {
+	// From here on nothing matched. That is only a conclusive "plain IPMI" when
+	// the probe really read a banner or a prompt; a watchdog expiry, a read
+	// error or an empty session is inconclusive and must not be saved.
+	if expired.Load() {
 		return "", 0, &console.TimeoutError{Host: name, Via: "SSH", After: read, Cause: err}
 	}
-	return "", 0, err
+	if err != nil {
+		return "", 0, err
+	}
+	if banner.Len() == 0 && strings.TrimSpace(out) == "" {
+		return "", 0, errors.New("no banner or prompt was read")
+	}
+	return "", 0, nil
 }
 
 // readFirstOutput opens a shell and reads until the vendor is clear, the first
@@ -110,6 +119,7 @@ func readFirstOutput(cl *ssh.Client, banner string) (string, error) {
 	chunks := make(chan []byte)
 	done := make(chan struct{})
 	defer close(done)
+	var readErr error // set before chunks is closed
 	go func() {
 		defer close(chunks)
 		buf := make([]byte, 1024)
@@ -123,6 +133,9 @@ func readFirstOutput(cl *ssh.Client, banner string) (string, error) {
 				}
 			}
 			if err != nil {
+				if err != io.EOF {
+					readErr = err
+				}
 				return
 			}
 		}
@@ -137,6 +150,9 @@ func readFirstOutput(cl *ssh.Client, banner string) (string, error) {
 		}
 		b, ok := <-chunks // ends when the output ends or the deadline closes cl
 		if !ok {
+			if readErr != nil {
+				return string(out), console.CleanErr(readErr)
+			}
 			break
 		}
 		out = append(out, b...)
@@ -189,6 +205,11 @@ func Resolve(name string, h config.Host, budget time.Duration) config.Host {
 		return h
 	}
 	if typ == "" {
+		// The login worked but no vendor matched: it is a plain IPMI BMC.
+		// Save that so the host is not probed again on every command.
+		if _, serr := detect.SaveType(name, detect.TypeIPMI, 0); serr != nil && !app.Quiet() {
+			app.Notef(probeW(), "could not save type %s for %s: %v", detect.TypeIPMI, name, serr)
+		}
 		return h
 	}
 	set, serr := detect.SaveType(name, typ, gen)

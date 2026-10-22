@@ -195,8 +195,10 @@ func TestProbeNothingDetected(t *testing.T) {
 	if got := typeName(DriverForProbed("node01", h)); got != "*bmc.ipmiDriver" {
 		t.Errorf("driver %s", got)
 	}
-	if typ, _ := savedType(t, p); typ != "" {
-		t.Errorf("saved %q", typ)
+	// A login that works but matches no vendor is saved as plain IPMI, so the
+	// host is not probed again on every command.
+	if typ, _ := savedType(t, p); typ != "ipmi" {
+		t.Errorf("saved %q, want ipmi", typ)
 	}
 	if out.Len() != 0 {
 		t.Errorf("output %q", out.String())
@@ -402,5 +404,92 @@ func TestProbeRejectionMessageIsCleaned(t *testing.T) {
 	}
 	if strings.ContainsAny(out.String(), "\x1b\x07") {
 		t.Errorf("escape sequence in note: %q", out.String())
+	}
+}
+
+// The status and bulk paths (sshExec, cliDial) are unattended like the probe:
+// an encrypted key fails with ErrNeedsInput instead of asking for a passphrase.
+func TestUnattendedSSHPathsDoNotPrompt(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(blk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := startProbeBMC(t, "", "</>hpeiLO-> ", "pw")
+	_, h := probeEnv(t, "ilo", srv.port)
+	h.Key, h.Pass = keyPath, ""
+	if _, err := sshExec("node01", h, "racadm getsysinfo", time.Second, true); !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("sshExec err %v, want ErrNeedsInput", err)
+	}
+	if _, err := iloDo("node01", h, "power", time.Second, true); !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("iloDo err %v, want ErrNeedsInput", err)
+	}
+	if _, _, _, err := cliDial("node01", h, iloSpec, 24, 80, time.Second, true); !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("cliDial err %v, want ErrNeedsInput", err)
+	}
+	if srv.conns.Load() != 0 {
+		t.Errorf("connected %d times, want 0", srv.conns.Load())
+	}
+}
+
+// A probe that did not finish (watchdog expiry, or a session that ended with
+// no banner and no output) is not a conclusive "no vendor matched", so it must
+// not save type ipmi.
+func TestProbeIncompleteIsNotSavedAsIPMI(t *testing.T) {
+	cases := map[string]struct{ banner, out string }{
+		"watchdog expiry mid-read": {"Welcome\r\n", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := startProbeBMC(t, tc.banner, tc.out, "pw")
+			p, h := probeEnv(t, "", srv.port)
+			out := captureProbeOut(t)
+			swap(t, &probeFn, func(n string, h config.Host, _, _ time.Duration) (string, int, error) {
+				return probeVendor(n, h, 2*time.Second, 300*time.Millisecond)
+			})
+			if got := Resolve("node01", h, 0); got.Type != "" {
+				t.Errorf("type %q", got.Type)
+			}
+			if saved, _ := savedType(t, p); saved != "" {
+				t.Errorf("saved %q, want nothing", saved)
+			}
+			_ = out
+		})
+	}
+}
+
+func TestProbeNoBannerNoOutputIsInconclusive(t *testing.T) {
+	srv := startProbeBMC(t, "", "", "pw")
+	srv.onShell = func() {}
+	_, h := probeEnv(t, "", srv.port)
+	h.Name = "node01"
+	// The shell prints nothing and stays open until the watchdog fires; with
+	// the read budget this short the result must be an error, not (\"\", nil).
+	typ, _, err := probeVendor("node01", h, 2*time.Second, 200*time.Millisecond)
+	if typ != "" || err == nil {
+		t.Fatalf("typ %q err %v, want an error", typ, err)
+	}
+}
+
+// sshExec's deadline covers the session open: a BMC that authenticates but
+// never answers the channel open must time out, not hang.
+func TestSSHExecStalledSessionOpenIsBounded(t *testing.T) {
+	srv := startProbeBMC(t, "", "", "pw")
+	srv.stall = true
+	_, h := probeEnv(t, "", srv.port)
+	start := time.Now()
+	_, err := sshExec("node01", h, "racadm getsysinfo", 500*time.Millisecond, true)
+	if el := time.Since(start); el > 3*time.Second {
+		t.Fatalf("sshExec took %v", el)
+	}
+	if !console.IsTimeout(err) {
+		t.Fatalf("err %v, want a timeout", err)
 	}
 }
