@@ -1256,3 +1256,22 @@ func TestOwnerDisconnectOverACleanLineDisconnects(t *testing.T) {
 		t.Errorf("disconnects=%d hangups=%d, want 1 and 0", d, h)
 	}
 }
+
+// An urgent write's endpoint is recorded before the bytes can be written, so
+// it is not counted twice: once everything is out, enqCount equals wrote.
+func TestUrgentWriteIsCountedOnce(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	h := win.holder.hub
+	const n = 200
+	for i := 0; i < n; i++ {
+		win.Urgent([]byte{0x03})
+	}
+	eventually(t, "every ctrl+c is written", func() bool { return len(f.got()) == n })
+	eventually(t, "counts agree", func() bool {
+		h.enqMu.Lock()
+		defer h.enqMu.Unlock()
+		return h.enqCount == h.wrote.Load()
+	})
+}

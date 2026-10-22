@@ -644,8 +644,12 @@ func (h *hub) typeWindow(b []byte, urgent bool) {
 		h.ty.Enqueue(b)
 		return
 	}
-	h.ty.Urgent(b)
+	// Clear first, so what was queued is gone and wrote is final; the endpoint
+	// is recorded before the urgent bytes can be written and counted in wrote,
+	// or they would count twice.
+	h.ty.Clear()
 	h.enqCount = h.wrote.Load() + int64(len(b))
+	h.ty.Urgent(b)
 }
 
 // agentName is how the AI tool is named to windows. Call with mu held.
