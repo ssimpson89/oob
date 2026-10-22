@@ -438,3 +438,58 @@ func TestUnattendedSSHPathsDoNotPrompt(t *testing.T) {
 		t.Errorf("connected %d times, want 0", srv.conns.Load())
 	}
 }
+
+// A probe that did not finish (watchdog expiry, or a session that ended with
+// no banner and no output) is not a conclusive "no vendor matched", so it must
+// not save type ipmi.
+func TestProbeIncompleteIsNotSavedAsIPMI(t *testing.T) {
+	cases := map[string]struct{ banner, out string }{
+		"watchdog expiry mid-read": {"Welcome\r\n", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := startProbeBMC(t, tc.banner, tc.out, "pw")
+			p, h := probeEnv(t, "", srv.port)
+			out := captureProbeOut(t)
+			swap(t, &probeFn, func(n string, h config.Host, _, _ time.Duration) (string, int, error) {
+				return probeVendor(n, h, 2*time.Second, 300*time.Millisecond)
+			})
+			if got := Resolve("node01", h, 0); got.Type != "" {
+				t.Errorf("type %q", got.Type)
+			}
+			if saved, _ := savedType(t, p); saved != "" {
+				t.Errorf("saved %q, want nothing", saved)
+			}
+			_ = out
+		})
+	}
+}
+
+func TestProbeNoBannerNoOutputIsInconclusive(t *testing.T) {
+	srv := startProbeBMC(t, "", "", "pw")
+	srv.onShell = func() {}
+	_, h := probeEnv(t, "", srv.port)
+	h.Name = "node01"
+	// The shell prints nothing and stays open until the watchdog fires; with
+	// the read budget this short the result must be an error, not (\"\", nil).
+	typ, _, err := probeVendor("node01", h, 2*time.Second, 200*time.Millisecond)
+	if typ != "" || err == nil {
+		t.Fatalf("typ %q err %v, want an error", typ, err)
+	}
+}
+
+// sshExec's deadline covers the session open: a BMC that authenticates but
+// never answers the channel open must time out, not hang.
+func TestSSHExecStalledSessionOpenIsBounded(t *testing.T) {
+	srv := startProbeBMC(t, "", "", "pw")
+	srv.stall = true
+	_, h := probeEnv(t, "", srv.port)
+	start := time.Now()
+	_, err := sshExec("node01", h, "racadm getsysinfo", 500*time.Millisecond, true)
+	if el := time.Since(start); el > 3*time.Second {
+		t.Fatalf("sshExec took %v", el)
+	}
+	if !console.IsTimeout(err) {
+		t.Fatalf("err %v, want a timeout", err)
+	}
+}

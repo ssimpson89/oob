@@ -293,17 +293,21 @@ func sshExec(name string, h config.Host, cmd string, timeout time.Duration, noPr
 		return "", fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}
 	defer cl.Close()
-	sess, err := cl.NewSession()
-	if err != nil {
-		return "", err
-	}
-	defer sess.Close()
+	// The deadline covers opening the session too: a BMC that logs in but never
+	// answers the channel open would otherwise hang here. On timeout the
+	// deferred cl.Close unblocks the goroutine.
 	type res struct {
 		out []byte
 		err error
 	}
 	ch := make(chan res, 1)
 	go func() {
+		sess, err := cl.NewSession()
+		if err != nil {
+			ch <- res{nil, err}
+			return
+		}
+		defer sess.Close()
 		b, err := sess.CombinedOutput(cmd)
 		ch <- res{b, err}
 	}()
