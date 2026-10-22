@@ -15,13 +15,14 @@ import (
 	"time"
 
 	"github.com/ssimpson89/oob/internal/app"
+	"github.com/ssimpson89/oob/internal/termtext"
 )
 
 // logWriter is an open console log.
 type logWriter struct {
 	f    *os.File
 	path string
-	c    termCleaner
+	c    termtext.Cleaner
 }
 
 // openLog appends to path (creating it, mode 0600: logs can hold configs and

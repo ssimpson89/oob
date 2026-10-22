@@ -173,7 +173,7 @@ func TestCommandBarDropsHints(t *testing.T) {
 }
 
 func TestShortKey(t *testing.T) {
-	if shortKey("ctrl+]") != "^]" || shortKey("esc") != "esc" {
+	if shortKey != "^]" {
 		t.Error("shortKey")
 	}
 }

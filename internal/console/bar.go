@@ -1,6 +1,6 @@
 // Copyright (c) 2026 ssimpson89. MIT License. See THIRD_PARTY.md.
 //
-// seg, fitLine, the hint-dropping layouts and shortKey follow bauddy's
+// seg, fitLine and the hint-dropping layouts follow bauddy's
 // internal/tui/view.go, reworked to plain ANSI (no lipgloss) so the bar can be
 // painted on the bottom row of the normal screen.
 
@@ -152,7 +152,7 @@ func commandLayouts(st barState) []layout {
 			}
 			hints = append(hints, hint(b.key, label)...)
 		}
-		lead := []seg{{" " + shortKey("ctrl+]") + " ", true}}
+		lead := []seg{{" " + shortKey + " ", true}}
 		layouts = append(layouts, layout{slices.Concat(lead, hints), right})
 		// drop the lowest-keep hint still present
 		idx := -1
@@ -209,13 +209,13 @@ func barLine(st barState, w int) string {
 	switch {
 	case st.sending != "":
 		progress := "  sending " + st.sending
-		note = []seg{{progress, true}, {" (" + shortKey("ctrl+]") + " x clears)", false}}
+		note = []seg{{progress, true}, {" (" + shortKey + " x clears)", false}}
 		noteShort = []seg{{progress, true}}
 	case st.note != "":
 		note = []seg{{"  " + st.note, st.noteErr}}
 		noteShort = note
 	}
-	keys := []seg{{shortKey("ctrl+]"), true}, {" keys ", false}}
+	keys := []seg{{shortKey, true}, {" keys ", false}}
 	quit := slices.Concat([]seg{{"~.", true}, {" quit  ", false}}, keys)
 	layouts := []layout{
 		{slices.Concat(name, log, note), quit},

@@ -82,13 +82,8 @@ var commandKeys = []binding{
 	{"?", actHelp, "help", "Show every key", keepAlways, false},
 }
 
-// shortKey abbreviates a key for narrow windows: "ctrl+]" -> "^]".
-func shortKey(k string) string {
-	if rest, ok := strings.CutPrefix(k, "ctrl+"); ok {
-		return "^" + rest
-	}
-	return k
-}
+// shortKey is ctrl+] abbreviated for narrow windows.
+const shortKey = "^]"
 
 // helpText is the full key list, printed by the ? key.
 func helpText() string {
@@ -122,7 +117,6 @@ const escWait = 50 * time.Millisecond
 // marker or an arrow key is held until the next Feed or Flush.
 type keyParser struct {
 	mode    keyMode
-	started bool // false until the first byte: the session start counts as a line start
 	midLine bool // the last byte forwarded was not CR or LF
 	tilde   bool // a ~ at line start is held back until the next byte
 	paste   bool // between the paste markers: bytes are collected, not typed
@@ -226,7 +220,6 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 		}
 		if p.paste {
 			p.midLine = c != '\r' && c != '\n'
-			p.started = true
 			switch {
 			case p.over:
 			case len(p.pasted) >= pasteMax: // too big: drop it all, and the rest up to the end marker
@@ -237,9 +230,6 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 			continue
 		}
 		if p.mode == modeConsole {
-			if !p.started {
-				p.started = true
-			}
 			if c == 0x1b && i+2 < len(b) && b[i+1] == '[' && (b[i+2] == 'I' || b[i+2] == 'O') {
 				// A terminal's focus report (ESC [ I, ESC [ O, sent once a program
 				// has turned on ?1004h, such as vim). It isn't typing: forward it

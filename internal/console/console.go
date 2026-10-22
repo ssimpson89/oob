@@ -441,7 +441,7 @@ func (c *console) SharedNote(n Note, s SharedStatus) {
 		return
 	}
 	if n.Text != "" {
-		text := strings.ReplaceAll(n.Text, "{keys}", shortKey("ctrl+]"))
+		text := strings.ReplaceAll(n.Text, "{keys}", shortKey)
 		if n.Mark {
 			if c.log != nil {
 				_ = c.log.Mark(text)
