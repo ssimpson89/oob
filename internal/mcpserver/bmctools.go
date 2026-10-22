@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -50,9 +51,9 @@ type hostIn struct {
 }
 
 type statusIn struct {
-	Selector string `json:"selector,omitempty" jsonschema:"a glob, a substring, or tag:<tag>; omit for every host"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"most hosts to read, default 100, at most 500. A long list is cut sooner to keep the result small"`
-	Offset   int    `json:"offset,omitempty" jsonschema:"hosts to skip, for the next page: use next_offset from the previous result"`
+	Filter string `json:"filter,omitempty" jsonschema:"an exact host name (reads that one host in full), or a glob such as node*, a substring, or tag:<tag>. Case-insensitive. Omit for every host"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"most hosts to read, default 100, at most 500. A long list is cut sooner to keep the result small"`
+	Offset int    `json:"offset,omitempty" jsonschema:"hosts to skip, for the next page: use next_offset from the previous result"`
 }
 
 type statusRow struct {
@@ -71,15 +72,10 @@ func (s *server) addHostTools(srv *mcp.Server) {
 	ro := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &yes}
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "list_hosts",
-		Description: "List the hosts in oob's host list: name, BMC address, type, tags and notes. Never returns " +
+		Description: "List the hosts in oob's host list: name, BMC address, type, tags and notes. Filter is a glob, a substring or tag:<tag>; no match is an empty list, not an error. Never returns " +
 			"passwords or keys. Nothing is sent to any BMC. Long lists come in pages: use limit and offset, and next_offset when truncated.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &no},
 	}, s.listHosts)
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "power_status",
-		Description: "Read one host's chassis power state from its BMC.",
-		Annotations: ro,
-	}, s.powerStatus)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "status",
 		Description: "Power state of many hosts at once, read quietly and concurrently. The selector is a glob, " +
@@ -87,18 +83,21 @@ func (s *server) addHostTools(srv *mcp.Server) {
 		Annotations: ro,
 	}, s.bulkStatus)
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "sel_list",
-		Description: "List a host's system event log (SEL). Long logs show the newest entries.",
+		Name: "sel_list",
+		Description: "List a host's system event log (SEL). Long logs show the newest entries. On iLO this goes over IPMI over LAN, " +
+			"which may be off: a failure then says how to enable it.",
 		Annotations: ro,
 	}, s.selList)
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "sensors",
-		Description: "Sensor readings (temperatures, fans, voltages) over IPMI.",
+		Name: "sensors",
+		Description: "Sensor readings (temperatures, fans, voltages) over IPMI. On iLO and iDRAC, IPMI over LAN may be off: a failure " +
+			"then says how to enable it.",
 		Annotations: ro,
 	}, s.sensors)
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "bmc_info",
-		Description: "BMC identity and firmware (ipmitool mc info).",
+		Name: "bmc_info",
+		Description: "BMC identity and firmware (ipmitool mc info). On iLO and iDRAC, IPMI over LAN may be off: a failure then says " +
+			"how to enable it.",
 		Annotations: ro,
 	}, s.bmcInfo)
 }
@@ -121,6 +120,23 @@ func (s *server) hostFor(name string, exact bool) (string, config.Host, error) {
 		return "", config.Host{}, errors.New(strings.TrimSuffix(err.Error(), " (see: "+app.Name+" ls)") + "; use list_hosts for the names")
 	}
 	return n, h, nil
+}
+
+// oneStatus is status for a single exact host name: the BMC's own power
+// answer, as a one-row page.
+func (s *server) oneStatus(ctx context.Context, name string) (*mcp.CallToolResult, statusOut, error) {
+	_, h, err := s.hostFor(name, true)
+	out := statusOut{Hosts: []statusRow{}}
+	if err != nil {
+		return text(true, err.Error()), out, nil
+	}
+	got, err := s.runBMC(ctx, readTimeout, func() error { return s.be.Driver(name, h).Power("status") })
+	res, _, _ := bmcResult(name, "power status", got, err, readTimeout, false, false)
+	row := statusRow{Name: console.CleanRemoteLine(name), IP: console.CleanRemoteLine(h.IP), OK: !res.IsError}
+	row.Status = console.CleanRemoteLine(res.Content[0].(*mcp.TextContent).Text)
+	out.Hosts = append(out.Hosts, row)
+	out.finish("hosts", 1, 0, 1)
+	return res, out, nil
 }
 
 const (
@@ -208,21 +224,13 @@ func (s *server) listHosts(_ context.Context, _ *mcp.CallToolRequest, in listIn)
 	return text(false, "name\tip\ttype\ttags\tnotes\n"+strings.TrimSuffix(b.String(), "\n"), note), out, nil
 }
 
-func (s *server) powerStatus(ctx context.Context, _ *mcp.CallToolRequest, in hostIn) (*mcp.CallToolResult, any, error) {
-	name, h, err := s.hostFor(in.Host, false)
-	if err != nil {
-		return fail(err)
-	}
-	out, err := s.runBMC(ctx, readTimeout, func() error { return s.be.Driver(name, h).Power("status") })
-	return bmcResult(name, "power status", out, err, readTimeout, false, false)
-}
-
 func (s *server) selList(ctx context.Context, _ *mcp.CallToolRequest, in hostIn) (*mcp.CallToolResult, any, error) {
 	name, h, err := s.hostFor(in.Host, false)
 	if err != nil {
 		return fail(err)
 	}
 	out, err := s.runBMC(ctx, readTimeout, func() error { return s.be.Driver(name, h).SEL("list") })
+	out = withIPMIHint(out, err, h)
 	return bmcResult(name, "sel list", out, err, readTimeout, true, false)
 }
 
@@ -243,13 +251,36 @@ func (s *server) ipmiRead(ctx context.Context, host, what string, args ...string
 		code, err := s.be.IPMI(h, args...)
 		return app.Code(code, err)
 	})
+	out = withIPMIHint(out, err, h)
 	return bmcResult(name, what, out, err, readTimeout, false, false)
+}
+
+// ipmiSessionRE matches ipmitool failing to open an RMCP+ session, which is
+// what a BMC with IPMI over LAN switched off (the default on some iLO and
+// iDRAC) or a cipher it won't take looks like.
+var ipmiSessionRE = regexp.MustCompile(`(?i)rmcp\+ session|unable to establish lan session|error in open session response|no matching cipher suite`)
+
+// withIPMIHint adds advice to a failed ipmitool call's output when it couldn't
+// open a session.
+func withIPMIHint(out string, err error, h config.Host) string {
+	if err == nil || !ipmiSessionRE.MatchString(out) {
+		return out
+	}
+	hint := "Hint: IPMI over LAN may be disabled on the BMC. Enable it (iLO: iLO Settings > Access > IPMI/DCMI over LAN; " +
+		"iDRAC: the IPMI settings in the iDRAC network configuration), or use the vendor's own tools (iLO web interface or CLI, racadm)."
+	if h.Cipher == "" {
+		hint += " A cipher the BMC doesn't offer gives the same error; set the host's cipher with oob edit."
+	}
+	return strings.TrimSpace(out) + "\n" + hint
 }
 
 // bmcResult turns a captured BMC call into a tool result. keepEnd keeps the
 // newest part of a long output (a log), else the start.
 func bmcResult(name, what, out string, err error, timeout time.Duration, keepEnd, mayHaveRun bool) (*mcp.CallToolResult, any, error) {
 	out = strings.TrimSpace(bound(out, bmcTextMax, keepEnd))
+	if errors.Is(err, errQueued) {
+		return fail(fmt.Sprintf("%s on %s did not start: it waited %s behind other BMC calls. %s was not contacted; try again", what, name, queueTimeout.Round(time.Second), name))
+	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || console.IsTimeout(err) && out == "" {
 			err = errTimeout(what+" on "+name, timeout, mayHaveRun)
@@ -262,6 +293,10 @@ func bmcResult(name, what, out string, err error, timeout time.Duration, keepEnd
 	return text(false, out), nil, nil
 }
 
+// statusSkipped is the row of a host the overall time ran out before: it was
+// never asked, which says nothing about its BMC.
+const statusSkipped = "skipped: out of time; retry with a smaller limit"
+
 func (s *server) bulkStatus(ctx context.Context, _ *mcp.CallToolRequest, in statusIn) (*mcp.CallToolResult, statusOut, error) {
 	cfg, err := s.be.Config()
 	if err != nil {
@@ -271,9 +306,14 @@ func (s *server) bulkStatus(ctx context.Context, _ *mcp.CallToolRequest, in stat
 	if err != nil {
 		return text(true, err.Error()), statusOut{Hosts: []statusRow{}}, nil
 	}
-	all := cfg.Select(in.Selector)
+	if _, ok := cfg.Hosts[in.Filter]; ok && in.Filter != "" && offset == 0 {
+		return s.oneStatus(ctx, in.Filter)
+	}
+	all := cfg.Select(in.Filter)
 	if len(all) == 0 {
-		return text(true, "no hosts match"), statusOut{Hosts: []statusRow{}}, nil
+		out := statusOut{Hosts: []statusRow{}}
+		out.finish("hosts", 0, 0, 0)
+		return text(false, "no hosts match"), out, nil
 	}
 	if offset >= len(all) {
 		return text(true, fmt.Sprintf("offset %d is past the last of %d matching hosts", offset, len(all))), statusOut{Hosts: []statusRow{}}, nil
@@ -298,6 +338,7 @@ func (s *server) bulkStatus(ctx context.Context, _ *mcp.CallToolRequest, in stat
 	defer cancel()
 
 	var mu sync.Mutex
+	started := make([]bool, len(names))
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	for range min(statusWorkers, len(names)) {
@@ -305,6 +346,9 @@ func (s *server) bulkStatus(ctx context.Context, _ *mcp.CallToolRequest, in stat
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
+				mu.Lock()
+				started[i] = true
+				mu.Unlock()
 				_, h, _ := cfg.Lookup(names[i])
 				r := s.be.PowerStatus(names[i], h, statusTimeout)
 				mu.Lock()
@@ -331,6 +375,11 @@ func (s *server) bulkStatus(ctx context.Context, _ *mcp.CallToolRequest, in stat
 	}
 	mu.Lock()
 	page := append([]statusRow(nil), rows...)
+	for i := range page {
+		if !started[i] {
+			page[i].Status = statusSkipped // never asked: the overall time ran out first
+		}
+	}
 	mu.Unlock()
 
 	// Now the sizes are known: keep what fits.
