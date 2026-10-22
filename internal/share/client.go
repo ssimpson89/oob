@@ -23,8 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -250,6 +252,7 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 		return err
 	}
 	h := newHub(tr)
+	hosted.add(h)
 	h.addr, h.typ = c.opt.Addr, c.opt.Type
 	ho := &holder{hub: h, lock: lockFile}
 	if lockFile != nil {
@@ -750,6 +753,46 @@ func (c *Client) Close() error {
 	}
 	c.end(console.Result{Err: ErrClosed})
 	return nil
+}
+
+// hosted is the hubs this process runs, each until it shuts down.
+var hosted = hubSet{m: map[*hub]struct{}{}}
+
+type hubSet struct {
+	mu sync.Mutex
+	m  map[*hub]struct{}
+}
+
+func (s *hubSet) add(h *hub) {
+	s.mu.Lock()
+	s.m[h] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *hubSet) remove(h *hub) {
+	s.mu.Lock()
+	delete(s.m, h)
+	s.mu.Unlock()
+}
+
+// CloseHosted ends every console this process hosts, even one kept for windows
+// after its host client left: the windows are told it closed, the transport is
+// closed and the session is released at the BMC. For a process about to exit,
+// which would otherwise leave the BMC's session active.
+func CloseHosted() {
+	hosted.mu.Lock()
+	all := slices.Collect(maps.Keys(hosted.m))
+	hosted.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, h := range all {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.shutdown()
+			h.release()
+		}()
+	}
+	wg.Wait()
 }
 
 // Release ends the session at the BMC's end after Close, if this process

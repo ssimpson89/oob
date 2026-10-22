@@ -412,3 +412,36 @@ func TestExclusiveIsHandedToTheHubThatHostsUnderIt(t *testing.T) {
 	}
 	c.Close()
 }
+
+// A process that is about to exit ends every console it hosts: with a window
+// on it, whether its own client is still there or has left and the hub lingers
+// for the window, the window is told, the transport is closed and the BMC
+// session is released.
+func TestCloseHostedEndsConsolesWindowsAreOnAndReleasesThem(t *testing.T) {
+	for _, hostLeft := range []bool{false, true} {
+		env(t)
+		f := newFake()
+		hostC := host(t, f, Options{})
+		win, err := join(t, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hostLeft {
+			hostC.Close()
+			hostC.Release()
+			time.Sleep(50 * time.Millisecond)
+			if f.isClosed() || f.wasReleased() {
+				t.Fatal("the console should linger for its window")
+			}
+		}
+		CloseHosted()
+		select {
+		case <-win.Done():
+		case <-time.After(3 * time.Second):
+			t.Fatalf("hostLeft=%v: the window was never told the console closed", hostLeft)
+		}
+		if !f.isClosed() || !f.wasReleased() {
+			t.Errorf("hostLeft=%v: closed %v, released %v", hostLeft, f.isClosed(), f.wasReleased())
+		}
+	}
+}

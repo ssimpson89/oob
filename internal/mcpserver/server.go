@@ -32,6 +32,7 @@ import (
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // Options configure the server.
@@ -341,4 +342,5 @@ func (s *server) closeAll() {
 		}()
 	}
 	wg.Wait()
+	share.CloseHosted() // consoles kept for windows after their session ended go too
 }

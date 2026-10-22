@@ -448,6 +448,7 @@ func (h *hub) end(res console.Result) {
 // call twice.
 func (h *hub) shutdown() {
 	h.closeOnce.Do(func() {
+		hosted.remove(h)
 		res := console.Result{Err: errors.New("the oob that opened this console closed it")}
 		h.query(func() { h.end(res) })
 		h.closeTr()

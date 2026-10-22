@@ -233,3 +233,22 @@ func TestAnAgentJoiningJustAfterAWindowsBreakKnowsOfIt(t *testing.T) {
 	h.srv.mu.Unlock()
 	eventually(t, "the joiner is told of the earlier BREAK", c.sinceBreak)
 }
+
+// The server's exit ends the console even with the user's window on it: the
+// window is told, and the BMC session is released.
+func TestServerExitReleasesAConsoleAWindowIsOn(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	w := window(t)
+	f := h.host("node01")
+	h.srv.closeAll()
+	select {
+	case <-w.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the window was never told the console closed")
+	}
+	eventually(t, "the BMC session is released", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.released })
+	if !f.isClosed() {
+		t.Error("the console was left open")
+	}
+}
