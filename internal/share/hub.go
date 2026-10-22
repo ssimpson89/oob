@@ -42,11 +42,6 @@ const breakMemory = time.Minute
 var typingWindow = 3 * time.Second
 
 var (
-	// pager matches a pager waiting at the end of the output, where a
-	// backspace could be taken as a key.
-	pager = regexp.MustCompile(`(?i)-\s*\(?more\b[^\n]*$`)
-	// loginAt matches a login or password question on the cursor line.
-	loginAt = regexp.MustCompile(`(?i)(login|username|password)( for \S+)?: ?$`)
 	// lineStart finds where the cursor's line begins.
 	lineStart = regexp.MustCompile("[\r\n]|\x1b\\[[0-9;]*[Hf]")
 )
@@ -107,14 +102,12 @@ type hub struct {
 	atPrompt  bool
 	keysNoted bool // the link's input note was shown
 
-	lease     bool
-	leaseID   int               // which acquisition holds the keyboard, while lease is set
-	cancelled map[cancelKey]int // lease ids released before their request arrived, per client, in order seen
-	cancelSeq int
-	paused    bool
-	gen       int  // changes whenever the AI tool's keyboard is taken back
-	writing   bool // the AI tool's write is being typed
-	busy      int  // exclusive link operations (BREAK, toggle...) and an agent's erase running; window input and new leases wait for 0
+	lease   bool
+	leaseID int // which acquisition holds the keyboard, while lease is set
+	paused  bool
+	gen     int  // changes whenever the AI tool's keyboard is taken back
+	writing bool // the AI tool's write is being typed
+	busy    int  // exclusive link operations (BREAK, toggle...) and an agent's erase running; window input and new leases wait for 0
 
 	// What is on the console's line, from the bytes the typer has written.
 	segs      []seg // who queued the bytes the typer has taken and not yet written, in order
@@ -130,12 +123,6 @@ type hub struct {
 	lastDrop time.Time
 	closed   bool
 	orphan   bool // the host's own client left; the hub ends with its last window
-}
-
-// cancelKey names a lease request by the client that made it: ids count per client.
-type cancelKey struct {
-	p  *peer
-	id int
 }
 
 // Whose bytes a seg holds.
@@ -559,7 +546,7 @@ func (h *hub) cursorText() string {
 	return c.Partial()
 }
 
-func (h *hub) atLogin() bool { return loginAt.MatchString(h.cursorText()) }
+func (h *hub) atLogin() bool { return console.SecretPrompt.MatchString(h.cursorText()) }
 
 // serve talks to one client until it goes away. local marks the host
 // process's own client.
@@ -667,11 +654,6 @@ func (h *hub) leave(p *peer) {
 		return
 	}
 	delete(h.peers, p)
-	for k := range h.cancelled {
-		if k.p == p {
-			delete(h.cancelled, k)
-		}
-	}
 	if p == h.agent && (h.lease || h.agentLine.chars > 0) {
 		h.revoke(func(string, string) { h.left(p) })
 		return
@@ -940,7 +922,7 @@ func (h *hub) erase(then func(note, reason string)) {
 	n := 0
 	var note, reason string
 	switch {
-	case t.chars > 0 && !t.ctrl && !pager.Match(h.ring) && !h.atLogin():
+	case t.chars > 0 && !t.ctrl && !console.Pager.MatchString(h.cursorText()) && !h.atLogin():
 		n = t.chars
 		note, reason = "paused · unsent command erased", StopCleared
 	case t.chars > 0:
@@ -1055,13 +1037,10 @@ func (h *hub) refuse(p *peer) error {
 	return nil
 }
 
-// cancelledMax bounds how many early releases the hub remembers.
-const cancelledMax = 64
-
 // agentOp is the AI tool taking the keyboard for a command, or giving it back.
-// Each acquisition carries an id, so a release names the acquisition it ends:
-// a late one can't free a newer lease, and a request its client gave up on
-// (the release can arrive first) is refused instead of granted to nobody.
+// Each acquisition carries an id, so a release names the acquisition it ends and
+// a late one can't free a newer lease. A client's requests and releases arrive
+// in the order it sent them, so a release always follows its request.
 func (h *hub) agentOp(p *peer, m msg) error {
 	if _, here := h.peers[p]; !here || (p.agent && h.agent != p) {
 		return errGone
@@ -1070,36 +1049,13 @@ func (h *hub) agentOp(p *peer, m msg) error {
 	case !p.agent:
 		return errors.New("only an AI tool takes the keyboard")
 	case m.Op == opRelease:
-		switch {
-		case h.lease && h.leaseID == m.Lease:
+		if h.lease && h.leaseID == m.Lease {
 			h.lease, h.leaseID = false, 0 // what it typed without Enter stays tracked, for its next command or a stop
 			h.broadcastState()
-		case m.Lease != 0 && !(h.lease && h.leaseID == m.Lease):
-			// Not held now: either long over, or its request is still on the
-			// way. Remember it, so the request is refused when it arrives.
-			if h.cancelled == nil {
-				h.cancelled = map[cancelKey]int{}
-			}
-			h.cancelSeq++
-			h.cancelled[cancelKey{p, m.Lease}] = h.cancelSeq
-			if len(h.cancelled) > cancelledMax {
-				var oldest cancelKey
-				at := 0
-				for k, seq := range h.cancelled {
-					if at == 0 || seq < at {
-						oldest, at = k, seq
-					}
-				}
-				delete(h.cancelled, oldest)
-			}
 		}
 		return nil
 	case h.lease:
 		return ErrBusy
-	}
-	if _, gone := h.cancelled[cancelKey{p, m.Lease}]; gone && m.Lease != 0 {
-		delete(h.cancelled, cancelKey{p, m.Lease})
-		return errors.New("the lease request was cancelled")
 	}
 	if h.closed {
 		return ErrClosed

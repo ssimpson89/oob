@@ -7,7 +7,6 @@ package share
 import (
 	"context"
 	"errors"
-	"io"
 	"strings"
 	"testing"
 	"time"
@@ -166,44 +165,6 @@ func TestALeaseForAClientThatHasLeftIsRefused(t *testing.T) {
 		}
 	})
 	_ = ai
-}
-
-// A lease id is the client's own: one that left, with a release recorded
-// ahead of its request, must not refuse the next client's request with the
-// same number, and its record goes with it.
-func TestCancelledLeaseIDsAreKeptPerClientAndForgottenWhenItLeaves(t *testing.T) {
-	env(t)
-	f := newFake()
-	win := host(t, f, Options{NoLinger: true})
-	h := hubOf(t, win)
-	w := rawAgent(t)
-	_ = w.send(msg{T: tReq, ID: 1, Op: opRelease, Lease: 7})
-	reply(t, w, 1)
-	var n int
-	inHub(t, h, func() { n = len(h.cancelled) })
-	if n != 1 {
-		t.Fatalf("%d cancelled ids recorded, want 1", n)
-	}
-	// Its own request for 7 is refused.
-	_ = w.send(msg{T: tReq, ID: 2, Op: opLease, Lease: 7})
-	if r := reply(t, w, 2); r.Err == "" {
-		t.Fatal("its cancelled request was granted")
-	}
-	// It leaves a cancelled id behind, and goes.
-	_ = w.send(msg{T: tReq, ID: 3, Op: opRelease, Lease: 8})
-	reply(t, w, 3)
-	_ = w.w.(io.Closer).Close()
-	eventually(t, "the hub forgot the client", func() bool {
-		var gone bool
-		h.query(func() { gone = h.agent == nil && len(h.cancelled) == 0 })
-		return gone
-	})
-	// The next client's lease 8 is its own.
-	w2 := rawAgent(t)
-	_ = w2.send(msg{T: tReq, ID: 1, Op: opLease, Lease: 8})
-	if r := reply(t, w2, 1); r.Err != "" {
-		t.Errorf("a new client's lease 8 was refused: %s", r.Err)
-	}
 }
 
 // The keyboard isn't given to the AI tool while the typer still holds input

@@ -22,7 +22,6 @@ import (
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/share"
-	"github.com/ssimpson89/oob/internal/typer"
 )
 
 const (
@@ -49,17 +48,10 @@ type session struct {
 	addr string // the BMC address and type the console was opened on
 	typ  string
 	tr   *bmc.ConsoleTransport
-	// sh is the shared console the session types through (the hub owns the one
-	// typer); nil when tests or callers supply a bare transport.
+	// sh is the shared console the session types through: the hub owns the one
+	// typer and decides who may type.
 	sh *share.Client
 	tx *console.Transcript
-	// ty queues everything typed at the console, paced if the link is serial.
-	// txErr is the write error that ended it, if one did.
-	ty     *typer.Typer
-	stopTy context.CancelFunc
-	txErr  error // guarded by mu
-	wrote  int   // bytes the link has taken, ever; guarded by mu
-	inSend bool  // the typer is inside the link's Send; guarded by mu
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -76,7 +68,6 @@ type session struct {
 	answersAt int    // the prompt count when a command was last approved (-1: none)
 	typing    typing // what send_keys has typed since the last Enter
 	lastEsc   bool   // the last byte sent was ESC
-	breakAt   time.Time
 	lastUsed  time.Time
 	ended     bool // nothing more can be typed
 	marked    bool // the end is in the transcript, with its exit status
@@ -100,12 +91,6 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 		lastUsed: time.Now(), changed: make(chan struct{}),
 		doneC: make(chan struct{}), eofC: make(chan struct{}), drained: make(chan struct{}),
 	}
-	ctx, stop := context.WithCancel(context.Background())
-	c.stopTy = stop
-	c.ty = console.NewTyper(tr.Link, tr.Pacing)
-	if sh == nil {
-		go c.runTyper(ctx, tr)
-	}
 	go func() {
 		r := <-tr.Done
 		c.mu.Lock()
@@ -115,25 +100,6 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 	}()
 	go c.drain()
 	return c
-}
-
-// runTyper types the session's queue at the transport's link, when no hub does.
-func (c *session) runTyper(ctx context.Context, tr *bmc.ConsoleTransport) {
-	_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
-		c.mu.Lock()
-		c.inSend = true
-		c.mu.Unlock()
-		err := tr.Link.Send(b)
-		c.mu.Lock()
-		c.inSend = false
-		if err != nil {
-			c.txErr = err
-		} else {
-			c.wrote += len(b)
-		}
-		c.mu.Unlock()
-		return len(b), err
-	}))
 }
 
 // drain records the console's output until it ends.
@@ -148,8 +114,8 @@ func (c *session) drain() {
 		if err != nil {
 			// Nothing more will arrive, so nothing typed now can be checked
 			// against what the console shows: a stale prompt would wave the
-			// rest of a batch through. Stop the input and refuse new sends
-			// before anyone waiting on eofC can act on the hang-up.
+			// rest of a batch through. Refuse new sends before anyone waiting
+			// on eofC can act on the hang-up.
 			c.endInput()
 			close(c.eofC)
 			select { // the exit status is worth a moment, collected apart from that
@@ -157,17 +123,6 @@ func (c *session) drain() {
 			case <-time.After(2 * time.Second):
 			}
 			c.markEnded()
-			// A write still stuck in the link will never finish: the console
-			// is gone, and the typer is not waited on. Close the transport so
-			// the write fails and its goroutine ends. Not waited for, since
-			// closing can be slow; Release and the final Close stay with
-			// closeTransport, which runs the teardown once.
-			c.mu.Lock()
-			stuck := c.inSend
-			c.mu.Unlock()
-			if stuck {
-				go c.trOnce.Do(c.tr.Close)
-			}
 			return
 		}
 	}
@@ -200,9 +155,8 @@ func (c *session) feed(b []byte) {
 	c.notifyLocked()
 }
 
-// endInput marks the session ended and drops whatever is queued to be typed.
-// When it returns nothing more reaches the console and canSend refuses. The
-// message is provisional until markEnded has the exit status.
+// endInput marks the session ended, so canSend refuses. The message is
+// provisional until markEnded has the exit status.
 func (c *session) endInput() {
 	c.mu.Lock()
 	if !c.ended {
@@ -210,8 +164,6 @@ func (c *session) endInput() {
 		c.endMsg = "the console connection ended"
 	}
 	c.mu.Unlock()
-	c.stopTy()
-	c.ty.Clear() // drops the queue without waiting on the writer, which may be stuck in Send
 }
 
 // markEnded records that the transport has gone, with its exit status if it
@@ -280,7 +232,7 @@ func (c *session) canSend() error {
 	if c.ended {
 		return fmt.Errorf("%s, so nothing was sent. Disconnect and connect again", c.endMsg)
 	}
-	if c.sh != nil && c.sh.Status().Paused {
+	if c.sh.Status().Paused {
 		return errors.New(pausedText) // before anything else, so a paused tool is told so
 	}
 	return nil
@@ -332,89 +284,31 @@ func (c *session) closeTransport() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
-	c.stopTy()
 	c.trOnce.Do(c.tr.Close)
 }
 
-// mapInput fits b to a link that reads ESC with the byte after it (iLO VSP):
-// a lone ESC becomes ESC ESC, and keys the link would drop are refused whole
-// with console.ErrKeysDropped, so the AI tool isn't told it pressed a key that
-// never arrived.
-func (c *session) mapInput(b []byte) ([]byte, error) {
-	return c.mapUnits([][]byte{b})
-}
-
-// mapUnits is mapInput for a call made of keys and text: each unit is mapped
-// on its own, so "esc" then "enter" is ESC ESC CR and not the Alt-Enter the
-// joined bytes would read as. Any unit the link would drop refuses the call.
-func (c *session) mapUnits(units [][]byte) ([]byte, error) {
-	var out []byte
-	for _, u := range units {
-		m, note := console.MapInput(c.tr.Link, u)
-		if note != "" {
-			return nil, console.ErrKeysDropped
-		}
-		out = append(out, m...)
-	}
-	return out, nil
-}
-
-// write types b at the console, within ctx: it queues the bytes and returns
-// when the last one is out. On a serial console that takes a while, since the
-// queue paces them.
+// write types b at the console, within ctx, and returns when the last byte is
+// out. On a serial console that takes a while, since the hub paces them.
 func (c *session) write(ctx context.Context, b []byte) error {
 	return c.writeUnits(ctx, [][]byte{b})
 }
 
-// writeUnits is write for a call made of separate keys and text (see mapUnits).
+// writeUnits is write for a call made of separate keys and text: the hub fits
+// each to the console on its own, so "esc" then "enter" is ESC ESC CR and not
+// the Alt-Enter the joined bytes would read as, and it refuses the whole call if
+// the link would drop any of it.
 func (c *session) writeUnits(ctx context.Context, units [][]byte) error {
-	var b []byte
-	if c.sh == nil { // a shared console's hub maps and refuses these itself
-		out, err := c.mapUnits(units)
-		if err != nil {
-			return err
-		}
-		b = out
-	} else {
-		for _, u := range units {
-			b = append(b, u...)
-		}
-	}
+	b := bytes.Join(units, nil)
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
-	before := c.wrote
 	c.mu.Unlock()
 	err := c.guarded(ctx, func() error {
-		if c.sh != nil { // the hub's one typer paces it, with the lease and typing checks
-			return c.sh.TypeKeys(context.Background(), units) // guarded ends it if ctx does
-		}
-		<-c.ty.Enqueue(b)
-		return nil
+		return c.sh.TypeKeys(context.Background(), units) // guarded ends it if ctx does
 	})
-	if err != nil {
-		if errors.Is(err, errStuck) {
-			return err
-		}
-		return shareError(err)
+	if errors.Is(err, errStuck) {
+		return err
 	}
-	if c.sh != nil { // the hub reports bytes it dropped as errors
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// The queue closes its waiters for dropped bytes too, such as when the
-	// remote hangs up during pacing, so count what the link took.
-	switch got := c.wrote - before; {
-	case c.txErr != nil:
-		return c.txErr
-	case got < len(b) && c.ended:
-		return fmt.Errorf("%s, and only %d of %d bytes were typed. Disconnect and connect again", c.endMsg, got, len(b))
-	case c.closed:
-		return errors.New("the session was closed before everything was typed")
-	case got < len(b):
-		return fmt.Errorf("only %d of %d bytes were typed before sending stopped", got, len(b))
-	}
-	return nil
+	return shareError(err)
 }
 
 // typingBudget is the typing time for a wire payload: a LineDelay for each
@@ -425,18 +319,15 @@ func (c *session) typingBudget(wire []byte) time.Duration {
 	return c.typingTime(len(wire), lines+1)
 }
 
-// typingTime is how long the queue takes to type n bytes in lines lines, so a
+// typingTime is how long the hub takes to type n bytes in lines lines, so a
 // tool's time limit covers it. It is zero for a console that isn't paced.
 func (c *session) typingTime(n, lines int) time.Duration {
-	if c.ty.Paced == nil || !c.ty.Paced() {
+	l, ok := c.tr.Link.(interface{ Serial() bool })
+	if !ok || !l.Serial() || c.tr.Pacing.Char == nil || c.tr.Pacing.Line == nil {
 		return 0
 	}
-	return time.Duration(n)*c.ty.CharDelay + time.Duration(lines)*c.ty.LineDelay
+	return time.Duration(n)*(*c.tr.Pacing.Char) + time.Duration(lines)*(*c.tr.Pacing.Line)
 }
-
-type writerFunc func([]byte) (int, error)
-
-func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 
 // unread returns what the console printed since output was last returned,
 // ending with the line the cursor is on, and marks it returned.
@@ -465,7 +356,7 @@ func (c *session) notes() []string {
 		n = append(n, "This session is at the BMC's own command line, not the host console. Everything typed here needs the "+
 			"user's approval. bmc_prompt with to=console goes back.")
 	}
-	if loginPrompt.MatchString(c.tx.Partial()) {
+	if console.SecretPrompt.MatchString(c.tx.Partial()) {
 		n = append(n, "The console is asking for a login. Ask the user to log in or to give you credentials. Don't guess: "+
 			"failed logins can lock the account.")
 	}

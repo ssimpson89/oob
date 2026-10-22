@@ -600,14 +600,7 @@ func describeGate(g gate) string {
 // sinceBreak reports whether a BREAK was sent recently enough that the next
 // key may be a SysRq command.
 func (c *session) sinceBreak() bool {
-	c.mu.Lock()
-	at := c.breakAt
-	c.mu.Unlock()
-	if c.sh != nil { // a BREAK sent from a window counts the same
-		if t := c.sh.BreakAt(); t.After(at) {
-			at = t
-		}
-	}
+	at := c.sh.BreakAt() // a BREAK from a window counts the same
 	return !at.IsZero() && time.Since(at) < afterBreak
 }
 
@@ -709,7 +702,11 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 					"nothing will replay:\n"+strings.Join(lines[i:], "\n")+"\nSend them with a new send_command, which will ask the user."), nil, nil
 			}
 		}
-		c.tx.Mark("agent typed: " + l)
+		if console.SecretPrompt.MatchString(c.line().cursor) {
+			c.tx.Mark("agent answered a login prompt") // what was typed there isn't logged
+		} else {
+			c.tx.Mark("agent typed: " + l)
+		}
 		err := c.runLine(ctx, l, wait)
 		lastErr = err
 		if !errors.Is(err, errStuck) {
@@ -754,7 +751,7 @@ func (c *session) runLine(ctx context.Context, l string, wait time.Duration) err
 		default:
 		}
 		cur := c.line().cursor
-		if looksLikePrompt(cur) || confirming.MatchString(cur) || paging.MatchString(cur) || loginPrompt.MatchString(cur) {
+		if looksLikePrompt(cur) || confirming.MatchString(cur) || console.Pager.MatchString(cur) || console.SecretPrompt.MatchString(cur) {
 			return nil
 		}
 		changed = c.changes() // still running: wait for more
@@ -785,9 +782,9 @@ func (c *session) stopAdvice(mid bool) string {
 	switch {
 	case confirming.MatchString(cur):
 		return "The console is asking a question. Answer with send_keys: text y and keys [\"enter\"] to go ahead, text n to cancel."
-	case paging.MatchString(cur):
+	case console.Pager.MatchString(cur):
 		return "The console is paging: send_keys keys [\"space\"] shows the next page, text q stops. Paging off, or head and grep, avoids this."
-	case loginPrompt.MatchString(cur):
+	case console.SecretPrompt.MatchString(cur):
 		if mid {
 			return "The console is at a login or password prompt, so the lines after it would be typed in as a name or a password. " +
 				"Ask the user to log in or to give you credentials; don't guess."
@@ -888,11 +885,6 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		wire.WriteString(st.text + keyBytes[st.key])
 		units = append(units, []byte(st.text), []byte(keyBytes[st.key]))
 	}
-	if c.sh == nil {
-		if _, err := c.mapUnits(units); err != nil {
-			return fail(err) // before asking the user to approve what can't be typed
-		}
-	}
 	if c.onBMC() && (in.Text != "" || slices.Contains(in.Keys, "enter")) {
 		add(whyBMC)
 	}
@@ -981,9 +973,6 @@ func (s *server) sendBreak(ctx context.Context, req *mcp.CallToolRequest, in ses
 		s.stuck(c, err)
 		return fail("the BREAK wasn't sent: ", shareError(err))
 	}
-	c.mu.Lock()
-	c.breakAt = time.Now()
-	c.mu.Unlock()
 	c.tx.Mark("BREAK sent")
 	c.settle(ctx, changed, keysWait, false)
 	if err := ctx.Err(); err != nil {

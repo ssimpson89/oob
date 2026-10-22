@@ -936,28 +936,6 @@ func TestACancelledLeaseDoesNotLeaveTheHubHoldingTheKeyboard(t *testing.T) {
 	}
 }
 
-func TestAReleaseThatArrivesBeforeItsRequestRefusesTheRequest(t *testing.T) {
-	env(t)
-	f := newFake()
-	win := host(t, f, Options{NoLinger: true})
-	w := rawAgent(t)
-	// The release for lease 7 overtakes the request for it.
-	_ = w.send(msg{T: tReq, ID: 1, Op: opRelease, Lease: 7})
-	reply(t, w, 1)
-	_ = w.send(msg{T: tReq, ID: 2, Op: opLease, Lease: 7})
-	if r := reply(t, w, 2); r.Err == "" {
-		t.Fatal("a request already released was granted")
-	}
-	if held, _ := leaseHeld(t, win); held {
-		t.Error("the hub is holding the keyboard for a request nobody wants")
-	}
-	// Its id is spent, not the keyboard: a new acquisition works.
-	_ = w.send(msg{T: tReq, ID: 3, Op: opLease, Lease: 8})
-	if r := reply(t, w, 3); r.Err != "" {
-		t.Errorf("lease 8: %s", r.Err)
-	}
-}
-
 func TestALateReleaseDoesNotFreeANewerLease(t *testing.T) {
 	env(t)
 	f := newFake()

@@ -220,10 +220,6 @@ var (
 		`are you sure|proceed\s*\?|continue\s*\?|is this ok|do you want to`)
 	// promptEnd finds where a prompt may end and typing begin.
 	promptEnd = regexp.MustCompile(`[#>$%]`)
-	// paging matches a pager's question, such as --More--.
-	paging = regexp.MustCompile(`(?i)-\s*more|\(more|q quit|\(end\)|lines \d+-\d+`)
-	// loginPrompt matches a login or password question on the cursor line.
-	loginPrompt = regexp.MustCompile(`(?i)(login|username|password)( for \S+)?: ?$`)
 )
 
 // lineRisk is risk for the host's cursor line, prompt and all. The prompt
