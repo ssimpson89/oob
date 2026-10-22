@@ -31,17 +31,18 @@ type fakeConsole struct {
 	pw   *io.PipeWriter
 	done chan console.Result
 
-	mu       sync.Mutex
-	sent     []byte
-	closed   bool
-	released bool
-	inSend   atomic.Int32
-	overlap  atomic.Bool
-	delay    time.Duration
-	breaks   int
-	atBMC    bool
-	toggle   bool
-	vsp      bool // maps input like an iLO VSP
+	mu                   sync.Mutex
+	sent                 []byte
+	closed               bool
+	released             bool
+	inSend               atomic.Int32
+	overlap              atomic.Bool
+	delay                time.Duration
+	breaks               int
+	disconnects, hangups int
+	atBMC                bool
+	toggle               bool
+	vsp                  bool // maps input like an iLO VSP
 
 	sendErr     error          // Send fails with this
 	onSend      func(b []byte) // runs inside Send, after b is recorded
@@ -88,7 +89,27 @@ func (f *fakeConsole) Break() error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeConsole) Disconnect() error                { f.done <- console.Result{}; f.pw.Close(); return nil }
+func (f *fakeConsole) Disconnect() error {
+	f.mu.Lock()
+	f.disconnects++
+	f.mu.Unlock()
+	f.done <- console.Result{}
+	f.pw.Close()
+	return nil
+}
+
+// Hangup ends the session without typing, as a SOL link's does.
+func (f *fakeConsole) Hangup() error {
+	f.mu.Lock()
+	f.hangups++
+	f.mu.Unlock()
+	select {
+	case f.done <- console.Result{}:
+	default:
+	}
+	f.pw.Close()
+	return nil
+}
 func (f *fakeConsole) Resize(rows, cols int) error      { return nil }
 func (f *fakeConsole) FitSize(rows, cols int) error     { return nil }
 func (f *fakeConsole) SizeIsFree() bool                 { return false }
@@ -1192,5 +1213,46 @@ func TestOnlyTheOwnerGetsTheSizeLine(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if f.got() != "" {
 		t.Errorf("a joined window's size typed %q at the console", f.got())
+	}
+}
+
+func (f *fakeConsole) ends() (disconnects, hangups int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.disconnects, f.hangups
+}
+
+// ~. in the owning window over a line holding typed input must not type the
+// disconnect sequence (its Enter would run the line): the hub hangs up.
+func TestOwnerDisconnectOverADirtyLineHangsUp(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	if err := win.Transport().Link.Send([]byte("reboot")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the line is typed", func() bool { return f.got() == "reboot" })
+	eventually(t, "the line is dirty", func() bool { return win.holder.hub.lineDirty.Load() })
+	if err := win.Transport().Link.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if d, h := f.ends(); d != 0 || h != 1 {
+		t.Errorf("disconnects=%d hangups=%d, want 0 and 1", d, h)
+	}
+}
+
+func TestOwnerDisconnectOverACleanLineDisconnects(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	if err := win.Transport().Link.Send([]byte("ls\r")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the line is typed", func() bool { return f.got() == "ls\r" })
+	if err := win.Transport().Link.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if d, h := f.ends(); d != 1 || h != 0 {
+		t.Errorf("disconnects=%d hangups=%d, want 1 and 0", d, h)
 	}
 }

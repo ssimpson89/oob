@@ -56,6 +56,12 @@ type sizeLiner interface {
 	SizeLine(rows, cols int) (string, bool)
 }
 
+// hangupper is a link that can end the session without typing anything at the
+// remote (see console's hangupper).
+type hangupper interface {
+	Hangup() error
+}
+
 // hub shares one console transport between the clients connected to it: the
 // windows and at most one AI tool. It runs in whichever process opened it.
 //
@@ -1139,7 +1145,14 @@ func (h *hub) linkOp(p *peer, m msg, reply *msg) error {
 		reply.Kind, reply.AtPrompt = kind, at
 		return err
 	case opDisconnect:
+		// The disconnect sequence starts with an Enter, which would submit
+		// whatever the line holds. Look before the queue is cleared, and end
+		// the session without typing when there is anything.
+		dirty := h.ty.Queued() > 0 || h.lineDirty.Load()
 		h.dropQueued()
+		if hl, ok := h.tr.Link.(hangupper); ok && dirty {
+			return hl.Hangup()
+		}
 		return h.tr.Link.Disconnect()
 	case opResize:
 		return h.tr.Link.Resize(m.Rows, m.Cols)

@@ -218,6 +218,7 @@ func solConsole(h config.Host, name string, power func() (string, error), open f
 	if err != nil {
 		return 1, err
 	}
+	defer c.Release() // after Close: ends the BMC's session if this oob opened it
 	defer c.Close()
 	connecting := "connecting to " + name + " via IPMI..."
 	if c.Joined() {
