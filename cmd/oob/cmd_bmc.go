@@ -291,7 +291,7 @@ func bmcCmds() []*cobra.Command {
 			if runtime.GOOS == "darwin" {
 				opener = "open"
 			}
-			url := "https://" + h.IP + "/"
+			url := webURL(h.IP)
 			bin, err := exec.LookPath(opener)
 			if err != nil {
 				fmt.Println(url)
@@ -302,6 +302,14 @@ func bmcCmds() []*cobra.Command {
 		}),
 	})
 	return cmds
+}
+
+// webURL is the BMC's https URL, with an IPv6 address in brackets.
+func webURL(ip string) string {
+	if strings.Contains(ip, ":") && !strings.HasPrefix(ip, "[") {
+		ip = "[" + ip + "]"
+	}
+	return "https://" + ip + "/"
 }
 
 // riskyIpmiArgs reports whether passthrough ipmitool arguments contain a

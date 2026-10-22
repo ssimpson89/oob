@@ -41,13 +41,11 @@ func main() {
 	os.Exit(1)
 }
 
-func cfgPath() (string, error) { return config.ConfigPath(cfgFlag) }
-
 // load reads the config. An explicitly given -c/--config file must exist.
 // Permission warnings are only printed once the file parsed, so they never bury a
 // parse error.
 func load() (string, *config.Config, error) {
-	p, err := cfgPath()
+	p, err := config.CurrentPath()
 	if err != nil {
 		return "", nil, err
 	}
@@ -69,7 +67,7 @@ func load() (string, *config.Config, error) {
 // loadCreate is load for commands that create the config file when missing
 // (add, import).
 func loadCreate(w io.Writer) (string, *config.Config, error) {
-	p, err := cfgPath()
+	p, err := config.CurrentPath()
 	if err != nil {
 		return "", nil, err
 	}
@@ -196,13 +194,25 @@ func newSSHCmd() *cobra.Command {
 			"for the machine itself (its login prompt, GRUB, BIOS) use `" + AppName + " sol <name>`.\n" +
 			"On iLO and iDRAC, ctrl+] then c switches between the two in one session.\n\n" +
 			"Login uses the host's `key` if set, else ssh-agent keys, then the stored password.\n" +
-			"Host keys are pinned on first connect; after a BMC reimage use --reset-hostkey.",
+			"Host keys are pinned on first connect; after a BMC reimage use --reset-hostkey.\n\n" +
+			"Flags go before the host name; everything after it is the remote command, so its own\n" +
+			"dashes are passed through. A `--` before the command also works:\n" +
+			"  " + AppName + " ssh <name> -- show -l all /system1",
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: hostCompletion,
-		RunE: withHost(func(name string, h config.Host, rest []string) error {
-			return doSSH(h, name, reset, rest)
-		}),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withHost(func(name string, h config.Host, rest []string) error {
+				// A prefix match is fine for a login, but never run a command
+				// on a host the user did not name exactly.
+				if len(rest) > 0 && name != args[0] {
+					return fmt.Errorf("a remote command needs the exact host name (%q matched %q by prefix)", args[0], name)
+				}
+				return doSSH(h, name, reset, rest)
+			})(cmd, args)
+		},
 	}
+	// Everything after the host name is the remote command, dashes included.
+	c.Flags().SetInterspersed(false)
 	c.Flags().BoolVar(&reset, "reset-hostkey", false, "forget the stored host key first (after a BMC reimage)")
 	return c
 }
@@ -230,9 +240,18 @@ func newRoot() *cobra.Command {
 			if err := suggestCommand(args[0]); err != nil {
 				return err
 			}
+			if len(args) > 1 && isCommandName(args[1]) {
+				return fmt.Errorf("%q is also an %s command: did you mean `%s %s`? (to run it on the BMC, use `%s ssh %s`)",
+					args[1], AppName, AppName, strings.Join(append([]string{args[1], args[0]}, args[2:]...), " "),
+					AppName, strings.Join(args, " "))
+			}
 			return sshCmd.RunE(cmd, args)
 		},
 	}
+	// `<name> --reset-hostkey` is the ssh shorthand with its flag; the rest of
+	// the line is the remote command, as in `ssh`.
+	root.Flags().AddFlag(sshCmd.Flags().Lookup("reset-hostkey"))
+	root.Flags().SetInterspersed(false)
 	root.PersistentFlags().StringVarP(&cfgFlag, "config", "c", "", "config file (default ~/.config/"+AppName+"/hosts.json, or $XDG_CONFIG_HOME/"+AppName+"/hosts.json when set; must exist unless the command is add or import)")
 	root.PersistentFlags().BoolVarP(&yesFlag, "yes", "y", false, "skip confirmation prompts")
 
@@ -341,7 +360,7 @@ func closestCommand(arg string) string {
 // suggestCommand errors with a "did you mean" hint when arg is neither a host
 // (exact or prefix) nor a command but is close to a command name.
 func suggestCommand(arg string) error {
-	p, err := cfgPath()
+	p, err := config.CurrentPath()
 	if err != nil {
 		return nil
 	}

@@ -25,7 +25,7 @@ const csvMaxCols = 8
 type CSVResult struct {
 	Hosts    map[string]config.Host
 	Order    []string // names in file order
-	Skipped  int      // blank rows plus the header row
+	Skipped  int      // blank rows, # comment rows and the header row
 	Warnings []string
 	Errors   []string // sorted by row; non-empty means nothing may be imported
 }
@@ -51,6 +51,9 @@ func validHostName(n string) error {
 	}
 	if strings.HasPrefix(n, "-") {
 		return fmt.Errorf("name %q must not start with '-'", n)
+	}
+	if i := strings.IndexAny(n, ":*?[]"); i >= 0 {
+		return fmt.Errorf("name %q must not contain %q (reserved for host selection)", n, n[i])
 	}
 	for _, r := range n {
 		if unicode.IsSpace(r) || unicode.IsControl(r) {
@@ -126,11 +129,15 @@ func ParseHostsCSV(in io.Reader) (*CSVResult, error) {
 	// Blank out whitespace-only lines (keeps line numbers) and count them.
 	lines := strings.Split(string(raw), "\n")
 	for i, l := range lines {
-		if strings.TrimSpace(l) == "" {
+		last := i == len(lines)-1 // the piece after a final newline is not a line
+		switch {
+		case strings.TrimSpace(l) == "":
 			lines[i] = ""
-			if i < len(lines)-1 { // the piece after a final newline is not a line
+			if !last {
 				res.Skipped++
 			}
+		case strings.HasPrefix(l, "#"): // csv.Reader drops these; count them
+			res.Skipped++
 		}
 	}
 	r := csv.NewReader(strings.NewReader(strings.Join(lines, "\n")))

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"github.com/ssimpson89/oob/internal/app"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -118,7 +120,7 @@ func TestImportCommandCSV(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(out, "imported 2 (skipped 3 blank/header)") {
+		if !strings.Contains(out, "imported 2 (skipped 3 blank/header/comment)") {
 			t.Errorf("out=%q", out)
 		}
 		h := mustLoad(t, cfg).Hosts["csv1"]
@@ -313,7 +315,7 @@ func TestSelect(t *testing.T) {
 		"TAG:Prod": {"db1", "web1"},
 	}
 	for sel, want := range cases {
-		if got := selectHosts(c, sel); !reflect.DeepEqual(got, want) {
+		if got := c.Select(sel); !reflect.DeepEqual(got, want) {
 			t.Errorf("%q: %v want %v", sel, got, want)
 		}
 	}
@@ -454,5 +456,101 @@ func TestPowerStatusExhaustedBudgetTimesOut(t *testing.T) {
 	r := powerStatus("node01", config.Host{IP: "192.0.2.1"}, 50*time.Millisecond)
 	if called || !r.Failed || !strings.Contains(r.Text, "timed out") {
 		t.Errorf("result %+v, PowerStatus called %v", r, called)
+	}
+}
+
+func seedHosts(t *testing.T, hosts ...string) string {
+	t.Helper()
+	cfg := tmpCfg(t)
+	for _, n := range hosts {
+		if _, _, err := runOob(t, cfg, "", "add", n, "192.0.2.1", "--pass", "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return cfg
+}
+
+func TestShorthandRefusesCommandWord(t *testing.T) {
+	cfg := seedHosts(t, "node01")
+	_, _, err := runOob(t, cfg, "", "node01", "power", "off")
+	if err == nil || !strings.Contains(err.Error(), "did you mean `oob power node01 off`?") {
+		t.Errorf("err=%v", err)
+	}
+}
+
+func TestShorthandRemoteCommandNeedsExactName(t *testing.T) {
+	cfg := seedHosts(t, "node01")
+	_, _, err := runOob(t, cfg, "", "node0", "show", "system1")
+	if err == nil || !strings.Contains(err.Error(), "exact host name") {
+		t.Errorf("err=%v", err)
+	}
+	_, _, err = runOob(t, cfg, "", "ssh", "node0", "show")
+	if err == nil || !strings.Contains(err.Error(), "exact host name") {
+		t.Errorf("ssh: err=%v", err)
+	}
+}
+
+func TestShorthandDashArgsAndResetFlagParse(t *testing.T) {
+	cfg := seedHosts(t, "node01")
+	for _, args := range [][]string{
+		{"nosuch", "uname", "-a"}, {"nosuch", "--reset-hostkey"}, {"ssh", "nosuch", "uname", "-a"}, {"ssh", "nosuch", "--", "uname", "-a"},
+	} {
+		_, _, err := runOob(t, cfg, "", args...)
+		if err == nil || !strings.Contains(err.Error(), `no such host "nosuch"`) {
+			t.Errorf("%v: err=%v", args, err)
+		}
+	}
+}
+
+func TestWebURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"192.0.2.1": "https://192.0.2.1/", "bmc.example.com": "https://bmc.example.com/", "2001:db8::1": "https://[2001:db8::1]/",
+	} {
+		if got := webURL(in); got != want {
+			t.Errorf("%q: %q", in, got)
+		}
+	}
+}
+
+func TestValidHostNameRejectsSelectorChars(t *testing.T) {
+	for _, n := range []string{"a:b", "a*", "a?", "a[1]", "a]", "a b", "a\tb"} {
+		if validHostName(n) == nil {
+			t.Errorf("%q accepted", n)
+		}
+	}
+	if validHostName("rack2-node_01.x") != nil {
+		t.Error("good name rejected")
+	}
+}
+
+func TestLsNoMatchExits1(t *testing.T) {
+	cfg := seedHosts(t, "node01")
+	_, errs, err := runOob(t, cfg, "", "ls", "zzz")
+	var ec app.ExitCode
+	if !errors.As(err, &ec) || int(ec) != 1 || !strings.Contains(errs, "no hosts match zzz") {
+		t.Errorf("err=%v stderr=%q", err, errs)
+	}
+}
+
+func TestImportCommentsCountedAndOverwriteKeepsFields(t *testing.T) {
+	cfg := tmpCfg(t)
+	if err := os.WriteFile(cfg, []byte(`{"hosts":{"n1":{"ip":"192.0.2.9","user":"old","pass":"pw","key":"~/k","type":"ilo","ilo_gen":5,"tags":["a"],"char_delay_ms":5,"x_new":1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(t.TempDir(), "i.csv")
+	if err := os.WriteFile(f, []byte("# comment\nn1,192.0.2.10,newuser\n# another\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := runOob(t, cfg, "", "import", "--overwrite", f)
+	if err != nil || !strings.Contains(out, "imported 1 (skipped 2 blank/header/comment)") {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	h := mustLoad(t, cfg).Hosts["n1"]
+	if h.IP != "192.0.2.10" || h.User != "newuser" || h.Pass != "pw" || h.Key != "~/k" || h.Type != "ilo" || h.ILOGen != 5 || len(h.Tags) != 1 || h.CharDelayMS == nil {
+		t.Errorf("fields lost: %+v", h)
+	}
+	b, _ := os.ReadFile(cfg)
+	if !strings.Contains(string(b), "x_new") {
+		t.Errorf("unknown key lost: %s", b)
 	}
 }
