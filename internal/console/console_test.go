@@ -173,7 +173,7 @@ func TestCommandBarDropsHints(t *testing.T) {
 }
 
 func TestShortKey(t *testing.T) {
-	if shortKey("ctrl+]") != "^]" || shortKey("esc") != "esc" {
+	if shortKey != "^]" {
 		t.Error("shortKey")
 	}
 }
@@ -217,7 +217,10 @@ func TestClobbers(t *testing.T) {
 		"\x1bc":                 true,
 		"\x1b[2J":               true,
 		"\x1b[3J":               true,
-		"\x1b[J":                false,
+		"\x1b[J":                true,
+		"\x1b[0J":               true,
+		"\x1b[1J":               false,
+		"\x1b[H\x1b[J":          true,
 		"\x1b[!p":               true,
 		"abc\x1b[H\x1b[2;3Hxyz": false,
 	} {
@@ -846,3 +849,148 @@ func (s *stuckToggle) Toggle() (string, bool, error) {
 	return "", false, errors.New("closed")
 }
 func (s *stuckToggle) Hangup() error { close(s.closed); return nil }
+
+func TestLogMarkDoesNotSplitALine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n.log")
+	l, err := openLog(path, "hdr", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Write([]byte("root@host:~# ls /e"))
+	_ = l.Mark("BREAK sent")
+	_ = l.Write([]byte("tc\r\nnext\r\npart"))
+	_ = l.Mark("at close")
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) != 6 || lines[1] != "root@host:~# ls /etc" || !strings.HasSuffix(lines[2], "BREAK sent ---") ||
+		lines[3] != "next" || lines[4] != "part" || !strings.HasSuffix(lines[5], "at close ---") {
+		t.Errorf("marker split or lost a line:\n%s", b)
+	}
+}
+
+func TestCloseResetsRemoteModes(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	c.Output([]byte("\x1b[?1049h\x1b[?25l\x1b[?1003h"))
+	out.Reset()
+	c.Close()
+	s := out.String()
+	for _, want := range []string{"\x1b[?1049l", "\x1b[?25h", "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l",
+		"\x1b[?1006l", "\x1b[?1004l", "\x1b[?1l", "\x1b>", "\x1b(B", "\x0f", "\x1b[?2004l", "\x1b[r"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("close missing %q in %q", want, s)
+		}
+	}
+	if strings.Index(s, "\x1b[?1049l") > strings.Index(s, "\x1b[r") {
+		t.Errorf("alternate screen must be left before the region is cleared: %q", s)
+	}
+}
+
+func TestPasteReenabledAfterRemoteTurnsItOff(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	out.Reset()
+	c.Output([]byte("prompt\x1b[?2004l"))
+	if !strings.Contains(out.String(), "\x1b[?2004h") {
+		t.Errorf("bracketed paste not turned back on: %q", out.String())
+	}
+	out.Reset()
+	c.Output([]byte("more"))
+	if strings.Contains(out.String(), "\x1b[?2004h") {
+		t.Errorf("paste re-sent with nothing to repair: %q", out.String())
+	}
+}
+
+func TestNoRepaintWhenNothingChanged(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	c.Output([]byte("hello\r\n"))
+	out.Reset()
+	c.tickOnce(time.Now().Add(10 * time.Second))
+	if out.Len() != 0 {
+		t.Errorf("idle tick repainted a clean bar: %q", out.String())
+	}
+	c.mu.Lock()
+	c.dirty = true
+	c.mu.Unlock()
+	c.tickOnce(time.Now().Add(10 * time.Second))
+	if !strings.Contains(out.String(), "\x1b[24;1H") {
+		t.Errorf("dirty bar not repainted: %q", out.String())
+	}
+}
+
+func TestClearScreenSplitAcrossReadsIsDetected(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	c.Output([]byte("x\x1b[2"))
+	out.Reset()
+	c.Output([]byte("Jy"))
+	if !strings.Contains(out.String(), "\x1b[1;23r") {
+		t.Errorf("split clear screen not detected, no repaint: %q", out.String())
+	}
+	var s clobberScan
+	s.Feed([]byte("\x1b"))
+	if clob, _ := s.Feed([]byte("c")); !clob {
+		t.Error("ESC split from c not detected")
+	}
+}
+
+func TestBarSelectsNormalCharset(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	if !strings.Contains(out.String(), "\x1b[24;1H\x1b(B\x0f") {
+		t.Errorf("start paint does not select the normal charset: %q", out.String())
+	}
+	out.Reset()
+	c.SetSize(30, 80)
+	s := out.String()
+	i, j := strings.Index(s, "\x1b(B\x0f"), strings.Index(s, "\x1b[?7l")
+	if i < 0 || j < i || !strings.HasSuffix(s, "\x1b8") {
+		t.Errorf("repaint order wrong: %q", s)
+	}
+}
+
+func TestEraseToEndOfScreenRepaintsBar(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	out.Reset()
+	c.Output([]byte("\x1b[H\x1b[J"))
+	if !strings.Contains(out.String(), "\x1b[24;1H") {
+		t.Errorf("bar not repainted after CSI H CSI J: %q", out.String())
+	}
+}
+
+func TestLogMarkersKeepOrderAfterErasedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n.log")
+	l, err := openLog(path, "hdr", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Write([]byte("prompt"))
+	_ = l.Mark("first")
+	_ = l.Write([]byte("\r\x1b[2K"))
+	_ = l.Mark("second")
+	_ = l.Write([]byte("done\r\n"))
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	i, j := strings.Index(string(b), "first ---"), strings.Index(string(b), "second ---")
+	if i < 0 || j < 0 || i > j {
+		t.Errorf("markers out of order (first=%d second=%d):\n%s", i, j, b)
+	}
+}

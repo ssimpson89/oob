@@ -5,13 +5,15 @@
 
 package console
 
+import "github.com/ssimpson89/oob/internal/termtext"
+
 // historyLinesMax is how many completed lines of output are kept.
 const historyLinesMax = 10000
 
 // history keeps the newest completed lines of console output as plain text
 // (escape sequences removed), in a ring so memory stays bounded.
 type history struct {
-	cl    termCleaner
+	cl    termtext.Cleaner
 	buf   []string // ring storage, grows to max then wraps
 	max   int
 	start int // index of the oldest line once the ring is full

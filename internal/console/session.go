@@ -529,7 +529,7 @@ func (k *consoleKeys) do(a action) {
 		con.Note("now at "+kind, false)
 		con.Mark("switched to " + kind)
 	case actLiteral:
-		k.q.Urgent([]byte{escapeByte})
+		k.q.Enqueue([]byte{escapeByte})
 	case actPower:
 		if cs.Power == nil {
 			return
