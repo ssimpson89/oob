@@ -462,3 +462,54 @@ func TestRunLineStopsWhenOutputClosed(t *testing.T) {
 		t.Fatal("runLine kept waiting after the output closed")
 	}
 }
+
+// When the output hangs up in the middle of a batch, the shell prompt still
+// showing is stale: the rest of the batch must not be typed, and later calls
+// must be refused. The input is stopped before anyone waiting on the hang-up
+// is woken.
+func TestEOFStopsBatchAndRefusesSends(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) {
+		f.respond = func(f *fakeHost, cmd string) bool {
+			if cmd != "echo one" {
+				return false
+			}
+			f.emit("one\r\n" + f.prompt) // a prompt that is about to be stale
+			go func() {
+				for len(f.outq) > 0 {
+					time.Sleep(time.Millisecond)
+				}
+				time.Sleep(5 * time.Millisecond) // the pump has delivered it; well inside quietFor
+				f.pw.Close()                     // output EOF; no exit status is ever sent
+			}()
+			return true
+		}
+	}
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, isErr := h.send("s1", "echo one\necho two\necho three")
+	if !isErr {
+		t.Errorf("batch cut short by EOF reported success: %q", out)
+	}
+	select {
+	case <-c.eofC:
+	default:
+		t.Fatal("output EOF not seen")
+	}
+	if err := c.canSend(); err == nil {
+		t.Error("canSend is nil after output EOF, before the exit status")
+	}
+	if out, isErr := h.send("s1", "echo four"); !isErr {
+		t.Errorf("send after EOF was accepted: %q", out)
+	}
+	if out, isErr := h.keys("s1", "echo five", "enter"); !isErr {
+		t.Errorf("send_keys after EOF was accepted: %q", out)
+	}
+	if got := f.entered(); len(got) != 1 || got[0] != "echo one" {
+		t.Errorf("host ran %q, want only the first line", got)
+	}
+}
