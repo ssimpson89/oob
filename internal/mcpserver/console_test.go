@@ -690,3 +690,24 @@ func leased(c *session, fn func(context.Context) error) error {
 	defer release()
 	return fn(ctx)
 }
+
+// What the agent types at a login, password or passphrase prompt is not written
+// to the log.
+func TestSessionLogDoesNotRecordAnswersToSecretPrompts(t *testing.T) {
+	for _, prompt := range []string{"node01 login: ", "Password: ", "Enter passphrase for /home/u/.ssh/id_ed25519: ", "Verify password: "} {
+		dir := t.TempDir()
+		h := start(t, Options{Log: true, LogDir: dir}, "")
+		h.initial = &prompt
+		id := h.connect()
+		h.send(id, "hunter2")
+		h.call("disconnect", map[string]any{"session": id})
+		files, _ := filepath.Glob(filepath.Join(dir, "node01-*.log"))
+		if len(files) != 1 {
+			t.Fatalf("%q: log files %v", prompt, files)
+		}
+		b, _ := os.ReadFile(files[0])
+		if strings.Contains(string(b), "agent typed: hunter2") || !strings.Contains(string(b), "agent answered a login prompt") {
+			t.Errorf("%q: the log:\n%s", prompt, b)
+		}
+	}
+}
