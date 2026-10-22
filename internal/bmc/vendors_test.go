@@ -510,3 +510,17 @@ func TestSupermicroConsoleWithoutTerminalDoesNotClearASharedConsole(t *testing.T
 		t.Errorf("Console = %v, want a refusal naming the other oob", err)
 	}
 }
+
+// The untested-vendor note and the racreset note go to the captured output, so
+// an MCP caller sees them, not only the terminal.
+func TestIDRACNotesAreCaptured(t *testing.T) {
+	swap(t, &untestedDone, false)
+	d := newFakeIDRAC(&fakeRacadm{out: map[string]string{}})
+	out, err := Capture(context.Background(), func() error { return d.MCReset("cold") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no warm or cold choice") || !strings.Contains(out, "support is untested") {
+		t.Errorf("captured output %q", out)
+	}
+}

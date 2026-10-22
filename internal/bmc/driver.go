@@ -63,9 +63,10 @@ func DriverFor(name string, h config.Host) Driver {
 }
 
 // untestedOut and untestedDone: one line per run, the first time a driver for
-// an untested vendor changes state.
+// an untested vendor changes state. untestedOut nil means stderr, or the
+// output of the running Capture, so MCP callers see the note too.
 var (
-	untestedOut  io.Writer = os.Stderr
+	untestedOut  io.Writer
 	untestedMu   sync.Mutex
 	untestedDone bool
 )
@@ -84,7 +85,11 @@ const untestedMsg = "%s support is untested; please report results"
 
 func untestedNote(vendor string) {
 	if untestedFirst() {
-		app.Notef(untestedOut, untestedMsg, vendor)
+		w := untestedOut
+		if w == nil {
+			w = stderrW()
+		}
+		app.Notef(w, untestedMsg, vendor)
 	}
 }
 

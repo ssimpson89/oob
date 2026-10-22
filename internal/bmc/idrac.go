@@ -3,7 +3,6 @@ package bmc
 import (
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -230,7 +229,7 @@ func (d *idracDriver) SEL(act string) error {
 // the SSH session may drop as the iDRAC restarts.
 func (d *idracDriver) MCReset(kind string) error {
 	untestedNote(detect.VendorName(detect.TypeIDRAC))
-	app.Notef(os.Stderr, "racadm racreset has no warm or cold choice; running a plain racreset (asked for %s)", kind)
+	app.Notef(stderrW(), "racadm racreset has no warm or cold choice; running a plain racreset (asked for %s)", kind)
 	out, err := d.racadm(cliCmdTimeout, "racreset")
 	if err != nil {
 		return d.unknownOnTimeout(err)
