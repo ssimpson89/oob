@@ -379,3 +379,24 @@ func TestStuckBMCPromptEndsAndForgetsTheSession(t *testing.T) {
 		t.Errorf("the session wasn't forgotten: %q %v", out, isErr)
 	}
 }
+
+// Where the console is comes from the shared console's state. A window that
+// switched back to the host console without printing anything leaves the
+// session's cached answer stale, and bmc_prompt must not go by it.
+func TestBMCPromptGoesByTheSharedConsolesState(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) { f.toggle = true }
+	h.connect()
+	h.srv.mu.Lock()
+	c := h.srv.sessions["s1"]
+	h.srv.mu.Unlock()
+	c.mu.Lock()
+	c.atBMC = true // what the output last showed; the console has since moved back
+	c.mu.Unlock()
+	if out, isErr := h.call("bmc_prompt", map[string]any{"session": "s1", "to": "console"}); isErr || !strings.Contains(out, "already at the console") {
+		t.Errorf("to console: %q %v", out, isErr)
+	}
+	if out, isErr := h.call("bmc_prompt", map[string]any{"session": "s1", "to": "bmc"}); isErr || !strings.Contains(out, "Now at ilo cli") {
+		t.Errorf("to bmc: %q %v", out, isErr)
+	}
+}

@@ -631,14 +631,12 @@ func (c *session) sinceBreak() bool {
 	return !at.IsZero() && time.Since(at) < afterBreak
 }
 
-// onBMC reports whether the console is at the BMC's own command line: by what the
-// output showed, or by the shared console's state, which a window's switch
-// changes before any output follows.
+// onBMC reports whether the console is at the BMC's own command line, by the
+// shared console's state: it follows a window's switch (which may print
+// nothing) as well as the output, so a cached answer from the output alone
+// could be stale.
 func (c *session) onBMC() bool {
-	c.mu.Lock()
-	at := c.atBMC
-	c.mu.Unlock()
-	return at || c.sh.Status().AtPrompt
+	return c.sh.Status().AtPrompt
 }
 
 func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in commandIn) (*mcp.CallToolResult, any, error) {
