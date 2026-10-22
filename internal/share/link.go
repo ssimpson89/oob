@@ -72,3 +72,9 @@ func (l *link) SizeLine(rows, cols int) (string, bool) {
 	r, err := l.c.call(ctx, msg{Op: opSizeLine, Rows: rows, Cols: cols})
 	return r.Text, err == nil && r.OK
 }
+
+// Hangup leaves the console without typing anything: for the oob that opened it
+// that closes the transport (a write stuck in it fails), for a window it just
+// goes. The window uses it when a disconnect or a BMC prompt switch doesn't
+// answer.
+func (l *link) Hangup() error { return l.c.Close() }

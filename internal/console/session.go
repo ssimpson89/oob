@@ -41,9 +41,9 @@ type hangupper interface {
 	Hangup() error
 }
 
-// disconnectWait bounds how long a disconnect waits for the link's own
-// Disconnect before hanging up. It is a var so tests can shorten it.
-var disconnectWait = 5 * time.Second
+// linkWait bounds how long a disconnect or a switch to the BMC prompt waits for
+// the link before hanging up. It is a var so tests can shorten it.
+var linkWait = 5 * time.Second
 
 // toggler is a link that can switch between the host console and the BMC's own
 // CLI prompt (c key). It returns the bar label and whether it is at the prompt.
@@ -497,7 +497,30 @@ func (k *consoleKeys) do(a action) {
 			return
 		}
 		k.q.Clear()
-		kind, at, err := t.Toggle()
+		// Toggling types at the remote, which a stuck transport never takes: run
+		// it aside, and hang up if it is not back in time, so this input loop
+		// goes on.
+		type toggled struct {
+			kind string
+			at   bool
+			err  error
+		}
+		res := make(chan toggled, 1)
+		go func() {
+			kind, at, err := t.Toggle()
+			res <- toggled{kind, at, err}
+		}()
+		var r toggled
+		select {
+		case r = <-res:
+		case <-time.After(linkWait):
+			con.Note("bmc prompt: no answer, hanging up", true)
+			if h, ok := cs.Link.(hangupper); ok {
+				_ = h.Hangup()
+			}
+			return
+		}
+		kind, at, err := r.kind, r.at, r.err
 		con.SetKind(kind, at)
 		if err != nil {
 			con.Note("bmc prompt: "+err.Error(), true)
@@ -552,7 +575,7 @@ func (k *consoleKeys) do(a action) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(disconnectWait):
+		case <-time.After(linkWait):
 			if h, ok := cs.Link.(hangupper); ok {
 				_ = h.Hangup()
 			}

@@ -1218,10 +1218,49 @@ func (h *hub) linkOp(p *peer, m msg, reply func(msg, error)) {
 	go h.runLinkOp(m, dirty, reply)
 }
 
-// runLinkOp uses the link, outside the loop, and posts the result back.
+// linkOpWait bounds a disconnect or a switch to the BMC prompt: both type at the
+// console, and on a transport that has stopped taking input they would block
+// for good, with the hub busy. A variable so tests can shorten it.
+var linkOpWait = 5 * time.Second
+
+// runLinkOp uses the link, outside the loop, and posts the result back. A
+// disconnect or toggle that is not done in linkOpWait is given up on: the
+// transport is closed, which fails the stuck write and ends the console, and
+// everyone is told.
 func (h *hub) runLinkOp(m msg, dirty bool, reply func(msg, error)) {
-	var r msg
-	var err error
+	type result struct {
+		r   msg
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		r, err := h.doLinkOp(m, dirty)
+		done <- result{r, err}
+	}()
+	var late <-chan time.Time
+	if m.Op == opDisconnect || m.Op == opToggle {
+		t := time.NewTimer(linkOpWait)
+		defer t.Stop()
+		late = t.C
+	}
+	select {
+	case res := <-done:
+		h.post(func() { h.linkOpDone(m, res.r, res.err, reply) })
+	case <-late:
+		go h.closeTr()
+		h.post(func() {
+			h.busy--
+			h.note("the console stopped answering · closed")
+			if m.Op == opDisconnect {
+				reply(msg{}, nil) // the console is ending, which is what was asked
+			} else {
+				reply(msg{}, errors.New("the console stopped answering and was closed"))
+			}
+		})
+	}
+}
+
+func (h *hub) doLinkOp(m msg, dirty bool) (r msg, err error) {
 	switch m.Op {
 	case opBreak:
 		err = h.tr.Link.Break()
@@ -1240,20 +1279,23 @@ func (h *hub) runLinkOp(m msg, dirty bool, reply func(msg, error)) {
 	default:
 		err = errors.New("unknown operation " + m.Op)
 	}
-	h.post(func() {
-		h.busy--
-		switch {
-		case m.Op == opBreak && err == nil:
-			h.breakAt = time.Now()
-			for q := range h.peers { // the AI tool's safety checks care whoever sent it
-				h.queue(q, msg{T: tBreak})
-			}
-		case m.Op == opToggle:
-			h.kind, h.atPrompt = r.Kind, r.AtPrompt
-			h.broadcastState()
+	return r, err
+}
+
+// linkOpDone finishes a link operation, in the loop.
+func (h *hub) linkOpDone(m msg, r msg, err error, reply func(msg, error)) {
+	h.busy--
+	switch {
+	case m.Op == opBreak && err == nil:
+		h.breakAt = time.Now()
+		for q := range h.peers { // the AI tool's safety checks care whoever sent it
+			h.queue(q, msg{T: tBreak})
 		}
-		reply(r, err)
-	})
+	case m.Op == opToggle:
+		h.kind, h.atPrompt = r.Kind, r.AtPrompt
+		h.broadcastState()
+	}
+	reply(r, err)
 }
 
 // Messages to clients.

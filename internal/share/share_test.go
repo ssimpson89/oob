@@ -49,6 +49,7 @@ type fakeConsole struct {
 	breakGate   chan struct{}  // Break waits for it to close, if set
 	inBreak     chan struct{}  // closed when Break starts, if set
 	releaseGate chan struct{}  // the transport's Release waits for it to close, if set
+	opGate      chan struct{}  // Disconnect and Toggle wait for it to close, if set: a transport that stopped answering
 }
 
 func newFake() *fakeConsole {
@@ -90,6 +91,9 @@ func (f *fakeConsole) Break() error {
 	return nil
 }
 func (f *fakeConsole) Disconnect() error {
+	if f.opGate != nil {
+		<-f.opGate
+	}
 	f.mu.Lock()
 	f.disconnects++
 	f.mu.Unlock()
@@ -160,6 +164,9 @@ func (f *fakeConsole) transport() *console.Transport {
 	}
 	if f.toggle {
 		t.Toggle = func() (string, bool, error) {
+			if f.opGate != nil {
+				<-f.opGate
+			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.atBMC = !f.atBMC

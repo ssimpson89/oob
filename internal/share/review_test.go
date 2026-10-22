@@ -445,3 +445,61 @@ func TestCloseHostedEndsConsolesWindowsAreOnAndReleasesThem(t *testing.T) {
 		}
 	}
 }
+
+// A disconnect or a switch to the BMC prompt that the transport never answers
+// can't hang the window: the hub gives up after linkOpWait, closes the
+// transport and tells everyone.
+func TestStuckDisconnectAndToggleCloseTheConsole(t *testing.T) {
+	for _, op := range []string{"disconnect", "toggle"} {
+		t.Run(op, func(t *testing.T) {
+			env(t)
+			old := linkOpWait
+			linkOpWait = 100 * time.Millisecond
+			t.Cleanup(func() { linkOpWait = old })
+			f := newFake()
+			f.toggle = true
+			f.opGate = make(chan struct{})
+			t.Cleanup(func() { close(f.opGate) })
+			win := host(t, f, Options{NoLinger: true})
+			errc := make(chan error, 1)
+			go func() {
+				if op == "disconnect" {
+					errc <- win.Transport().Link.Disconnect()
+				} else {
+					_, _, err := win.Toggle()
+					errc <- err
+				}
+			}()
+			select {
+			case err := <-errc:
+				if (err != nil) != (op == "toggle") {
+					t.Errorf("%s returned %v", op, err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s never returned", op)
+			}
+			eventually(t, "the transport is closed", f.isClosed)
+			select {
+			case <-win.Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("the window was never told the console ended")
+			}
+		})
+	}
+}
+
+// The window's Hangup closes the console it opened without typing at it.
+func TestLinkHangupClosesTheHostedConsole(t *testing.T) {
+	env(t)
+	f := newFake()
+	win := host(t, f, Options{NoLinger: true})
+	hl, ok := win.Transport().Link.(interface{ Hangup() error })
+	if !ok {
+		t.Fatal("the shared link has no Hangup, so the window's bounded disconnect has no fallback")
+	}
+	_ = hl.Hangup()
+	eventually(t, "the transport is closed", f.isClosed)
+	if got := f.got(); got != "" {
+		t.Errorf("hangup typed %q", got)
+	}
+}
