@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -126,6 +127,7 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start ipmitool: %w", err)
 	}
+	link := &solLink{ptmx: ptmx, cmd: cmd}
 	done := make(chan console.Result, 1)
 	// refused is set when ipmitool itself gave up with a non-zero exit status
 	// (for instance "SOL payload already active": someone else holds the
@@ -145,7 +147,7 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 			if ee.ExitCode() > 0 {
 				refused.Store(true)
 			}
-			done <- console.Result{Code: exitCodeOf(ee)}
+			done <- console.Result{Code: solExitCode(ee, link.hungUp.Load())}
 		default:
 			done <- console.Result{Code: 1, Err: err}
 		}
@@ -154,7 +156,7 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 	return &ConsoleTransport{
 		Kind:   "sol",
 		Pacing: console.PacingMS(h.CharDelayMS, h.LineDelayMS),
-		Link:   &solLink{ptmx: ptmx, cmd: cmd},
+		Link:   link,
 		Out:    io.TeeReader(ptmx, tail),
 		Done:   done,
 		Tail:   tail.String,
@@ -177,6 +179,16 @@ func openSOL(h config.Host, rows, cols int) (*ConsoleTransport, error) {
 			_, _ = ipmiOutput(h, ipmiQuickTimeout, "sol", "deactivate")
 		},
 	}, nil
+}
+
+// solExitCode is ipmitool's exit code, except that the SIGKILL of an
+// intentional hangup is a clean exit: the user chose to leave. Anything else,
+// including a real error after a hangup, keeps its code.
+func solExitCode(ee *exec.ExitError, hungUp bool) int {
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && hungUp && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
+		return 0
+	}
+	return exitCodeOf(ee)
 }
 
 // solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
