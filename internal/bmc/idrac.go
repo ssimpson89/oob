@@ -77,19 +77,25 @@ func racadmError(out string) error {
 // idracDriver runs racadm over SSH exec. run is a field so tests can fake it.
 type idracDriver struct {
 	ipmiDriver // unused except for the host; every action is overridden
-	run        func(cmd string, timeout time.Duration) (string, error)
+	run        func(cmd string, timeout time.Duration, noPrompt bool) (string, error)
 }
 
 func newIDRACDriver(name string, h config.Host) *idracDriver {
-	return &idracDriver{ipmiDriver: ipmiDriver{name, h}, run: func(cmd string, timeout time.Duration) (string, error) {
-		return sshExec(name, h, cmd, timeout)
+	return &idracDriver{ipmiDriver: ipmiDriver{name, h}, run: func(cmd string, timeout time.Duration, noPrompt bool) (string, error) {
+		return sshExec(name, h, cmd, timeout, noPrompt)
 	}}
 }
 
 // racadm runs one racadm command and returns its output. Output with an ERROR
 // line is a failure even when the exit status is 0.
 func (d *idracDriver) racadm(timeout time.Duration, args ...string) (string, error) {
-	out, err := d.run("racadm "+strings.Join(args, " "), timeout)
+	return d.racadmOpt(timeout, false, args...)
+}
+
+// racadmOpt is racadm with noPrompt for runs that must not ask the user for
+// anything (the status table, bulk runs).
+func (d *idracDriver) racadmOpt(timeout time.Duration, noPrompt bool, args ...string) (string, error) {
+	out, err := d.run("racadm "+strings.Join(args, " "), timeout, noPrompt)
 	if e := racadmError(out); e != nil {
 		return out, e
 	}
@@ -150,7 +156,7 @@ func (d *idracDriver) Power(act string) error {
 }
 
 func (d *idracDriver) PowerStatus(timeout time.Duration) StatusResult {
-	out, err := d.racadm(timeout, "serveraction", "powerstatus")
+	out, err := d.racadmOpt(timeout, true, "serveraction", "powerstatus")
 	if err != nil {
 		return statusFail(err.Error())
 	}
@@ -269,8 +275,10 @@ func (d *idracDriver) ConsolePower() func() (string, error) {
 }
 
 // sshExec runs one remote command over SSH (no PTY) and returns its combined
-// output, giving up after timeout. It also feeds the output to vendor detection.
-func sshExec(name string, h config.Host, cmd string, timeout time.Duration) (string, error) {
+// output. timeout is the caller's whole budget: it bounds the connect and the
+// command together. noPrompt keeps the login from asking for a key passphrase.
+// It also feeds the output to vendor detection.
+func sshExec(name string, h config.Host, cmd string, timeout time.Duration, noPrompt bool) (string, error) {
 	if err := sshx.CheckCreds(name, h); err != nil {
 		return "", err
 	}
@@ -280,7 +288,8 @@ func sshExec(name string, h config.Host, cmd string, timeout time.Duration) (str
 	}
 	app.Progressf("connecting to %s via SSH...", name)
 	det := detect.NewDetector(name, h)
-	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner})
+	deadline := time.Now().Add(timeout)
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner, Timeout: timeout, NoPrompt: noPrompt})
 	if err != nil {
 		return "", fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}
@@ -303,7 +312,7 @@ func sshExec(name string, h config.Host, cmd string, timeout time.Duration) (str
 	case r := <-ch:
 		det.Feed(r.out) // an empty answer still says the login worked
 		return string(r.out), console.CleanErr(r.err)
-	case <-time.After(timeout):
+	case <-time.After(max(time.Until(deadline), 0)):
 		return "", &console.TimeoutError{Host: name, Via: "SSH", After: timeout}
 	}
 }

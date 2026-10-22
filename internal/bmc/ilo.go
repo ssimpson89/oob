@@ -142,13 +142,14 @@ func (s *cliSession) Run(cmd string, timeout time.Duration) (iloResult, error) {
 }
 
 // iloDial connects to an iLO and waits for its first prompt.
-func iloDial(name string, h config.Host, rows, cols int) (*cliSession, *ssh.Session, io.WriteCloser, error) {
-	return cliDial(name, h, iloSpec, rows, cols)
+func iloDial(name string, h config.Host, rows, cols int, timeout time.Duration, noPrompt bool) (*cliSession, *ssh.Session, io.WriteCloser, error) {
+	return cliDial(name, h, iloSpec, rows, cols, timeout, noPrompt)
 }
 
-// iloDo opens a CLI session, runs cmd and closes it.
-func iloDo(name string, h config.Host, cmd string) (iloResult, error) {
-	s, _, _, err := iloDial(name, h, 24, 200)
+// iloDo opens a CLI session, runs cmd and closes it. timeout and noPrompt are
+// for runs without a user at the keyboard (see cliDial).
+func iloDo(name string, h config.Host, cmd string, timeout time.Duration, noPrompt bool) (iloResult, error) {
+	s, _, _, err := iloDial(name, h, 24, 200, timeout, noPrompt)
 	if err != nil {
 		return iloResult{Status: -1}, err
 	}
@@ -265,7 +266,7 @@ func iloCycle(name string, r iloRunner, sleep func(time.Duration)) (string, erro
 // so the VSP session stays up.
 func iloPowerCycleFn(name string, h config.Host) func() (string, error) {
 	return func() (string, error) {
-		s, _, _, err := iloDial(name, h, 24, 200)
+		s, _, _, err := iloDial(name, h, 24, 200, 0, false)
 		if err != nil {
 			return "", err
 		}
@@ -387,7 +388,7 @@ func (d *iloDriver) Power(act string) error {
 		return err
 	}
 	app.Progressf("connecting to %s via SSH (iLO CLI)...", d.name)
-	res, err := iloDo(d.name, d.h, cmd)
+	res, err := iloDo(d.name, d.h, cmd, 0, false)
 	if err != nil {
 		if errors.Is(err, errCLINoReply) {
 			return fmt.Errorf("%w; %s", err, console.ResultUnknown(d.name))
@@ -426,8 +427,12 @@ func (d *iloDriver) PowerStatus(timeout time.Duration) StatusResult {
 		err error
 	}
 	ch := make(chan out, 1)
+	left := timeout
+	if dl, ok := ctx.Deadline(); ok {
+		left = max(time.Until(dl), time.Millisecond)
+	}
 	go func() {
-		r, err := iloDo(d.name, d.h, "power")
+		r, err := iloDo(d.name, d.h, "power", left, true)
 		ch <- out{r, err}
 	}()
 	select {
@@ -534,7 +539,7 @@ func (d *iloDriver) ConsolePower() func() (string, error) {
 // iloPrint runs one iLO CLI command and prints the response text.
 func iloPrint(name string, h config.Host, cmd string) error {
 	app.Progressf("connecting to %s via SSH (iLO CLI)...", name)
-	res, err := iloDo(name, h, cmd)
+	res, err := iloDo(name, h, cmd, 0, false)
 	if err != nil {
 		return err
 	}

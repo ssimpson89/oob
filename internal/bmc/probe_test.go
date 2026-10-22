@@ -406,3 +406,35 @@ func TestProbeRejectionMessageIsCleaned(t *testing.T) {
 		t.Errorf("escape sequence in note: %q", out.String())
 	}
 }
+
+// The status and bulk paths (sshExec, cliDial) are unattended like the probe:
+// an encrypted key fails with ErrNeedsInput instead of asking for a passphrase.
+func TestUnattendedSSHPathsDoNotPrompt(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(blk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := startProbeBMC(t, "", "</>hpeiLO-> ", "pw")
+	_, h := probeEnv(t, "ilo", srv.port)
+	h.Key, h.Pass = keyPath, ""
+	if _, err := sshExec("node01", h, "racadm getsysinfo", time.Second, true); !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("sshExec err %v, want ErrNeedsInput", err)
+	}
+	if _, err := iloDo("node01", h, "power", time.Second, true); !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("iloDo err %v, want ErrNeedsInput", err)
+	}
+	if _, _, _, err := cliDial("node01", h, iloSpec, 24, 80, time.Second, true); !errors.Is(err, sshx.ErrNeedsInput) {
+		t.Errorf("cliDial err %v, want ErrNeedsInput", err)
+	}
+	if srv.conns.Load() != 0 {
+		t.Errorf("connected %d times, want 0", srv.conns.Load())
+	}
+}

@@ -222,7 +222,9 @@ func startShell(c *ssh.Client, rows, cols int) (*ssh.Session, io.WriteCloser, io
 
 // cliDial connects, opens an interactive CLI and waits for the first prompt
 // (matched by sp.prompt). The returned session owns the SSH client.
-func cliDial(name string, h config.Host, sp cliSpec, rows, cols int) (*cliSession, *ssh.Session, io.WriteCloser, error) {
+// timeout (0: the default) limits the connect and noPrompt keeps the login from
+// asking for a passphrase, for runs without a user at the keyboard.
+func cliDial(name string, h config.Host, sp cliSpec, rows, cols int, timeout time.Duration, noPrompt bool) (*cliSession, *ssh.Session, io.WriteCloser, error) {
 	kh, err := sshx.KnownHostsPath()
 	if err != nil {
 		return nil, nil, nil, err
@@ -231,7 +233,7 @@ func cliDial(name string, h config.Host, sp cliSpec, rows, cols int) (*cliSessio
 		return nil, nil, nil, err
 	}
 	det := detect.NewDetector(name, h)
-	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner})
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner, Timeout: timeout, NoPrompt: noPrompt})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}
@@ -484,7 +486,7 @@ var consoleStartWait = 5 * time.Second
 // console transport. It needs no terminal of its own: rows and cols are the
 // size the remote is told. Both the console bar and a headless front end use it.
 func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTransport, error) {
-	s, sess, stdin, err := cliDial(name, h, sp, rows, cols)
+	s, sess, stdin, err := cliDial(name, h, sp, rows, cols, 0, false)
 	if err != nil {
 		return nil, err
 	}
