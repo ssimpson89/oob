@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -62,18 +63,18 @@ func TestConsoleSessionLifecycle(t *testing.T) {
 	if out, _ := h.call("read_output", map[string]any{"session": "s1", "wait_seconds": 0.2, "until": "never appears"}); !strings.Contains(out, "didn't appear") {
 		t.Errorf("until that never comes: %q", out)
 	}
-	out, _ = h.call("read_history", map[string]any{"session": "s1", "lines": 5})
+	out, _ = h.call("read_output", map[string]any{"session": "s1", "lines": 5})
 	if !strings.Contains(out, "5.14.0-test") || len(strings.Split(out, "\n")) > 5 {
 		t.Errorf("read_history: %q", out)
 	}
-	out, _ = h.call("read_history", map[string]any{"session": "s1", "search": "HEARTBEAT"}) // exact case: no match
+	out, _ = h.call("read_output", map[string]any{"session": "s1", "search": "HEARTBEAT"}) // exact case: no match
 	if out != "(nothing found)" {
 		t.Errorf("history is smart-case: %q", out)
 	}
-	if out, _ := h.call("read_history", map[string]any{"session": "s1", "search": "heartbeat"}); !strings.Contains(out, "kernel: heartbeat") {
+	if out, _ := h.call("read_output", map[string]any{"session": "s1", "search": "heartbeat"}); !strings.Contains(out, "kernel: heartbeat") {
 		t.Errorf("history search: %q", out)
 	}
-	if out, isErr := h.call("read_history", map[string]any{"session": "s1", "lines": 5000}); !isErr {
+	if out, isErr := h.call("read_output", map[string]any{"session": "s1", "lines": 5000}); !isErr {
 		t.Errorf("too many lines accepted: %q", out)
 	}
 
@@ -146,10 +147,40 @@ func TestConnectForceNeedsApproval(t *testing.T) {
 
 func TestConnectNoticesAConsoleThatEndsAtOnce(t *testing.T) {
 	h := start(t, Options{}, "")
+	// The quiet timer must not decide this: with it out of the picture, only
+	// the console ending can end connect's wait, however slowly the host runs.
+	quietFor = time.Minute
 	h.setup = func(f *fakeHost) { f.emit("Error: SOL payload already active\r\n"); f.finish() }
 	out, isErr := h.call("connect", map[string]any{"host": "node01"})
 	if !isErr || !strings.Contains(out, "ended right after connecting") {
 		t.Errorf("connect: %q %v", out, isErr)
+	}
+	if n := len(h.srv.sessions); n != 0 {
+		t.Errorf("%d sessions left open", n)
+	}
+}
+
+// The output hanging up is enough to know the console ended, even if its exit
+// status never arrives; connect must not return success after the full wait.
+func TestConnectNoticesAnOutputThatHangsUpWithoutAnExitStatus(t *testing.T) {
+	h := start(t, Options{}, "")
+	quietFor = time.Minute
+	oldGrace := connectEndGrace
+	connectEndGrace = 50 * time.Millisecond
+	t.Cleanup(func() { connectEndGrace = oldGrace })
+	h.setup = func(f *fakeHost) {
+		f.emit("Error: SOL payload already active\r\n")
+		go func() { time.Sleep(10 * time.Millisecond); f.pw.Close() }() // no f.done
+	}
+	begin := time.Now()
+	out, isErr := h.call("connect", map[string]any{"host": "node01"})
+	if !isErr || !strings.Contains(out, "ended right after connecting") {
+		t.Errorf("connect: %q %v", out, isErr)
+	}
+	// The shared hub gives the exit status endWait (2s) before it tells the
+	// session the console ended; waiting out connect's whole settle would be 3s.
+	if d := time.Since(begin); d > connectWait-300*time.Millisecond {
+		t.Errorf("connect took %v, it should notice the hang-up, not wait out the full settle", d)
 	}
 	if n := len(h.srv.sessions); n != 0 {
 		t.Errorf("%d sessions left open", n)
@@ -258,7 +289,7 @@ func TestConsoleOutputIsSanitized(t *testing.T) {
 		args map[string]any
 	}{
 		{"send_command", map[string]any{"session": "s1", "line": "evil", "wait_seconds": 0.5}},
-		{"read_history", map[string]any{"session": "s1"}},
+		{"read_output", map[string]any{"session": "s1", "lines": 50}},
 	} {
 		out, _ := h.call(c.tool, c.args)
 		if !strings.Contains(out, "red") || !strings.Contains(out, "ok") {
@@ -285,7 +316,7 @@ func TestConsoleOutputIsBounded(t *testing.T) {
 	if !strings.Contains(out, "earlier lines not shown") || !strings.Contains(out, "log line 2999") {
 		t.Errorf("should say lines were cut and keep the newest: %q", out[:min(len(out), 200)])
 	}
-	hist, _ := h.call("read_history", map[string]any{"session": "s1", "lines": 300})
+	hist, _ := h.call("read_output", map[string]any{"session": "s1", "lines": 300})
 	if len(hist) > shownBytesMax+2048 {
 		t.Errorf("history is %d bytes", len(hist))
 	}
@@ -400,5 +431,283 @@ func TestSendCommandWaitStartsAfterTyping(t *testing.T) {
 	out, isErr := h.call("send_command", map[string]any{"session": "s1", "line": line, "wait_seconds": 0.6})
 	if isErr || !strings.Contains(out, "late-result") {
 		t.Errorf("answer arrived %.1fs after typing began but was missed: %q %v", time.Since(start).Seconds(), out, isErr)
+	}
+}
+
+func TestSendKeysOnAnILOVSP(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) { f.vsp = true }
+	h.connect()
+	f := h.host("node01")
+
+	out, isErr := h.keys("s1", "", "up")
+	if !isErr || !strings.Contains(out, "iLO VSP, which can't pass arrow keys") {
+		t.Fatalf("arrow key: got %q %v, want an error naming the VSP limitation", out, isErr)
+	}
+	out, isErr = h.keys("s1", "", "f1")
+	if !isErr || !strings.Contains(out, "iLO VSP") {
+		t.Fatalf("function key: got %q %v", out, isErr)
+	}
+	if got := f.rawSent(); got != "" {
+		t.Fatalf("refused keys still typed %q", got)
+	}
+
+	if out, isErr = h.keys("s1", "", "esc"); isErr {
+		t.Fatalf("esc: %q", out)
+	}
+	if got := f.rawSent(); got != "\x1b\x1b" {
+		t.Errorf("esc typed %q, want ESC ESC", got)
+	}
+}
+
+func TestSendKeysArrowsAreFineOffVSP(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.keys("s1", "", "up"); isErr {
+		t.Fatalf("got %q", out)
+	}
+	if got := h.host("node01").rawSent(); got != "\x1b[A" {
+		t.Errorf("typed %q", got)
+	}
+}
+
+func TestSendKeysEscThenEnterKeepsTheKeysApartOnAnILOVSP(t *testing.T) {
+	h := start(t, Options{}, "accept") // esc then enter runs an edited line: the user is asked
+	h.setup = func(f *fakeHost) { f.vsp = true }
+	h.connect()
+	f := h.host("node01")
+	// Two keys: Escape, then Enter. Joined as ESC CR they would read as one
+	// Alt-Enter, which a VSP can't pass.
+	if out, isErr := h.keys("s1", "", "esc", "enter"); isErr {
+		t.Fatalf("esc, enter: %q", out)
+	}
+	if got := f.rawSent(); got != "\x1b\x1b\r" {
+		t.Errorf("typed %q, want ESC ESC CR", got)
+	}
+	// Text then a key keeps its boundary too, and the whole call is still
+	// checked first: one key the VSP can't pass sends nothing at all.
+	before := f.rawSent()
+	out, isErr := h.keys("s1", "abc", "esc", "up")
+	if !isErr || !strings.Contains(out, "iLO VSP") {
+		t.Fatalf("esc, up: %q %v", out, isErr)
+	}
+	if got := f.rawSent(); got != before {
+		t.Errorf("a refused call still typed %q", got[len(before):])
+	}
+}
+
+// A console whose output hangs up with no exit status must end runLine at
+// once, not spin until wait_seconds passes.
+func TestRunLineStopsWhenOutputClosed(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.emit("compiling...") // cursor not at a prompt, so only EOF can end the wait
+	time.Sleep(100 * time.Millisecond)
+	f.pw.Close() // output EOF; Done is never sent
+	select {
+	case <-c.eofC:
+	case <-time.After(10 * time.Second): // a shared console waits endWait for the exit status first
+		t.Fatal("output EOF not seen")
+	}
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- c.runLine(context.Background(), "uptime", 5*time.Second) }()
+	select {
+	case <-done:
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("runLine took %v after output closed", d)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runLine kept waiting after the output closed")
+	}
+}
+
+// eofWhileRunning is a host whose "echo one" starts something that keeps
+// running: some output, no prompt.
+func eofWhileRunning(t *testing.T, h *harness) (*fakeHost, *session) {
+	t.Helper()
+	h.setup = func(f *fakeHost) {
+		f.respond = func(f *fakeHost, cmd string) bool {
+			if cmd != "echo one" {
+				return false
+			}
+			f.emit("one\r\nrunning")
+			return true
+		}
+	}
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, c
+}
+
+// closeOutputWhenShown waits until "echo one" has been entered and the
+// console shows non-prompt output, then hangs up the output with no exit
+// status ever sent.
+func closeOutputWhenShown(t *testing.T, f *fakeHost, c *session) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(f.entered()) == 0 || c.line().cursor != "running" {
+		if time.Now().After(deadline) {
+			t.Fatal("the command never showed output")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for len(f.outq) > 0 {
+		time.Sleep(time.Millisecond)
+	}
+	f.pw.Close() // output EOF; Done is withheld
+}
+
+// When the output hangs up while a command is still running, runLine must
+// return at once and without error: it typed the line, and the hang-up is
+// reported by the session, not by the call.
+func TestEOFEndsRunLineWithoutError(t *testing.T) {
+	h := start(t, Options{}, "")
+	f, c := eofWhileRunning(t, h)
+	res := make(chan error, 1)
+	go func() {
+		res <- leased(c, func(ctx context.Context) error { return c.runLine(ctx, "echo one", 30*time.Second) })
+	}()
+	closeOutputWhenShown(t, f, c)
+	select {
+	case err := <-res:
+		if err != nil {
+			t.Errorf("runLine = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second): // a shared console gives the exit status endWait (2s) first
+		t.Fatal("runLine kept waiting after the output closed")
+	}
+}
+
+// When the output hangs up in the middle of a batch, the shell prompt still
+// showing is stale: the rest of the batch must not be typed, and later calls
+// must be refused. The input is stopped before anyone waiting on the hang-up
+// is woken.
+func TestEOFStopsBatchAndRefusesSends(t *testing.T) {
+	h := start(t, Options{}, "")
+	f, c := eofWhileRunning(t, h)
+	type result struct {
+		out   string
+		isErr bool
+	}
+	res := make(chan result, 1)
+	go func() {
+		out, isErr := h.call("send_command", map[string]any{"session": "s1", "line": "echo one\necho two\necho three", "wait_seconds": 10}) // outlasts the hub's 2s status wait
+		res <- result{out, isErr}
+	}()
+	closeOutputWhenShown(t, f, c)
+	select {
+	case r := <-res:
+		// the shared console's hub words the cut-off its own way
+		if !strings.Contains(r.out, "Session ended") && !strings.Contains(r.out, "connection to the console dropped") || !strings.Contains(r.out, "weren't sent") && !strings.Contains(r.out, "nothing more was sent") {
+			t.Errorf("batch cut short by EOF did not say so: %q %v", r.out, r.isErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the batch kept waiting after the output closed")
+	}
+	select {
+	case <-c.eofC:
+	default:
+		t.Fatal("output EOF not seen")
+	}
+	if err := c.canSend(); err == nil {
+		t.Error("canSend is nil after output EOF, before the exit status")
+	}
+	if out, isErr := h.send("s1", "echo four"); !isErr {
+		t.Errorf("send after EOF was accepted: %q", out)
+	}
+	if out, isErr := h.keys("s1", "echo five", "enter"); !isErr {
+		t.Errorf("send_keys after EOF was accepted: %q", out)
+	}
+	if got := f.entered(); len(got) != 1 || got[0] != "echo one" {
+		t.Errorf("host ran %q, want only the first line", got)
+	}
+}
+
+// Output EOF while a Send is stuck in the link and no exit status ever comes:
+// draining must not wait on the typer. The end is recorded within the status
+// grace period, and the transport is closed so the stuck write ends.
+func TestEOFWithBlockedSendDoesNotWaitOnTyper(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.setStuck()
+	res := make(chan error, 1)
+	go func() {
+		res <- leased(c, func(ctx context.Context) error { return c.runLine(ctx, "uptime", 30*time.Second) })
+	}()
+	select {
+	case <-f.blocked: // the typer is inside Send
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send never blocked")
+	}
+	f.pw.Close() // output EOF; Done is withheld
+	select {
+	case <-c.eofC:
+	case <-time.After(5 * time.Second): // after the hub's 2s status wait
+		t.Fatal("output EOF not seen: the drain waited on the blocked writer")
+	}
+	select {
+	case <-res:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the send kept waiting after the output closed")
+	}
+	deadline := time.Now().Add(6 * time.Second) // the 2s status wait, then the end is recorded
+	for {
+		c.mu.Lock()
+		marked := c.marked
+		c.mu.Unlock()
+		if marked && f.isClosed() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("end recorded %v, transport closed %v; want both", marked, f.isClosed())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// leased runs fn holding the keyboard, as a tool call does: the hub refuses
+// typing from a client that has no lease.
+func leased(c *session, fn func(context.Context) error) error {
+	ctx, _, release, err := c.keyboard(context.Background())
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn(ctx)
+}
+
+// What the agent types at a login, password or passphrase prompt is not written
+// to the log.
+func TestSessionLogDoesNotRecordAnswersToSecretPrompts(t *testing.T) {
+	for _, prompt := range []string{"node01 login: ", "Password: ", "Enter passphrase for /home/u/.ssh/id_ed25519: ", "Verify password: "} {
+		dir := t.TempDir()
+		h := start(t, Options{Log: true, LogDir: dir}, "")
+		h.initial = &prompt
+		id := h.connect()
+		h.send(id, "hunter2")
+		h.call("disconnect", map[string]any{"session": id})
+		files, _ := filepath.Glob(filepath.Join(dir, "node01-*.log"))
+		if len(files) != 1 {
+			t.Fatalf("%q: log files %v", prompt, files)
+		}
+		b, _ := os.ReadFile(files[0])
+		if strings.Contains(string(b), "agent typed: hunter2") || !strings.Contains(string(b), "agent answered a login prompt") {
+			t.Errorf("%q: the log:\n%s", prompt, b)
+		}
 	}
 }

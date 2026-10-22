@@ -41,9 +41,9 @@ type hangupper interface {
 	Hangup() error
 }
 
-// disconnectWait bounds how long a disconnect waits for the link's own
-// Disconnect before hanging up. It is a var so tests can shorten it.
-var disconnectWait = 5 * time.Second
+// linkWait bounds how long a disconnect or a switch to the BMC prompt waits for
+// the link before hanging up. It is a var so tests can shorten it.
+var linkWait = 5 * time.Second
 
 // toggler is a link that can switch between the host console and the BMC's own
 // CLI prompt (c key). It returns the bar label and whether it is at the prompt.
@@ -80,6 +80,12 @@ type Setup struct {
 	NoToggle string
 	// Pacing overrides the typing delays on serial links.
 	Pacing Pacing
+	// Queue, if set, replaces the console's own typing queue: the console is
+	// shared and one typer at the hub paces what every window types.
+	Queue Queue
+	// Shared, if set, says the console is shared: the bar shows who is on it
+	// and the i key pauses the AI tool.
+	Shared Shared
 }
 
 // UseBar reports whether the bottom bar can run: stdin and stdout must both be
@@ -184,6 +190,20 @@ func Run(cs Setup) (int, error) {
 	auto := cs.Link.SizeIsFree()
 	con.SetAuto(auto)
 
+	if cs.Shared != nil {
+		con.SetShared(cs.Shared.Status())
+		guard(cleanup, func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case n := <-cs.Shared.Notes():
+					con.SharedNote(n, cs.Shared.Status())
+				}
+			}
+		})
+	}
+
 	outDone := make(chan struct{})
 	guard(cleanup, func() {
 		defer close(outDone)
@@ -270,7 +290,7 @@ func Run(cs Setup) (int, error) {
 	guard(cleanup, func() {
 		for {
 			var wait <-chan time.Time
-			if keys.parser.Pending() {
+			if keys.parser.Pending() || keys.filter.Pending() {
 				wait = time.After(escWait)
 			}
 			var ok bool
@@ -312,7 +332,11 @@ type consoleKeys struct {
 	autoMu sync.Mutex // guards auto
 	auto   bool
 
-	ty *typer.Typer // everything typed or pasted goes through it, in order
+	ty *typer.Typer // everything typed or pasted goes through it, in order (nil when shared)
+	q  Queue        // ty, or the hub's queue
+
+	noted  atomic.Bool // the link's input note was shown
+	filter InputFilter // holds the start of an escape sequence a read ended in; used from the input loop only
 
 	// lineDirty: the last byte written was neither Enter nor ctrl+c, so the
 	// remote line may hold unsubmitted input. See breakSafe.
@@ -335,7 +359,11 @@ func (k *consoleKeys) Input(b []byte) bool {
 // Flush resolves a held ESC after escWait with no more input.
 func (k *consoleKeys) Flush() bool {
 	fwd, acts := k.parser.Flush()
-	return k.apply(fwd, acts)
+	ok := k.apply(fwd, acts)
+	out, note := k.filter.Flush(k.cs.Link) // a cut-off key is dropped; input the link no longer maps is typed
+	k.showKeysNote(note)
+	k.q.Enqueue(out)
+	return ok
 }
 
 func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
@@ -367,6 +395,9 @@ func (k *consoleKeys) apply(fwd []byte, acts []action) bool {
 // BREAK is refused until the line is clean. Dropping the queue first would not
 // help, since the bytes already sent stay on the remote line.
 func (k *consoleKeys) breakSafe() bool {
+	if k.ty == nil { // shared: the hub's typer and line tracking decide, and refuse
+		return true
+	}
 	if k.ty.Queued() == 0 && !k.lineDirty.Load() {
 		return true
 	}
@@ -391,8 +422,12 @@ func (k *consoleKeys) do(a action) {
 	rows, cols := con.Size()
 	switch a.act {
 	case actPaste:
-		b := pasteBytes(a.text)
-		k.ty.Enqueue(b)
+		text := a.text
+		if stripsPaste(cs.Link) {
+			text = StripEsc(text)
+		}
+		b := pasteBytes(text)
+		k.q.Enqueue(b)
 		con.Mark(fmt.Sprintf("pasted %d bytes", len(b)))
 	case actPasteTooBig:
 		con.Note(fmt.Sprintf("paste not sent: over %d MiB", pasteMax>>20), true)
@@ -400,7 +435,7 @@ func (k *consoleKeys) do(a action) {
 		// Always clear: Enqueue may not have updated Pending yet. The count
 		// only decides whether there is anything to tell the user.
 		queued := con.Pending() > 0
-		k.ty.Clear()
+		k.q.Clear()
 		if queued {
 			con.Note("typing queue cleared", false)
 			con.Mark("typing queue cleared")
@@ -448,7 +483,7 @@ func (k *consoleKeys) do(a action) {
 			return
 		}
 		time.Sleep(sysrqGap)
-		k.ty.Urgent([]byte{a.arg})
+		k.q.Urgent([]byte{a.arg})
 		con.Note("SysRq "+string(a.arg)+" sent", false)
 		con.Mark("SysRq " + string(a.arg) + " sent")
 	case actBMC:
@@ -461,8 +496,31 @@ func (k *consoleKeys) do(a action) {
 			con.Note(msg, false)
 			return
 		}
-		k.ty.Clear()
-		kind, at, err := t.Toggle()
+		k.q.Clear()
+		// Toggling types at the remote, which a stuck transport never takes: run
+		// it aside, and hang up if it is not back in time, so this input loop
+		// goes on.
+		type toggled struct {
+			kind string
+			at   bool
+			err  error
+		}
+		res := make(chan toggled, 1)
+		go func() {
+			kind, at, err := t.Toggle()
+			res <- toggled{kind, at, err}
+		}()
+		var r toggled
+		select {
+		case r = <-res:
+		case <-time.After(linkWait):
+			con.Note("bmc prompt: no answer, hanging up", true)
+			if h, ok := cs.Link.(hangupper); ok {
+				_ = h.Hangup()
+			}
+			return
+		}
+		kind, at, err := r.kind, r.at, r.err
 		con.SetKind(kind, at)
 		if err != nil {
 			con.Note("bmc prompt: "+err.Error(), true)
@@ -471,7 +529,7 @@ func (k *consoleKeys) do(a action) {
 		con.Note("now at "+kind, false)
 		con.Mark("switched to " + kind)
 	case actLiteral:
-		k.ty.Urgent([]byte{escapeByte})
+		k.q.Enqueue([]byte{escapeByte})
 	case actPower:
 		if cs.Power == nil {
 			return
@@ -491,15 +549,21 @@ func (k *consoleKeys) do(a action) {
 		})
 	case actDisconnect:
 		con.Mark("disconnect")
+		// A local typer is this window's own, and goes with it. A shared
+		// console's queue is the hub's, with other windows' and the AI tool's
+		// typing in it: a window leaving must not clear it. (The window that
+		// opened the console ends it, and the hub drops the queue itself.)
 		// Decide before clearing: the clean disconnect may type at the remote
 		// (IPMI SOL's escape starts with a CR), and over a dirty line or a
 		// part-sent paste that CR would submit a truncated command.
-		dirty := k.ty.Queued() > 0 || k.lineDirty.Load()
-		k.ty.Clear() // never waits on the writer, which may be blocked in Send
-		if h, ok := cs.Link.(hangupper); ok && dirty {
-			con.Note("input is pending on the line: hanging up without typing", false)
-			_ = h.Hangup()
-			return
+		if k.ty != nil {
+			dirty := k.ty.Queued() > 0 || k.lineDirty.Load()
+			k.ty.Clear() // never waits on the writer, which may be blocked in Send
+			if h, ok := cs.Link.(hangupper); ok && dirty {
+				con.Note("input is pending on the line: hanging up without typing", false)
+				_ = h.Hangup()
+				return
+			}
 		}
 		// Disconnect may type at the remote, and a write to a stuck transport
 		// can block for good. Run it aside and, if it has not returned in
@@ -511,10 +575,18 @@ func (k *consoleKeys) do(a action) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(disconnectWait):
+		case <-time.After(linkWait):
 			if h, ok := cs.Link.(hangupper); ok {
 				_ = h.Hangup()
 			}
+		}
+	case actAI:
+		if cs.Shared == nil {
+			con.Note("this console isn't shared with an AI tool", false)
+			return
+		}
+		if err := cs.Shared.TogglePause(); err != nil {
+			con.Note(err.Error(), true)
 		}
 	case actHelp:
 		con.Print(helpText())

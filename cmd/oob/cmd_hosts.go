@@ -64,7 +64,7 @@ func statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			names := selectHosts(cfg, argOr(args, ""))
+			names := cfg.Select(argOr(args, ""))
 			if len(names) == 0 {
 				return errors.New("no hosts match")
 			}
@@ -107,9 +107,6 @@ func statusCmd() *cobra.Command {
 	return c
 }
 
-// selectHosts returns sorted names matching sel (see config.Select).
-func selectHosts(c *config.Config, sel string) []string { return c.Select(sel) }
-
 func lsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use: "ls [filter]", Short: "List hosts (passwords are never shown)", Args: cobra.MaximumNArgs(1),
@@ -123,7 +120,7 @@ func lsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			names := selectHosts(c, argOr(args, ""))
+			names := c.Select(argOr(args, ""))
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 			fmt.Fprintln(tw, "NAME\tIP\tUSER\tTAGS\tNOTES")
 			for _, n := range names {
@@ -135,6 +132,7 @@ func lsCmd() *cobra.Command {
 			}
 			if len(names) == 0 && len(args) > 0 {
 				fmt.Fprintln(cmd.ErrOrStderr(), "no hosts match", args[0])
+				return app.ExitCode(1)
 			}
 			return nil
 		},
@@ -472,8 +470,9 @@ func importCmd() *cobra.Command {
 		Use: "import <file.csv>", Short: "Bulk load hosts: name,ip,user,pass,port,cipher,notes,tags(;-separated)",
 		Long: "Bulk load hosts from a CSV file with columns name,ip,user,pass,port,cipher,notes,tags.\n" +
 			"Tags are separated by ';'. A header row is optional (a first cell of \"name\" is skipped).\n" +
-			"Blank lines are skipped. The import is all-or-nothing: if any row is bad, every problem is\n" +
-			"listed with its row number and nothing is imported. Existing hosts are skipped unless --overwrite.",
+			"Blank lines and lines starting with # are skipped. The import is all-or-nothing: if any row is bad, every problem is\n" +
+			"listed with its row number and nothing is imported. Existing hosts are skipped unless --overwrite, which\n" +
+			"changes only the fields the row sets and keeps the rest (key, type, tags when empty, ...).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f, err := os.Open(args[0])
@@ -504,7 +503,7 @@ func importCmd() *cobra.Command {
 						skipped = append(skipped, n)
 						continue
 					}
-					c.Hosts[n] = res.Hosts[n]
+					c.Hosts[n] = mergeCSVHost(c.Hosts[n], res.Hosts[n])
 					added++
 				}
 				sort.Strings(skipped)
@@ -513,15 +512,41 @@ func importCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "imported %d (skipped %d blank/header)\n", added, res.Skipped)
+			fmt.Fprintf(cmd.OutOrStdout(), "imported %d (skipped %d blank/header/comment)\n", added, res.Skipped)
 			if len(skipped) > 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "skipped %d existing: %s (use --overwrite to replace)\n", len(skipped), strings.Join(skipped, ", "))
 			}
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&overwrite, "overwrite", false, "replace existing hosts")
+	c.Flags().BoolVar(&overwrite, "overwrite", false, "update existing hosts with the fields the CSV sets (empty cells keep the stored value)")
 	return c
+}
+
+// mergeCSVHost applies a CSV row to an existing host: the address always
+// changes, the other fields only when the row sets them. Everything the CSV has
+// no column for (key, type, ilo_gen, delays) is kept.
+func mergeCSVHost(cur, row config.Host) config.Host {
+	cur.IP = row.IP
+	if row.User != "" {
+		cur.User = row.User
+	}
+	if row.Pass != "" {
+		cur.Pass = row.Pass
+	}
+	if row.Port != 0 {
+		cur.Port = row.Port
+	}
+	if row.Cipher != "" {
+		cur.Cipher = row.Cipher
+	}
+	if row.Notes != "" {
+		cur.Notes = row.Notes
+	}
+	if len(row.Tags) > 0 {
+		cur.Tags = row.Tags
+	}
+	return cur
 }
 
 // hasKey reports whether the host will have an SSH key after this add: the

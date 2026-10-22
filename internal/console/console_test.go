@@ -77,6 +77,17 @@ func TestKeyParser(t *testing.T) {
 		{"stray end marker stripped", []string{"a\x1b[201~b"}, "ab", nil, modeConsole},
 		{"paste during command mode cancels it", []string{esc + "\x1b[200~s\x1b[201~"}, "", []action{{act: actCancel}, {act: actPaste, text: "s"}}, modeConsole},
 		{"forwarding resumes", []string{esc + "s" + "ok"}, "ok", []action{{act: actSize}}, modeConsole},
+		{"focus in forwarded intact", []string{"\x1b[I"}, "\x1b[I", nil, modeConsole},
+		{"focus out forwarded intact", []string{"\x1b[O"}, "\x1b[O", nil, modeConsole},
+		{"focus report doesn't end line start", []string{"\r\x1b[O~."}, "\r\x1b[O", []action{{act: actDisconnect, at: 4}}, modeConsole},
+		{"focus report at session start keeps line start", []string{"\x1b[I~."}, "\x1b[I", []action{{act: actDisconnect, at: 3}}, modeConsole},
+		{"focus report split across reads", []string{"\r\x1b", "[O~."}, "\r\x1b[O", []action{{act: actDisconnect, at: 3}}, modeConsole},
+		{"focus report between text", []string{"ab\x1b[Ocd"}, "ab\x1b[Ocd", nil, modeConsole},
+		{"focus report mid-line leaves ~ literal", []string{"a\x1b[O~."}, "a\x1b[O~.", nil, modeConsole},
+		{"focus report after a held ~ keeps order", []string{"\r~\x1b[O."}, "\r~\x1b[O.", nil, modeConsole},
+		{"focus report in command mode swallowed", []string{esc + "\x1b[Os"}, "", []action{{act: actSize}}, modeConsole},
+		{"SS3 key forwarded intact", []string{"\x1bOP", "\x1bOA"}, "\x1bOP\x1bOA", nil, modeConsole},
+		{"SS3 split across reads forwarded in order", []string{"\x1b", "OP"}, "\x1bOP", nil, modeConsole},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -162,7 +173,7 @@ func TestCommandBarDropsHints(t *testing.T) {
 }
 
 func TestShortKey(t *testing.T) {
-	if shortKey("ctrl+]") != "^]" || shortKey("esc") != "esc" {
+	if shortKey != "^]" {
 		t.Error("shortKey")
 	}
 }
@@ -206,7 +217,10 @@ func TestClobbers(t *testing.T) {
 		"\x1bc":                 true,
 		"\x1b[2J":               true,
 		"\x1b[3J":               true,
-		"\x1b[J":                false,
+		"\x1b[J":                true,
+		"\x1b[0J":               true,
+		"\x1b[1J":               false,
+		"\x1b[H\x1b[J":          true,
 		"\x1b[!p":               true,
 		"abc\x1b[H\x1b[2;3Hxyz": false,
 	} {
@@ -767,13 +781,13 @@ func TestDisconnectDoesNotWaitOnBlockedSend(t *testing.T) {
 	}
 }
 
-// A clean-line Disconnect that itself blocks is bounded: after disconnectWait
+// A clean-line Disconnect that itself blocks is bounded: after linkWait
 // the link is hung up.
 func TestDisconnectHangsUpWhenLinkDisconnectBlocks(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	old := disconnectWait
-	disconnectWait = 50 * time.Millisecond
-	defer func() { disconnectWait = old }()
+	old := linkWait
+	linkWait = 50 * time.Millisecond
+	defer func() { linkWait = old }()
 	var out bytes.Buffer
 	con := newConsole(&out, "h", "sol", 24, 80)
 	con.Start()
@@ -796,3 +810,187 @@ type stuckDisconnect struct {
 
 func (s *stuckDisconnect) Disconnect() error { <-s.closed; return nil }
 func (s *stuckDisconnect) Hangup() error     { close(s.closed); return nil }
+
+// A switch to the BMC prompt that never returns doesn't hold the input loop: it
+// is bounded, and the link is hung up.
+func TestToggleHangsUpWhenTheLinkDoesNotAnswer(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	old := linkWait
+	linkWait = 50 * time.Millisecond
+	defer func() { linkWait = old }()
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "ilo", 24, 80)
+	con.Start()
+	defer con.Close()
+	tl := &stuckToggle{closed: make(chan struct{})}
+	k := newKeys(&Setup{Link: tl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	done := make(chan struct{})
+	go func() { k.Input([]byte(string(rune(escapeByte)) + "c")); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the input loop waited on the stuck toggle")
+	}
+	select {
+	case <-tl.closed:
+	default:
+		t.Error("the link was not hung up")
+	}
+}
+
+type stuckToggle struct {
+	hangLink
+	closed chan struct{}
+}
+
+func (s *stuckToggle) Toggle() (string, bool, error) {
+	<-s.closed
+	return "", false, errors.New("closed")
+}
+func (s *stuckToggle) Hangup() error { close(s.closed); return nil }
+
+func TestLogMarkDoesNotSplitALine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n.log")
+	l, err := openLog(path, "hdr", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Write([]byte("root@host:~# ls /e"))
+	_ = l.Mark("BREAK sent")
+	_ = l.Write([]byte("tc\r\nnext\r\npart"))
+	_ = l.Mark("at close")
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) != 6 || lines[1] != "root@host:~# ls /etc" || !strings.HasSuffix(lines[2], "BREAK sent ---") ||
+		lines[3] != "next" || lines[4] != "part" || !strings.HasSuffix(lines[5], "at close ---") {
+		t.Errorf("marker split or lost a line:\n%s", b)
+	}
+}
+
+func TestCloseResetsRemoteModes(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	c.Output([]byte("\x1b[?1049h\x1b[?25l\x1b[?1003h"))
+	out.Reset()
+	c.Close()
+	s := out.String()
+	for _, want := range []string{"\x1b[?1049l", "\x1b[?25h", "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l",
+		"\x1b[?1006l", "\x1b[?1004l", "\x1b[?1l", "\x1b>", "\x1b(B", "\x0f", "\x1b[?2004l", "\x1b[r"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("close missing %q in %q", want, s)
+		}
+	}
+	if strings.Index(s, "\x1b[?1049l") > strings.Index(s, "\x1b[r") {
+		t.Errorf("alternate screen must be left before the region is cleared: %q", s)
+	}
+}
+
+func TestPasteReenabledAfterRemoteTurnsItOff(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	out.Reset()
+	c.Output([]byte("prompt\x1b[?2004l"))
+	if !strings.Contains(out.String(), "\x1b[?2004h") {
+		t.Errorf("bracketed paste not turned back on: %q", out.String())
+	}
+	out.Reset()
+	c.Output([]byte("more"))
+	if strings.Contains(out.String(), "\x1b[?2004h") {
+		t.Errorf("paste re-sent with nothing to repair: %q", out.String())
+	}
+}
+
+func TestNoRepaintWhenNothingChanged(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	c.Output([]byte("hello\r\n"))
+	out.Reset()
+	c.tickOnce(time.Now().Add(10 * time.Second))
+	if out.Len() != 0 {
+		t.Errorf("idle tick repainted a clean bar: %q", out.String())
+	}
+	c.mu.Lock()
+	c.dirty = true
+	c.mu.Unlock()
+	c.tickOnce(time.Now().Add(10 * time.Second))
+	if !strings.Contains(out.String(), "\x1b[24;1H") {
+		t.Errorf("dirty bar not repainted: %q", out.String())
+	}
+}
+
+func TestClearScreenSplitAcrossReadsIsDetected(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	c.Output([]byte("x\x1b[2"))
+	out.Reset()
+	c.Output([]byte("Jy"))
+	if !strings.Contains(out.String(), "\x1b[1;23r") {
+		t.Errorf("split clear screen not detected, no repaint: %q", out.String())
+	}
+	var s clobberScan
+	s.Feed([]byte("\x1b"))
+	if clob, _ := s.Feed([]byte("c")); !clob {
+		t.Error("ESC split from c not detected")
+	}
+}
+
+func TestBarSelectsNormalCharset(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	if !strings.Contains(out.String(), "\x1b[24;1H\x1b(B\x0f") {
+		t.Errorf("start paint does not select the normal charset: %q", out.String())
+	}
+	out.Reset()
+	c.SetSize(30, 80)
+	s := out.String()
+	i, j := strings.Index(s, "\x1b(B\x0f"), strings.Index(s, "\x1b[?7l")
+	if i < 0 || j < i || !strings.HasSuffix(s, "\x1b8") {
+		t.Errorf("repaint order wrong: %q", s)
+	}
+}
+
+func TestEraseToEndOfScreenRepaintsBar(t *testing.T) {
+	var out bytes.Buffer
+	c := newConsole(&out, "h", "sol", 24, 80)
+	c.Start()
+	defer c.Close()
+	out.Reset()
+	c.Output([]byte("\x1b[H\x1b[J"))
+	if !strings.Contains(out.String(), "\x1b[24;1H") {
+		t.Errorf("bar not repainted after CSI H CSI J: %q", out.String())
+	}
+}
+
+func TestLogMarkersKeepOrderAfterErasedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n.log")
+	l, err := openLog(path, "hdr", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Write([]byte("prompt"))
+	_ = l.Mark("first")
+	_ = l.Write([]byte("\r\x1b[2K"))
+	_ = l.Mark("second")
+	_ = l.Write([]byte("done\r\n"))
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	i, j := strings.Index(string(b), "first ---"), strings.Index(string(b), "second ---")
+	if i < 0 || j < 0 || i > j {
+		t.Errorf("markers out of order (first=%d second=%d):\n%s", i, j, b)
+	}
+}

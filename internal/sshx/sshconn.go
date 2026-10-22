@@ -233,23 +233,6 @@ func KnownHostsPath() (string, error) {
 	return filepath.Join(filepath.Dir(p), "known_hosts"), nil
 }
 
-// sshConnect dials the BMC with ssh-agent or key auth, then password and
-// keyboard-interactive auth (see sshAuthMethods).
-func Connect(h config.Host, khPath string) (*ssh.Client, error) {
-	return ConnectOpts(h, khPath, nil)
-}
-
-// sshConnectOpts is sshConnect with a callback for the server's pre-auth banner.
-func ConnectOpts(h config.Host, khPath string, banner func(string)) (*ssh.Client, error) {
-	return ConnectTimeout(h, khPath, banner, connectTimeout)
-}
-
-// ConnectTimeout is ConnectOpts with its own limit for the TCP connect and the
-// SSH handshake.
-func ConnectTimeout(h config.Host, khPath string, banner func(string), timeout time.Duration) (*ssh.Client, error) {
-	return ConnectWith(h, khPath, Options{Banner: banner, Timeout: timeout})
-}
-
 // Options tunes ConnectWith.
 type Options struct {
 	Banner  func(string)  // receives the pre-auth banner after a successful login
@@ -259,7 +242,8 @@ type Options struct {
 	NoPrompt bool
 }
 
-// ConnectWith dials the BMC as Connect does, with the given options.
+// ConnectWith dials the BMC with ssh-agent or key auth, then password and
+// keyboard-interactive auth (see sshAuthMethods).
 func ConnectWith(h config.Host, khPath string, o Options) (*ssh.Client, error) {
 	if o.Timeout <= 0 {
 		o.Timeout = connectTimeout

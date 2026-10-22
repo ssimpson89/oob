@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // destructiveActions is the one list of commands that change or erase state
@@ -69,6 +71,33 @@ func confirmDestructive(cmd, name string, h config.Host, rest []string) error {
 	return nil
 }
 
+// takeConsole is for --raw, --force and --deactivate, which act on the BMC's
+// session directly and would take the console from whoever has it. It takes the
+// same ownership lock a sharing oob holds, so the check and the operation can't
+// be split by another oob opening the console in between: release it when the
+// operation is over. If another oob has the console, it says so.
+func takeConsole(name string, h config.Host) (release func(), err error) {
+	addr, _ := share.Endpoint(h)
+	release, err = share.Exclusive(name, addr)
+	if errors.Is(err, share.ErrShared) {
+		return nil, fmt.Errorf("%s's console is open in another oob and shared; --raw, --force and --deactivate would take it from them. Run `%s sol %s` to join it", name, app.Name, name)
+	}
+	return release, err
+}
+
+// joinSharedConsole joins the console another oob has open for name, as a
+// window. joined is false when nobody has it, and the caller opens it itself.
+func joinSharedConsole(name string, h config.Host, o bmc.SOLOptions, drv bmc.Driver) (joined bool, err error) {
+	if !console.UseBar() {
+		return false, nil
+	}
+	code, err := share.RunConsole(h, name, share.Console{Power: drv.ConsolePower()})
+	if errors.Is(err, share.ErrNoHub) {
+		return false, nil
+	}
+	return true, app.Code(code, err)
+}
+
 // bmcCmds returns the commands that act on a single BMC (over IPMI, SSH or
 // Redfish, depending on its driver).
 func bmcCmds() []*cobra.Command {
@@ -96,7 +125,9 @@ func bmcCmds() []*cobra.Command {
 			"overruns. Set 0 for no delay; the host's char_delay_ms and line_delay_ms set them per host.\n" +
 			"Like ssh, ~. at the start of a line also disconnects and ~~ sends a single ~.\n" +
 			"Inside an outer ssh session the outer ssh eats the first tilde, so type ~~. to reach oob.\n" +
-			"With --raw, or when stdout is not a terminal, ipmitool runs directly and its own ~. applies.",
+			"With --raw, or when stdout is not a terminal, ipmitool runs directly and its own ~. applies.\n\n" +
+			"The console is shared: if another oob (a second window, or `oob mcp` for an AI agent) already has\n" +
+			"it open, this joins it instead of opening a second connection. ~. then leaves only this window.",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: hostCompletion,
 		RunE: withHost(func(name string, h config.Host, _ []string) error {
@@ -106,7 +137,19 @@ func bmcCmds() []*cobra.Command {
 			if sol.Flags().Changed("line-delay") {
 				h.LineDelayMS = ptrMS(lineDelay)
 			}
-			return bmc.DriverForProbed(name, h).Console(o)
+			drv := bmc.DriverForProbed(name, h)
+			if o.Raw || o.Deact || o.Force {
+				release, err := takeConsole(name, h)
+				if err != nil {
+					return err
+				}
+				defer release() // held through the operation
+				return drv.Console(o)
+			}
+			if joined, err := joinSharedConsole(name, h, o, drv); joined {
+				return err
+			}
+			return drv.Console(o)
 		}),
 	}
 	sol.Flags().DurationVar(&charDelay, "char-delay", console.DefaultCharDelay, "gap after each typed byte on a serial console (0 for none)")
@@ -249,7 +292,7 @@ func bmcCmds() []*cobra.Command {
 			if runtime.GOOS == "darwin" {
 				opener = "open"
 			}
-			url := "https://" + h.IP + "/"
+			url := webURL(h.IP)
 			bin, err := exec.LookPath(opener)
 			if err != nil {
 				fmt.Println(url)
@@ -260,6 +303,15 @@ func bmcCmds() []*cobra.Command {
 		}),
 	})
 	return cmds
+}
+
+// webURL is the BMC's https URL, with an IPv6 literal in brackets.
+func webURL(ip string) string {
+	// Only a real IPv6 literal needs brackets; host:port and names do not.
+	if a := net.ParseIP(ip); a != nil && a.To4() == nil && strings.Contains(ip, ":") {
+		ip = "[" + ip + "]"
+	}
+	return "https://" + ip + "/"
 }
 
 // riskyIpmiArgs reports whether passthrough ipmitool arguments contain a

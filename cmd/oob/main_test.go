@@ -16,16 +16,6 @@ func swap[T any](t *testing.T, p *T, v T) {
 	t.Cleanup(func() { *p = old })
 }
 
-// clearNotices empties the queued notes when the test ends.
-func clearNotices(t *testing.T) {
-	t.Helper()
-	t.Cleanup(func() {
-		notices.Lock()
-		notices.msgs = nil
-		notices.Unlock()
-	})
-}
-
 func TestArgOr(t *testing.T) {
 	if got := argOr(nil, "x"); got != "x" {
 		t.Errorf("got %q", got)

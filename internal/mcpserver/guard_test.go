@@ -19,7 +19,7 @@ func TestGuardCatchesRebootLikeCommands(t *testing.T) {
 			answer string
 			runs   bool
 			says   string
-		}{{"", false, "can't ask"}, {"decline", false, "the user refused"}, {"accept", true, ""}} {
+		}{{"", false, "can't ask"}, {"decline", false, "the user declined"}, {"accept", true, ""}} {
 			h := start(t, Options{}, mode.answer)
 			h.connect()
 			out, _ := h.send("s1", line)
@@ -74,8 +74,8 @@ func TestNoWayAroundTheChecks(t *testing.T) {
 		{"typed text ending like a prompt", func(h *harness) { h.keys("s1", "reboot #") }, "send_command", map[string]any{"line": "uname -r"}},
 		{"enter after text typed earlier", func(h *harness) { h.keys("s1", "sudo reboot") }, "send_keys", map[string]any{"keys": []string{"enter"}}},
 		{"text key by key", nil, "send_keys", map[string]any{"text": "reboo", "keys": []string{"t", "enter"}}},
-		{"answering a question nobody approved", func(h *harness) { h.send("s1", "dnf install foo") }, "send_keys", map[string]any{"text": "y", "keys": []string{"enter"}}},
-		{"answering with send_command", func(h *harness) { h.send("s1", "dnf install foo") }, "send_command", map[string]any{"line": "y"}},
+		{"answering a question nobody approved", func(h *harness) { h.unaskedQuestion() }, "send_keys", map[string]any{"text": "y", "keys": []string{"enter"}}},
+		{"answering with send_command", func(h *harness) { h.unaskedQuestion() }, "send_command", map[string]any{"line": "y"}},
 		{"recalled line", func(h *harness) { h.keys("s1", "", "up") }, "send_keys", map[string]any{"keys": []string{"enter"}}},
 		{"firmware key", nil, "send_keys", map[string]any{"keys": []string{"f10"}}},
 		{"bootloader prompt", func(h *harness) { h.send("s1", "grub") }, "send_command", map[string]any{"line": "boot"}},
@@ -109,16 +109,31 @@ func TestNoWayAroundTheChecks(t *testing.T) {
 }
 
 func TestAnsweringAQuestion(t *testing.T) {
-	// A question raised by a command nobody approved: answering yes needs the user.
+	// A question no command of ours raised (the user's own, say): answering yes needs the user.
 	h := start(t, Options{}, "accept")
 	h.connect()
-	h.send("s1", "dnf install foo")
+	h.unaskedQuestion()
 	h.keys("s1", "y", "enter")
 	if !strings.Contains(h.askedAll(), "answers the host's question") {
 		t.Errorf("the answer wasn't questioned: %q", h.askedAll())
 	}
-	if got := strings.Join(h.host("node01").entered(), "|"); got != "dnf install foo|y" {
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "y" {
 		t.Errorf("host got %q", got)
+	}
+
+	// A question raised by a command that needed no approval: answering it needs none either.
+	h = start(t, Options{}, "")
+	h.connect()
+	h.send("s1", "dnf install foo")
+	if out, isErr := h.keys("s1", "y", "enter"); isErr || len(h.asked) != 0 {
+		t.Errorf("answering a harmless command's question asked or failed: %q %v %v", out, isErr, h.asked)
+	}
+	// ... and the same through send_command.
+	h = start(t, Options{}, "")
+	h.connect()
+	h.send("s1", "dnf install foo")
+	if out, isErr := h.send("s1", "y"); isErr || len(h.asked) != 0 {
+		t.Errorf("answering with send_command asked or failed: %q %v %v", out, isErr, h.asked)
 	}
 
 	// A question raised by a command the user approved: answering it needs nothing more.
@@ -147,7 +162,7 @@ func TestAnsweringAQuestion(t *testing.T) {
 	}{{"n", []string{"enter"}}, {"no", []string{"enter"}}, {"", []string{"ctrl+c"}}} {
 		h := start(t, Options{}, "")
 		h.connect()
-		h.send("s1", "dnf install foo")
+		h.unaskedQuestion()
 		if out, isErr := h.keys("s1", c.text, c.keys...); isErr {
 			t.Errorf("%q %v was refused: %q", c.text, c.keys, out)
 		}
@@ -195,7 +210,7 @@ func TestSendBreak(t *testing.T) {
 		answer string
 		sends  bool
 		says   string
-	}{{"", false, "can't ask"}, {"decline", false, "refused"}, {"accept", true, "BREAK"}} {
+	}{{"", false, "can't ask"}, {"decline", false, "the user declined"}, {"accept", true, "BREAK"}} {
 		h := start(t, Options{}, c.answer)
 		h.connect()
 		out, isErr := h.call("send_break", map[string]any{"session": "s1"})
@@ -377,5 +392,85 @@ func TestStuckBMCPromptEndsAndForgetsTheSession(t *testing.T) {
 	out, isErr = h.call("read_output", map[string]any{"session": "s1"})
 	if !isErr || !strings.Contains(out, "closed") {
 		t.Errorf("the session wasn't forgotten: %q %v", out, isErr)
+	}
+}
+
+// Where the console is comes from the shared console's state. A window that
+// switched back to the host console without printing anything leaves the
+// session's cached answer stale, and bmc_prompt must not go by it.
+func TestBMCPromptGoesByTheSharedConsolesState(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.setup = func(f *fakeHost) { f.toggle = true }
+	h.connect()
+	h.srv.mu.Lock()
+	c := h.srv.sessions["s1"]
+	h.srv.mu.Unlock()
+	c.mu.Lock()
+	c.atBMC = true // what the output last showed; the console has since moved back
+	c.mu.Unlock()
+	if out, isErr := h.call("bmc_prompt", map[string]any{"session": "s1", "to": "console"}); isErr || !strings.Contains(out, "already at the console") {
+		t.Errorf("to console: %q %v", out, isErr)
+	}
+	if out, isErr := h.call("bmc_prompt", map[string]any{"session": "s1", "to": "bmc"}); isErr || !strings.Contains(out, "Now at ilo cli") {
+		t.Errorf("to bmc: %q %v", out, isErr)
+	}
+}
+
+// unaskedQuestion has the host print a yes/no question that no command sent
+// through the session raised.
+func (h *harness) unaskedQuestion() {
+	f := h.host("node01")
+	f.mu.Lock()
+	f.asking = "y"
+	f.mu.Unlock()
+	f.emit("Is this ok [y/N]: ")
+	eventually(h.t, "the question is shown", func() bool {
+		c, _ := h.srv.session("s1")
+		return c.line().confirming()
+	})
+}
+
+// In a batch, each harmless line refreshes the answer exemption: the question
+// raised by the second line is answerable without approval even though the
+// first line produced a new prompt in between.
+func TestBatchLineQuestionNeedsNoApproval(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	if out, isErr := h.send("s1", "uname -r\ndnf install foo"); isErr {
+		t.Fatalf("batch: %q", out)
+	}
+	if out, isErr := h.keys("s1", "y", "enter"); isErr || len(h.asked) != 0 {
+		t.Errorf("answering the batch's question asked or failed: %q %v %v", out, isErr, h.asked)
+	}
+}
+
+// A call that never got the keyboard sent nothing, so it must not leave an
+// answer exemption behind.
+func TestFailedKeyboardLeavesNoAnswerExemption(t *testing.T) {
+	for _, tool := range []string{"send_command", "send_keys"} {
+		t.Run(tool, func(t *testing.T) {
+			h := start(t, Options{}, "")
+			h.connect()
+			old := beforeKeyboard
+			t.Cleanup(func() { beforeKeyboard = old })
+			beforeKeyboard = func(c *session) { beforeKeyboard = old; c.sh.Close() }
+			var out string
+			var isErr bool
+			if tool == "send_command" {
+				out, isErr = h.send("s1", "uname -r")
+			} else {
+				out, isErr = h.keys("s1", "uname -r", "enter")
+			}
+			if !isErr {
+				t.Fatalf("expected the keyboard to fail: %q", out)
+			}
+			c, _ := h.srv.session("s1")
+			c.mu.Lock()
+			at, prompts := c.answersAt, c.prompts
+			c.mu.Unlock()
+			if at == prompts {
+				t.Errorf("answersAt = %d: an exemption was recorded for a command that was never sent", at)
+			}
+		})
 	}
 }

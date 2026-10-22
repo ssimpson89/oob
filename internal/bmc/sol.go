@@ -14,7 +14,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
-	"golang.org/x/term"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // solEscape is the SOL escape character handed to ipmitool with -e. ipmitool
@@ -192,36 +192,21 @@ func solExitCode(ee *exec.ExitError, hungUp bool) int {
 }
 
 // solConsole runs SOL under a PTY with the bottom bar and returns ipmitool's
-// exit code.
-func solConsole(h config.Host, name string, power func() (string, error)) (int, error) {
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return 1, err
+// exit code. The console is shared: if another oob (an MCP server, or another
+// window) already has it, this joins it; otherwise this opens it and others
+// can join.
+//
+// open starts the SOL session when this oob is the one that hosts it (nil: a
+// plain openSOL). It runs under the console's ownership lock, so anything that
+// must clear the BMC's session first belongs in it.
+func solConsole(h config.Host, name string, power func() (string, error), open func(rows, cols int) (*ConsoleTransport, error)) (int, error) {
+	if open == nil {
+		open = func(rows, cols int) (*ConsoleTransport, error) { return openSOL(h, rows, cols) }
 	}
-	tr, err := openSOL(h, console.RemoteRows(rows), w)
-	if err != nil {
-		return 1, err
-	}
-	defer tr.Close()
-	// A hangup kills the client without the escape; end the BMC's session.
-	defer func() {
-		if sl, ok := tr.Link.(*solLink); ok && sl.hungUp.Load() && tr.Release != nil {
-			tr.Release()
-		}
-	}()
-	code, err := console.Run(console.Setup{
-		Host: name, Kind: "sol",
-		Link:       tr.Link,
-		Out:        tr.Out,
-		Done:       tr.Done,
-		Power:      power,
-		Pacing:     tr.Pacing,
-		Connecting: "connecting to " + name + " via IPMI...",
+	// Repeat any ipmitool error below the bar's old row so it is still on screen
+	// after the console is torn down.
+	return share.RunConsole(h, name, share.Console{
+		Open: open, Power: power, Connecting: "connecting to " + name + " via IPMI...",
+		Failed: func(c *share.Client) { reportIpmiFailure(c.Tail(), h) },
 	})
-	// The terminal is restored now. Repeat any ipmitool error below the bar's
-	// old row so it is still on screen after the console is torn down.
-	if code != 0 {
-		reportIpmiFailure(tr.Tail(), h)
-	}
-	return code, err
 }

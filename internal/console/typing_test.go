@@ -404,16 +404,28 @@ func TestCtrlCJumpsTheQueue(t *testing.T) {
 	}
 }
 
-func TestChordWritesDropTheQueueFirst(t *testing.T) {
+// ctrl+] ] sends the literal byte behind what is already queued; it must not
+// throw away a paste in progress.
+func TestLiteralChordKeepsTheQueue(t *testing.T) {
 	g := newGated()
 	r := newRig(t, g, Pacing{}, g.wait)
+	want := strings.Repeat("y", 100) + "\x1d"
 	r.paste(strings.Repeat("y", 100))
-	g.held(t)
+	first := g.held(t)
 	r.k.Input([]byte(string(rune(escapeByte)) + "]"))
-	<-g.wrote
-	<-g.wrote
-	if got := g.text(); got != "y\x1d" {
-		t.Errorf("sent %q, want the literal ctrl+] out at once after the queue was dropped", got)
+	first <- time.Now()
+	deadline := time.After(10 * time.Second)
+	for len(g.text()) < len(want) {
+		select {
+		case ch := <-g.waits:
+			ch <- time.Now()
+		case <-g.wrote:
+		case <-deadline:
+			t.Fatalf("sent %d bytes, want %d", len(g.text()), len(want))
+		}
+	}
+	if got := g.text(); got != want {
+		t.Errorf("sent %q, want the paste intact and the literal ctrl+] after it", got)
 	}
 }
 
@@ -593,6 +605,12 @@ func TestNewTyperDefaultsAndOverrides(t *testing.T) {
 	if NewTyper(&fakeLink{}, Pacing{}).Paced() {
 		t.Error("a link with no Serial is never paced")
 	}
+	if ty.EscDelay != DefaultEscDelay {
+		t.Errorf("EscDelay = %v with one delay still on, want the default", ty.EscDelay)
+	}
+	if ty := NewTyper(newSerialDev(), PacingMS(intp(0), intp(0))); ty.EscDelay != 0 {
+		t.Errorf("EscDelay = %v with both delays 0, want a plain writer", ty.EscDelay)
+	}
 	if p := PacingMS(nil, nil); p.Char != nil || p.Line != nil {
 		t.Error("unset stays unset")
 	}
@@ -707,6 +725,86 @@ func TestCtrlXClearsEvenIfPendingIsStale(t *testing.T) {
 	<-g.wrote
 	if got := g.text(); got != "xz" {
 		t.Errorf("sent %q, want the queue cleared even though pending read 0", got)
+	}
+}
+
+func TestZeroDelaysMakeEscapePasteAPlainWrite(t *testing.T) {
+	zero := time.Duration(0)
+	d := newSerialDev()
+	r := newRig(t, d, Pacing{Char: &zero, Line: &zero}, func(time.Duration) <-chan time.Time {
+		t.Error("typer waited with both delays set to 0")
+		ch := make(chan time.Time, 1)
+		ch <- time.Time{}
+		return ch
+	})
+	r.k.Input([]byte("\x1b:q"))
+	d.waitSent(t, 3)
+}
+
+// recQueue is a shared console's queue as a window sees it: it records what
+// the window asked of it.
+type recQueue struct {
+	mu         sync.Mutex
+	enq        [][]byte
+	urgent     [][]byte
+	clears     int
+	onProgress func(pending, total int)
+}
+
+func (q *recQueue) Enqueue(b []byte) <-chan struct{} {
+	q.mu.Lock()
+	q.enq = append(q.enq, append([]byte(nil), b...))
+	q.mu.Unlock()
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+func (q *recQueue) Urgent(b []byte) { q.mu.Lock(); q.urgent = append(q.urgent, b); q.mu.Unlock() }
+func (q *recQueue) Clear()          { q.mu.Lock(); q.clears++; q.mu.Unlock() }
+func (q *recQueue) OnProgress(f func(pending, total int)) {
+	q.mu.Lock()
+	q.onProgress = f
+	q.mu.Unlock()
+}
+func (q *recQueue) cleared() int { q.mu.Lock(); defer q.mu.Unlock(); return q.clears }
+
+func TestLeavingASharedWindowDoesNotClearTheHubsQueue(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&outLocked{w: &out}, "node01", "sol", 24, 80)
+	con.Start()
+	t.Cleanup(func() { con.Close() })
+	q := &recQueue{}
+	fl := &fakeLink{}
+	k := newKeys(&Setup{Link: fl, Queue: q}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	esc := string(rune(escapeByte))
+	k.Input([]byte(esc + ".")) // disconnect: a joined window just leaves
+	if fl.disconnects != 1 {
+		t.Fatalf("disconnects = %d", fl.disconnects)
+	}
+	if n := q.cleared(); n != 0 {
+		t.Errorf("leaving cleared the hub's queue %d times; it holds other windows' and the AI tool's typing", n)
+	}
+	// The explicit clear key still does: that is the user asking for it.
+	k.Input([]byte(esc + "x"))
+	if n := q.cleared(); n != 1 {
+		t.Errorf("ctrl+] x cleared %d times, want 1", n)
+	}
+}
+
+func TestLeavingALocalConsoleStillDropsItsOwnQueue(t *testing.T) {
+	g := newGated()
+	r := newRig(t, g, Pacing{}, g.wait)
+	r.paste(strings.Repeat("x", 100))
+	g.held(t)
+	r.k.Input([]byte(string(rune(escapeByte)) + "."))
+	// The typer reports a clear shortly after it returns, not before.
+	for end := time.Now().Add(2 * time.Second); r.con.Pending() != 0 && time.Now().Before(end); {
+		time.Sleep(time.Millisecond)
+	}
+	if r.con.Pending() != 0 || g.disconnects != 1 {
+		t.Errorf("pending %d, disconnects %d; want the local typer cleared and the console disconnected", r.con.Pending(), g.disconnects)
 	}
 }
 

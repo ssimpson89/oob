@@ -63,9 +63,10 @@ func DriverFor(name string, h config.Host) Driver {
 }
 
 // untestedOut and untestedDone: one line per run, the first time a driver for
-// an untested vendor changes state.
+// an untested vendor changes state. untestedOut nil means stderr, or the
+// output of the running Capture, so MCP callers see the note too.
 var (
-	untestedOut  io.Writer = os.Stderr
+	untestedOut  io.Writer
 	untestedMu   sync.Mutex
 	untestedDone bool
 )
@@ -84,7 +85,11 @@ const untestedMsg = "%s support is untested; please report results"
 
 func untestedNote(vendor string) {
 	if untestedFirst() {
-		app.Notef(untestedOut, untestedMsg, vendor)
+		w := untestedOut
+		if w == nil {
+			w = stderrW()
+		}
+		app.Notef(w, untestedMsg, vendor)
 	}
 }
 
@@ -94,13 +99,6 @@ func untestedNoteLater(vendor string) {
 	if untestedFirst() {
 		app.AddNotice(fmt.Sprintf(untestedMsg, vendor))
 	}
-}
-
-// resetUntestedNote lets tests see the note again.
-func resetUntestedNote() {
-	untestedMu.Lock()
-	untestedDone = false
-	untestedMu.Unlock()
 }
 
 // UnknownPowerError is the error for a power action no driver knows.
@@ -174,7 +172,7 @@ func (d *ipmiDriver) Console(o SOLOptions) error {
 		}
 	}
 	if !o.Raw && console.UseBar() {
-		return app.Code(solConsole(d.h, d.name, d.ConsolePower()))
+		return app.Code(solConsole(d.h, d.name, d.ConsolePower(), nil))
 	}
 	fmt.Fprintln(os.Stderr, "Connecting to SOL on "+d.name+". Disconnect with ~. (tilde, dot) at the start of a line (~~. inside an outer ssh session).")
 	return app.Code(RunIPMI(d.h, "sol", "activate"))

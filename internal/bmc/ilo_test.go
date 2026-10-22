@@ -83,10 +83,11 @@ func TestILOCommandMapping(t *testing.T) {
 			t.Errorf("power %s: %q, %v", act, got, err)
 		}
 	}
+	// cycle and reset never reach iloPowerCmd (the driver runs iloCycle), so
+	// they are unknown to it.
 	for _, act := range []string{"cycle", "reset"} {
-		_, err := iloPowerCmd(act)
-		if err == nil || !strings.Contains(err.Error(), "power off") || strings.Contains(err.Error(), "only supports") {
-			t.Errorf("power %s: unhelpful error %v", act, err)
+		if _, err := iloPowerCmd(act); err == nil {
+			t.Errorf("power %s accepted", act)
 		}
 	}
 	if _, err := iloPowerCmd("soft"); err == nil || !strings.Contains(err.Error(), "graceful") || !strings.Contains(err.Error(), "IPMI over LAN") {

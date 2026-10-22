@@ -38,6 +38,11 @@ import (
 
 const redfishTimeout = 15 * time.Second
 
+// redfishDialTimeout limits the TCP connect to port 443. A BMC whose HTTPS port
+// drops packets would otherwise eat the whole status budget before the SSH
+// fallback gets a turn. A failed dial is a fallback case (see redfishFallback).
+var redfishDialTimeout = 3 * time.Second
+
 const redfishRoot = "/redfish/v1"
 
 // redfishClient talks to one BMC.
@@ -62,6 +67,9 @@ func newRedfishClient(base, user, pass string) *redfishClient {
 		// A redirect would send the Basic credentials wherever the BMC points.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: redfishDialTimeout}).DialContext(ctx, network, addr)
+			},
 			// BMCs ship self-signed certificates, so chain verification is
 			// skipped on purpose. The leaf key is pinned on first use instead
 			// (see verifyPin): the first contact is trusted, later ones must

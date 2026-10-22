@@ -12,6 +12,7 @@ import (
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/detect"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // Supermicro support (type "supermicro"). UNTESTED: written from vendor
@@ -249,6 +250,27 @@ func (d *supermicroDriver) ConsolePower() func() (string, error) {
 func (d *supermicroDriver) Console(o SOLOptions) error {
 	if o.SSH {
 		return d.sshConsole(o)
+	}
+	if !o.Raw && !o.Deact && !o.Force {
+		// Nothing has taken the ownership lock, and clearing the session
+		// without it could end a console another oob is sharing.
+		if console.UseBar() {
+			// The console may be joined instead of opened: clear the stale
+			// session only in the oob that is elected to open it, under the
+			// lock.
+			return app.Code(solConsole(d.h, d.name, d.ConsolePower(), func(rows, cols int) (*ConsoleTransport, error) {
+				return d.OpenConsole(OpenConsoleOptions{Rows: rows, Cols: cols, Force: true})
+			}))
+		}
+		addr, _ := share.Endpoint(d.h)
+		release, err := share.Exclusive(d.name, addr)
+		if errors.Is(err, share.ErrShared) {
+			return fmt.Errorf("%s's console is open in another oob and shared; clearing its SOL session would take it from them. Run `%s sol %s` in a terminal to join it", d.name, app.Name, d.name)
+		}
+		if err != nil {
+			return err
+		}
+		defer release()
 	}
 	// Always clear a stale SOL session first, so --force is already what this
 	// does and is honored by default. Errors are ignored, but this also

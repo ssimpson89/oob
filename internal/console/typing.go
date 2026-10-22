@@ -35,6 +35,9 @@ type sizeLiner interface {
 const (
 	DefaultCharDelay = 10 * time.Millisecond
 	DefaultLineDelay = 200 * time.Millisecond
+	// DefaultEscDelay keeps a lone ESC apart from the next key, so vim and
+	// readline don't read the two as one Alt-key. See typer.Typer.EscDelay.
+	DefaultEscDelay = 150 * time.Millisecond
 )
 
 // Pacing overrides the default delays for serial links. A nil field keeps the
@@ -58,12 +61,17 @@ func PacingMS(char, line *int) Pacing {
 // NewTyper makes the input queue for a link: paced on a serial link, a plain
 // writer otherwise. Run it with the link's Send as the writer.
 func NewTyper(l Link, p Pacing) *typer.Typer {
-	t := &typer.Typer{CharDelay: DefaultCharDelay, LineDelay: DefaultLineDelay}
+	t := &typer.Typer{CharDelay: DefaultCharDelay, LineDelay: DefaultLineDelay, EscDelay: DefaultEscDelay}
 	if p.Char != nil {
 		t.CharDelay = *p.Char
 	}
 	if p.Line != nil {
 		t.LineDelay = *p.Line
+	}
+	// Both delays off means a plain writer. The ESC gap is part of pacing, so
+	// it goes too, or a zero-delay paste would still stall after every ESC.
+	if t.CharDelay == 0 && t.LineDelay == 0 {
+		t.EscDelay = 0
 	}
 	t.Paced = func() bool {
 		s, ok := l.(serialLink)
@@ -88,14 +96,23 @@ func pasteBytes(text string) []byte {
 // newKeys is a consoleKeys with its typing queue made but not yet running.
 func newKeys(cs *Setup, con *console, cleanup func(), stop <-chan struct{}) *consoleKeys {
 	k := &consoleKeys{cs: cs, con: con, cleanup: cleanup, stop: stop}
+	if cs.Queue != nil {
+		k.q = cs.Queue
+		cs.Queue.OnProgress(con.SetSend)
+		return k
+	}
 	k.ty = NewTyper(cs.Link, cs.Pacing)
 	k.ty.Progress = con.SetSend
+	k.q = k.ty
 	return k
 }
 
 // start runs the typing queue until the session ends. tr, if not nil, records
 // the bytes it writes.
 func (k *consoleKeys) start(tr *trace) {
+	if k.ty == nil { // shared: the hub runs the typer
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-k.stop
@@ -123,11 +140,19 @@ func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 // typeKeys queues keystrokes. ctrl+c is the exception: it jumps the queue,
 // dropping what was waiting, because nothing typed before an interrupt matters.
 func (k *consoleKeys) typeKeys(b []byte) {
+	b, note := k.filter.Map(k.cs.Link, b)
+	k.showKeysNote(note)
 	if i := bytes.LastIndexByte(b, 0x03); i >= 0 {
-		k.ty.Urgent([]byte{0x03})
+		k.q.Urgent([]byte{0x03})
 		b = b[i+1:]
 	}
-	k.ty.Enqueue(b)
+	k.q.Enqueue(b)
+}
+
+func (k *consoleKeys) showKeysNote(note string) {
+	if note != "" && k.noted.CompareAndSwap(false, true) { // once per session
+		k.con.Note(note, false)
+	}
 }
 
 // fitSize makes the remote agree with rows x cols: where that means typing
@@ -135,7 +160,7 @@ func (k *consoleKeys) typeKeys(b []byte) {
 func (k *consoleKeys) fitSize(rows, cols int) error {
 	if sl, ok := k.cs.Link.(sizeLiner); ok {
 		if line, ok := sl.SizeLine(rows, cols); ok {
-			k.ty.Enqueue([]byte(line + "\r"))
+			k.q.Enqueue([]byte(line + "\r"))
 			return nil
 		}
 	}

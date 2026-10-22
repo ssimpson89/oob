@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -81,4 +82,47 @@ func containsName(s string) bool {
 		}
 	}
 	return false
+}
+
+func TestUnknownKeysSurviveRoundTrip(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "hosts.json")
+	in := `{"future":{"a":1},"defaults":{"user":"u","dflt_new":true},"hosts":{"n1":{"ip":"192.0.2.1","host_new":"x"}}}`
+	if err := os.WriteFile(p, []byte(in), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := updateConfigAt(p, func(c *Config) error {
+		h := c.Hosts["n1"]
+		h.Notes = "hi"
+		c.Hosts["n1"] = h
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("saved config is not valid JSON: %v\n%s", err, b)
+	}
+	if f, _ := got["future"].(map[string]any); f == nil || f["a"] != float64(1) {
+		t.Errorf("future key lost: %v", got["future"])
+	}
+	if d, _ := got["defaults"].(map[string]any); d == nil || d["dflt_new"] != true || d["user"] != "u" {
+		t.Errorf("defaults not preserved: %v", got["defaults"])
+	}
+	hosts, _ := got["hosts"].(map[string]any)
+	n1, _ := hosts["n1"].(map[string]any)
+	if n1 == nil || n1["host_new"] != "x" || n1["notes"] != "hi" || n1["ip"] != "192.0.2.1" {
+		t.Errorf("host n1 not preserved/updated: %v", hosts["n1"])
+	}
+}
+
+func TestDefaultsTypeApplies(t *testing.T) {
+	c := &Config{Defaults: Host{Type: "ilo"}, Hosts: map[string]Host{"a": {IP: "192.0.2.1"}, "b": {IP: "192.0.2.2", Type: "idrac"}}}
+	if _, h, _ := c.Lookup("a"); h.Type != "ilo" {
+		t.Errorf("a type %q", h.Type)
+	}
+	if _, h, _ := c.Lookup("b"); h.Type != "idrac" {
+		t.Errorf("b type %q", h.Type)
+	}
 }

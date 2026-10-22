@@ -142,19 +142,14 @@ func (s *cliSession) Run(cmd string, timeout time.Duration) (iloResult, error) {
 }
 
 // iloDial connects to an iLO and waits for its first prompt.
-func iloDial(name string, h config.Host, rows, cols int) (*cliSession, *ssh.Session, io.WriteCloser, error) {
-	return cliDial(name, h, iloSpec, rows, cols)
+func iloDial(name string, h config.Host, rows, cols int, timeout time.Duration, noPrompt bool) (*cliSession, *ssh.Session, io.WriteCloser, error) {
+	return cliDial(name, h, iloSpec, rows, cols, timeout, noPrompt)
 }
 
-// iloDo opens a CLI session, runs cmd and closes it.
-func iloDo(name string, h config.Host, cmd string) (iloResult, error) {
-	app.Progressf("connecting to %s via SSH (iLO CLI)...", name)
-	return iloDoQuiet(name, h, cmd)
-}
-
-// iloDoQuiet is iloDo without the progress line (for many hosts at once).
-func iloDoQuiet(name string, h config.Host, cmd string) (iloResult, error) {
-	s, _, _, err := iloDial(name, h, 24, 200)
+// iloDo opens a CLI session, runs cmd and closes it. timeout and noPrompt are
+// for runs without a user at the keyboard (see cliDial).
+func iloDo(name string, h config.Host, cmd string, timeout time.Duration, noPrompt bool) (iloResult, error) {
+	s, _, _, err := iloDial(name, h, 24, 200, timeout, noPrompt)
 	if err != nil {
 		return iloResult{Status: -1}, err
 	}
@@ -169,11 +164,9 @@ func iloDoQuiet(name string, h config.Host, cmd string) (iloResult, error) {
 // errILOSoft explains that the iLO CLI has no graceful shutdown.
 var errILOSoft = errors.New("the iLO CLI has no graceful shutdown (soft). Use Redfish (GracefulShutdown, needs port 443), or `power off` for a hard power off, or enable IPMI over LAN on the iLO (iLO Settings > Access > IPMI/DCMI over LAN) and set the host type to \"ipmi\" (oob edit)")
 
-// errILOCycleCmd is for cycle and reset, which the driver builds from off,
-// wait, on (iloCycle) because the iLO CLI has no single command for them.
-var errILOCycleCmd = errors.New("the iLO CLI has no single cycle or reset command; the driver runs power off, waits for off, then power on")
-
-// iloPowerCmd maps a power action to the iLO CLI command.
+// iloPowerCmd maps a power action to the iLO CLI command. cycle and reset have
+// no single command; the driver builds them from off, wait, on (iloCycle) before
+// it gets here.
 func iloPowerCmd(act string) (string, error) {
 	switch act {
 	case "status":
@@ -182,8 +175,6 @@ func iloPowerCmd(act string) (string, error) {
 		return "power on", nil
 	case "off":
 		return "power off", nil
-	case "cycle", "reset":
-		return "", errILOCycleCmd
 	case "soft":
 		return "", errILOSoft
 	}
@@ -271,7 +262,7 @@ func iloCycle(name string, r iloRunner, sleep func(time.Duration)) (string, erro
 // so the VSP session stays up.
 func iloPowerCycleFn(name string, h config.Host) func() (string, error) {
 	return func() (string, error) {
-		s, _, _, err := iloDial(name, h, 24, 200)
+		s, _, _, err := iloDial(name, h, 24, 200, 0, false)
 		if err != nil {
 			return "", err
 		}
@@ -285,7 +276,7 @@ func iloPowerCycleFn(name string, h config.Host) func() (string, error) {
 var iloSpec = cliSpec{
 	kind: "vsp", promptKind: "ilo cli", prompt: iloPrompt, resync: true, start: []string{"vsp"},
 	entered: regexp.MustCompile(`(?i)Virtual Serial Port Active`),
-	esc:     []byte{0x1b, '('}, breakMsg: "VSP has no BREAK", label: "iLO CLI",
+	esc:     []byte{0x1b, '('}, breakMsg: "VSP has no BREAK", label: "iLO CLI", vspEsc: true,
 }
 
 // iloDriver prefers Redfish (power and boot) and falls back to the SSH CLI when
@@ -304,11 +295,7 @@ func newILODriver(name string, h config.Host) *iloDriver {
 // viaRedfish runs fn. When Redfish is unusable it says why on stderr (unless
 // quiet) and reports handled=false so the caller can use the SSH CLI. Any other
 // error is the answer.
-func (d *iloDriver) viaRedfish(quiet bool, fn func(ctx context.Context) error) (handled bool, err error) {
-	return d.viaRedfishCtx(context.Background(), quiet, fn)
-}
-
-func (d *iloDriver) viaRedfishCtx(ctx context.Context, quiet bool, fn func(ctx context.Context) error) (handled bool, err error) {
+func (d *iloDriver) viaRedfish(ctx context.Context, quiet bool, fn func(ctx context.Context) error) (handled bool, err error) {
 	if d.h.Pass == "" && d.h.User != "" && (d.h.Key != "" || sshx.AgentUsable()) {
 		// Redfish needs the password; the SSH CLI can log in with the key.
 		return false, nil
@@ -369,7 +356,7 @@ func (d *iloDriver) Power(act string) error {
 		return UnknownPowerError(act)
 	}
 	var rt, already string
-	handled, err := d.viaRedfish(false, func(ctx context.Context) error {
+	handled, err := d.viaRedfish(context.Background(), false, func(ctx context.Context) error {
 		var err error
 		rt, already, err = d.redfishReset(ctx, act)
 		return err
@@ -396,7 +383,8 @@ func (d *iloDriver) Power(act string) error {
 	if err != nil {
 		return err
 	}
-	res, err := iloDo(d.name, d.h, cmd)
+	app.Progressf("connecting to %s via SSH (iLO CLI)...", d.name)
+	res, err := iloDo(d.name, d.h, cmd, 0, false)
 	if err != nil {
 		if errors.Is(err, errCLINoReply) {
 			return fmt.Errorf("%w; %s", err, console.ResultUnknown(d.name))
@@ -413,7 +401,7 @@ func (d *iloDriver) PowerStatus(timeout time.Duration) StatusResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var state string
-	handled, err := d.viaRedfishCtx(ctx, true, func(ctx context.Context) error {
+	handled, err := d.viaRedfish(ctx, true, func(ctx context.Context) error {
 		var err error
 		state, err = d.rf.PowerState(ctx)
 		return err
@@ -435,8 +423,12 @@ func (d *iloDriver) PowerStatus(timeout time.Duration) StatusResult {
 		err error
 	}
 	ch := make(chan out, 1)
+	left := timeout
+	if dl, ok := ctx.Deadline(); ok {
+		left = max(time.Until(dl), time.Millisecond)
+	}
 	go func() {
-		r, err := iloDoQuiet(d.name, d.h, "power")
+		r, err := iloDo(d.name, d.h, "power", left, true)
 		ch <- out{r, err}
 	}()
 	select {
@@ -458,7 +450,7 @@ func (d *iloDriver) Boot(dev string, legacy, persistent bool) error {
 	if persistent {
 		return errors.New("--persistent is not supported on iLO (one-time boot only)")
 	}
-	handled, err := d.viaRedfish(false, func(ctx context.Context) error { return d.rf.BootOnce(ctx, target, legacy) })
+	handled, err := d.viaRedfish(context.Background(), false, func(ctx context.Context) error { return d.rf.BootOnce(ctx, target, legacy) })
 	if handled {
 		if err == nil {
 			mode := ""
@@ -525,7 +517,7 @@ func (d *iloDriver) ConsolePower() func() (string, error) {
 	cli := iloPowerCycleFn(d.name, d.h)
 	return func() (string, error) {
 		var rt string
-		handled, err := d.viaRedfish(true, func(ctx context.Context) error {
+		handled, err := d.viaRedfish(context.Background(), true, func(ctx context.Context) error {
 			var err error
 			rt, _, err = d.redfishReset(ctx, "cycle")
 			return err
@@ -542,7 +534,8 @@ func (d *iloDriver) ConsolePower() func() (string, error) {
 
 // iloPrint runs one iLO CLI command and prints the response text.
 func iloPrint(name string, h config.Host, cmd string) error {
-	res, err := iloDo(name, h, cmd)
+	app.Progressf("connecting to %s via SSH (iLO CLI)...", name)
+	res, err := iloDo(name, h, cmd, 0, false)
 	if err != nil {
 		return err
 	}

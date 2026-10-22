@@ -201,6 +201,14 @@ If ipmitool cannot open a session, oob prints a hint (IPMI over LAN may be disab
 under iLO Settings > Access > IPMI/DCMI over LAN, off by default on iLO 7). oob passes `-N 2 -R 2` so
 a dead BMC fails in about 11 seconds instead of 21.
 
+The iLO VSP reads ESC together with the byte after it: `ESC ESC` passes both, `ESC (` returns to the
+iLO CLI, and `ESC` plus anything else is dropped. So an arrow key, function key or Alt-key never
+reaches the server (measured on iLO 7). In the console, oob types the Esc key as `ESC ESC` and drops
+the other escape sequences, with a one-time note on the bar. Arrows work in plain shell with
+`ctrl+p`, `ctrl+n`, `ctrl+b` and `ctrl+f`, and in vim with `h`, `j`, `k` and `l`. An AI tool's
+`send_keys` with an arrow or function key gets an error instead. For full keys, `ssh` to the
+server itself (`oob ssh` reaches the iLO, not the server), or use IPMI SOL if IPMI over LAN is enabled.
+
 ## Dell iDRAC (untested)
 
 `"type": "idrac"`. iDRAC runs SSH exec, so oob runs `racadm` commands over SSH. Any output line
@@ -240,6 +248,7 @@ Press `ctrl+]`, then one key. Everything else you type goes to the machine.
 | `b` | Send BREAK |
 | `c` | Toggle between the host console and the BMC's own CLI prompt without disconnecting (iLO `ESC (` and `vsp`, iDRAC `ctrl+\` and `console com2`, Supermicro SSH SOL `ESC (` (unverified) and `cd /system1/sol1`, `start`). The bar label shows where you are (`vsp` or `ilo cli`, `com2` or `idrac cli`, `sol` or `smash`). On `oob ssh` to an iLO, iDRAC or Supermicro host you start at the prompt, and `c` starts the console. IPMI SOL has no BMC prompt, so `c` only shows a note. `~.` works from either state |
 | `r` then a letter | SysRq: BREAK, then the letter (for example `r` `b` reboots a Linux console) |
+| `i` | On a console shared with an AI agent: pause the agent, or let it type again (see below) |
 | `x` | Drop whatever is still queued to be typed, such as a big paste (`esc` does the same) |
 | `p` | Power cycle with confirmation (`y` to go ahead) |
 | `]` | Send `ctrl+]` itself |
@@ -295,9 +304,10 @@ Host tools, which take host names from `list_hosts`:
 | Tool | What it does |
 | --- | --- |
 | `list_hosts` | Name, BMC address, type, tags and notes. Never passwords, keys or key paths. Long lists come in pages (`limit`, `offset`, `next_offset`) |
-| `power_status`, `status` | Power state of one host, or of many at once (glob, text or `tag:x`; paged like `list_hosts`) |
-| `sel_list`, `sensors`, `bmc_info` | Event log (newest entries when it is long), sensor readings, BMC identity |
-| `power`, `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset` | Change state. Always asks you first |
+| `status` | Power state. With `filter` set to one exact host name it reads that host from its BMC; otherwise `filter` is a glob, text or `tag:x` (the same as in `list_hosts`) and many hosts are read at once, paged like `list_hosts`. Hosts not reached before the overall time ran out show `skipped` |
+| `sel_list`, `sensors`, `bmc_info` | Event log (newest entries when it is long), sensor readings, BMC identity. On iLO and iDRAC these use IPMI over LAN, and a failure says how to enable it |
+| `uid` | Turn the identify LED on or off. Doesn't ask |
+| `power`, `boot`, `nmi`, `sel_clear`, `mc_reset` | Change state. Always asks you first |
 
 Console tools, for the server's own serial console (its login prompt, GRUB, kernel messages), reached the
 same way as `oob sol`: IPMI SOL, iLO VSP over SSH, iDRAC `console com2`:
@@ -305,7 +315,7 @@ same way as `oob sol`: IPMI SOL, iLO VSP over SSH, iDRAC `console com2`:
 | Tool | What it does |
 | --- | --- |
 | `connect` | Open the console and return a session id. `force` clears a stale IPMI SOL session (asks first) |
-| `read_output`, `read_history` | What is new since the last read (it can wait for some text), and earlier output (the last 10000 lines, searchable) |
+| `read_output` | What is new since the last read (it can wait for some text). With `lines` or `search`, earlier output instead (the last 10000 lines are kept) |
 | `send_command` | Run a command and return its output. Stops at a `[y/N]` question or a pager |
 | `send_keys` | Text and keys: enter, arrows, ctrl+c, function keys, for answers and for GRUB or BIOS menus |
 | `send_break` | Serial BREAK, IPMI SOL only (iLO and iDRAC have none, and say so) |
@@ -321,19 +331,50 @@ agent typed. Logs are off by default because a console can show secrets.
 
 The agent can't answer for you. Your client shows the exact request and you accept or decline:
 
-- every state change: `power` (all actions, including `on`), `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset`
+- every state change: `power` (all actions, including `on`), `boot`, `nmi`, `sel_clear`, `mc_reset` (`uid`, the identify LED, is the one change that doesn't ask)
 - `connect` with `force`
 - console commands that reboot, power off, wipe, format or repartition, remove packages, cut the network or
   change accounts, and anything that triggers SysRq
 - anything typed at a bootloader prompt (GRUB, UEFI shell, U-Boot), or at the BMC's own command line
 - `send_break`, and the first keys typed after one (on Linux the next key is a SysRq command)
-- an answer to a yes/no question the agent's own command raised, unless the answer is no or ctrl+c
+- an answer to a yes/no question that none of the agent's commands raised, unless the answer is no or ctrl+c. A question raised by a command that needed your approval was covered by it, and one raised by a harmless command needs none
 
 If your client can't ask, oob refuses and tells the agent so. There is no switch to skip this, and
 `-y` doesn't apply. State changes take exact host names, never a prefix.
 
 The console check is a safety net, not a guarantee: it reads the command line, so scripts, aliases and
 menus in firmware or BIOS setup can get past it. Read what the agent wants to run before you allow it.
+
+### Sharing a console with an AI agent
+
+You and the agent can be on the same server console at the same time. An iLO allows only one virtual serial
+port session, so two independent connections can't work. Instead one oob process opens the console and shares
+it, and the others join it over a unix socket (`${XDG_STATE_HOME:-~/.local/state}/oob/share/<host>.sock`, folder
+0700, socket 0600). Whichever opens the console first holds it, whether that's `oob sol <host>` or the agent's
+`connect(host)`; the other joins.
+
+- `oob sol <host>` with the agent already connected joins its console. The bar shows `shared · Claude Code
+  connected` (or `working`, `paused`, or `shared · 1 other window` for a second window). With nobody else on the
+  console, `oob sol` looks and behaves as it always did.
+- `connect(host)` with your window open joins it, and tells the agent so. The agent sees only the line the cursor is
+  on when it joins, not what came before. Your new window gets the recent output from a line start.
+- There is one typing queue per console, at the process that holds it, so what you type, paste and what the agent
+  types are serialized and paced together. All the agent's usual approvals still apply.
+- While the agent runs a command it has the keyboard, and your keys are dropped (the bar tells you). `ctrl+] i`
+  pauses the agent: whatever it typed and didn't enter is erased, and its commands are refused with "the user
+  paused the AI" until you press `ctrl+] i` again. If you stop typing mid-line, the agent waits: its commands are
+  refused with "the user is typing on this console" until you press Enter and a few seconds pass.
+- At most one agent per console. A second is turned away.
+- `~.` in a window that joined only leaves that window. The console closes when the process that opened it ends.
+  If that is `oob sol`, leaving ends it for everyone on it. If it is the agent's `oob mcp`, the console stays
+  open after the agent disconnects (or goes idle) until the last window leaves. Nothing is handed over: a
+  console can't be reopened without logging in to the BMC again, so when the process that opened it exits, the
+  others are told the console closed.
+- `oob sol --raw`, `--force` and `--deactivate` refuse to run while the console is shared, since they would take
+  it from the other side.
+- A joined window doesn't resize the console; the window that opened it does.
+
+Unix only (macOS and Linux).
 
 ### What the agent never sees
 

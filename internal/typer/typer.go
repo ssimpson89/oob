@@ -23,6 +23,12 @@ type Typer struct {
 	// queue goes out at once; delays only separate bytes. Both zero makes
 	// Typer a plain writer.
 	CharDelay, LineDelay time.Duration
+	// EscDelay is the gap after a lone ESC (one not starting an arrow-key or
+	// similar sequence). Programs like vim wait briefly after ESC to see if a
+	// sequence follows; if the next key reaches them in that window, ESC and
+	// the key merge into one "Alt-key" and both are lost. Over a serial
+	// console keys typed apart can arrive bunched, so give ESC room.
+	EscDelay time.Duration
 	// Paced, if set, is asked before each byte; while it says false the
 	// delays are zero. A console that can move between a serial line and an
 	// ssh prompt uses this.
@@ -45,6 +51,7 @@ type Typer struct {
 	accepted int      // bytes ever accepted
 	total    int      // bytes in the current burst
 	urgent   [][]byte // to write next, in order, ahead of q
+	flight   int      // bytes of q inside the write in progress
 	gen      uint64   // bumped when q is dropped, so Run knows a write in flight was dropped
 	report   bool     // Progress is owed
 	stopped  bool
@@ -148,16 +155,22 @@ func (t *Typer) Urgent(b []byte) {
 
 // Clear drops everything queued and returns at once. Nothing dropped is
 // written after it returns, except a byte already inside a blocked Write.
-func (t *Typer) Clear() {
+func (t *Typer) Clear() { t.ClearCount() }
+
+// ClearCount is Clear that says how many bytes it dropped and how many of
+// them were inside a write in progress, which may still reach the writer.
+func (t *Typer) ClearCount() (dropped, inFlight int) {
 	t.init()
 	t.mu.Lock()
 	if t.stopped {
 		t.mu.Unlock()
-		return
+		return 0, 0
 	}
+	dropped, inFlight = len(t.q), t.flight
 	t.dropLocked()
 	t.mu.Unlock()
 	t.poke()
+	return dropped, inFlight
 }
 
 // Run writes queued bytes to w until ctx ends or a write fails, and returns
@@ -170,7 +183,7 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 	}
 	var hold <-chan time.Time // the gap after the last byte, while it runs
 	paced := func() bool {
-		return (t.CharDelay > 0 || t.LineDelay > 0) && (t.Paced == nil || t.Paced())
+		return (t.CharDelay > 0 || t.LineDelay > 0 || t.EscDelay > 0) && (t.Paced == nil || t.Paced())
 	}
 	// progress reports to the Progress callback; an unpaced write is over
 	// before anyone could see it. Called without mu held.
@@ -197,6 +210,9 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		}
 		if last == '\r' || last == '\n' {
 			return t.LineDelay
+		}
+		if last == 0x1b && (len(next) == 0 || (next[0] != '[' && next[0] != 'O')) {
+			return max(t.EscDelay, t.CharDelay)
 		}
 		return t.CharDelay
 	}
@@ -239,11 +255,15 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 			}
 			chunk := append([]byte(nil), t.q[:n]...)
 			gen := t.gen
+			t.flight = n
 			t.mu.Unlock()
-			if err := write(chunk); err != nil {
+			err := write(chunk)
+			t.mu.Lock()
+			t.flight = 0
+			if err != nil {
+				t.mu.Unlock()
 				return err
 			}
-			t.mu.Lock()
 			var pending, total int
 			if t.gen == gen { // else the write was dropped while it ran
 				t.q = t.q[n:]
@@ -277,3 +297,6 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		}
 	}
 }
+
+// OnProgress sets Progress, so a Typer is a console.Queue.
+func (t *Typer) OnProgress(f func(pending, total int)) { t.Progress = f }

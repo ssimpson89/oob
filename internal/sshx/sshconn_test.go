@@ -93,7 +93,7 @@ func knownLine(host string, port int, key ssh.PublicKey) string {
 func TestSSHHostKeyPinnedToStoredType(t *testing.T) {
 	rsaKey, edKey := newRSASigner(t), newEdSigner(t)
 	connect := func(t *testing.T, host string, port int, kh string) (*ssh.Client, error) {
-		return ConnectOpts(config.Host{IP: host, Port: port, User: "u", Pass: "pw", Name: "bmc1"}, kh, nil)
+		return ConnectWith(config.Host{IP: host, Port: port, User: "u", Pass: "pw", Name: "bmc1"}, kh, Options{})
 	}
 
 	t.Run("known RSA host offering only ed25519 is rejected", func(t *testing.T) {

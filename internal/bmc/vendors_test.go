@@ -17,6 +17,7 @@ import (
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/detect"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 // Only the start of the output counts: up to the first prompt or the first 4KB.
@@ -150,13 +151,13 @@ func TestILODriverViaRedfish(t *testing.T) {
 	c, _, done := fakeRedfish(t, 401, "")
 	defer done()
 	d := &iloDriver{ipmiDriver: ipmiDriver{"x", config.Host{IP: "192.0.2.1", User: "u", Pass: "p"}}, rf: c}
-	handled, err := d.viaRedfish(true, func(ctx context.Context) error { _, err := c.PowerState(ctx); return err })
+	handled, err := d.viaRedfish(context.Background(), true, func(ctx context.Context) error { _, err := c.PowerState(ctx); return err })
 	if handled || err != nil {
 		t.Errorf("401: handled=%v err=%v", handled, err)
 	}
 	c2, _, done2 := fakeRedfish(t, 500, "")
 	defer done2()
-	handled, err = d.viaRedfish(true, func(ctx context.Context) error { return c2.Reset(ctx, "On") })
+	handled, err = d.viaRedfish(context.Background(), true, func(ctx context.Context) error { return c2.Reset(ctx, "On") })
 	if !handled || err == nil {
 		t.Errorf("500: handled=%v err=%v", handled, err)
 	}
@@ -168,12 +169,12 @@ func TestILODriverViaRedfish(t *testing.T) {
 	}
 	d.h.Pass = ""
 	t.Setenv("SSH_AUTH_SOCK", "")
-	if handled, err = d.viaRedfish(true, func(context.Context) error { return nil }); !handled || err == nil {
+	if handled, err = d.viaRedfish(context.Background(), true, func(context.Context) error { return nil }); !handled || err == nil {
 		t.Errorf("missing password should be an error, not a fallback: %v %v", handled, err)
 	}
 	// with an SSH key the SSH CLI can log in, so it takes over
 	d.h.Key = "/some/key"
-	if handled, err = d.viaRedfish(true, func(context.Context) error { return nil }); handled || err != nil {
+	if handled, err = d.viaRedfish(context.Background(), true, func(context.Context) error { return nil }); handled || err != nil {
 		t.Errorf("key and no password should use the SSH CLI: %v %v", handled, err)
 	}
 }
@@ -215,13 +216,17 @@ func TestIDRACParsing(t *testing.T) {
 }
 
 type fakeRacadm struct {
-	cmds []string
-	out  map[string]string
-	err  error
+	cmds      []string
+	timeouts  []time.Duration
+	noPrompts []bool
+	out       map[string]string
+	err       error
 }
 
-func (f *fakeRacadm) run(cmd string, _ time.Duration) (string, error) {
+func (f *fakeRacadm) run(cmd string, to time.Duration, noPrompt bool) (string, error) {
 	f.cmds = append(f.cmds, cmd)
+	f.timeouts = append(f.timeouts, to)
+	f.noPrompts = append(f.noPrompts, noPrompt)
 	return f.out[cmd], f.err
 }
 
@@ -230,7 +235,7 @@ func newFakeIDRAC(f *fakeRacadm) *idracDriver {
 }
 
 func TestIDRACCommands(t *testing.T) {
-	resetUntestedNote()
+	swap(t, &untestedDone, false)
 	var buf strings.Builder
 	swap[io.Writer](t, &untestedOut, &buf)
 
@@ -238,6 +243,10 @@ func TestIDRACCommands(t *testing.T) {
 	d := newFakeIDRAC(f)
 	if r := d.PowerStatus(time.Second); r.Failed || r.Text != "Chassis Power is on" {
 		t.Errorf("%+v", r)
+	}
+	// The status read passes its budget on and never prompts; actions may.
+	if len(f.timeouts) != 1 || f.timeouts[0] != time.Second || !f.noPrompts[0] {
+		t.Errorf("status run: timeouts %v noPrompts %v", f.timeouts, f.noPrompts)
 	}
 	for _, c := range []struct {
 		do   func() error
@@ -478,3 +487,40 @@ func TestDriverFor(t *testing.T) {
 }
 
 func typeName(v any) string { return fmt.Sprintf("%T", v) }
+
+// Without a terminal Console has no elected opener to clear the stale session
+// in, so it must hold the ownership lock itself: with another oob sharing the
+// console it refuses instead of ending that session.
+func TestSupermicroConsoleWithoutTerminalDoesNotClearASharedConsole(t *testing.T) {
+	d, err := os.MkdirTemp("/tmp", "oob") // short: socket paths are limited to about 100 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	t.Setenv("XDG_STATE_HOME", d)
+	h := config.Host{IP: "192.0.2.5"}
+	addr, _ := share.Endpoint(h)
+	release, err := share.Exclusive("s", addr) // another oob has the console
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	err = newSupermicroDriver("s", h).Console(SOLOptions{})
+	if err == nil || !strings.Contains(err.Error(), "another oob") {
+		t.Errorf("Console = %v, want a refusal naming the other oob", err)
+	}
+}
+
+// The untested-vendor note and the racreset note go to the captured output, so
+// an MCP caller sees them, not only the terminal.
+func TestIDRACNotesAreCaptured(t *testing.T) {
+	swap(t, &untestedDone, false)
+	d := newFakeIDRAC(&fakeRacadm{out: map[string]string{}})
+	out, err := Capture(context.Background(), func() error { return d.MCReset("cold") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no warm or cold choice") || !strings.Contains(out, "support is untested") {
+		t.Errorf("captured output %q", out)
+	}
+}

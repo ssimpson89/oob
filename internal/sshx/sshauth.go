@@ -21,11 +21,11 @@ import (
 //   - a host with a `key` file offers only that key (the agent is not used, so
 //     a full agent cannot burn through the BMC's limited login attempts),
 //     then the password if one is set;
-//   - otherwise the ssh-agent's keys (SSH_AUTH_SOCK, unless OOB_NO_AGENT=1),
-//     then the password if one is set.
-//
-// Password and keyboard-interactive are always last, so a BMC that rejects
-// keys still gets the password.
+//   - otherwise, with a password set, the password and keyboard-interactive
+//     first and then the ssh-agent's keys (SSH_AUTH_SOCK, unless
+//     OOB_NO_AGENT=1): an agent with many keys would otherwise use up the
+//     BMC's login attempts before the password is tried;
+//   - with no password, the agent's keys.
 
 // agentDisabled reports whether OOB_NO_AGENT turns the ssh-agent off.
 func agentDisabled() bool {
@@ -98,18 +98,15 @@ var keyPassphrase = func(path string) ([]byte, error) {
 	return b, err
 }
 
-// loadKeySigner reads a private key file. It refuses a file that group or
-// other can read (as OpenSSH does) and asks once for a passphrase if needed.
-// Nothing about the key is ever printed.
-func loadKeySigner(path string) (ssh.Signer, error) { return loadKeySignerOpts(path, false) }
-
 // ErrNeedsInput says a login would have to ask the user for something (a key
 // passphrase) and the caller asked not to be prompted.
 var ErrNeedsInput = errors.New("login needs interactive input (key passphrase)")
 
-// loadKeySignerOpts is loadKeySigner; with noPrompt a passphrase-protected key
-// returns ErrNeedsInput instead of asking.
-func loadKeySignerOpts(path string, noPrompt bool) (ssh.Signer, error) {
+// loadKeySigner reads a private key file. It refuses a file that group or
+// other can read (as OpenSSH does) and asks once for a passphrase if needed;
+// with noPrompt a passphrase-protected key returns ErrNeedsInput instead.
+// Nothing about the key is ever printed.
+func loadKeySigner(path string, noPrompt bool) (ssh.Signer, error) {
 	p, err := expandHome(path)
 	if err != nil {
 		return nil, err
@@ -158,20 +155,26 @@ func sshAuthMethods(h config.Host, noPrompt bool) ([]ssh.AuthMethod, func(), err
 	closeFn := func() {}
 	switch {
 	case h.Key != "":
-		s, err := loadKeySignerOpts(h.Key, noPrompt)
+		s, err := loadKeySigner(h.Key, noPrompt)
 		if err != nil {
 			return nil, nil, err
 		}
 		methods = append(methods, ssh.PublicKeys(s))
+		if h.Pass != "" {
+			methods = append(methods, ssh.Password(h.Pass), kbdPassword(h.Pass))
+		}
 	default:
+		// With a configured password and no key, try the password first: an
+		// agent holding many keys would otherwise use up the server's
+		// MaxAuthTries ("too many authentication failures") before it.
+		if h.Pass != "" {
+			methods = append(methods, ssh.Password(h.Pass), kbdPassword(h.Pass))
+		}
 		if conn := dialAgent(); conn != nil {
 			ag := agent.NewClient(conn)
 			methods = append(methods, ssh.PublicKeysCallback(ag.Signers))
 			closeFn = func() { conn.Close() }
 		}
-	}
-	if h.Pass != "" {
-		methods = append(methods, ssh.Password(h.Pass), kbdPassword(h.Pass))
 	}
 	if len(methods) == 0 {
 		return nil, nil, errors.New("no way to log in over SSH: set a password, a key (oob add --key) or load a key into ssh-agent")

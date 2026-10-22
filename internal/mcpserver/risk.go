@@ -105,17 +105,6 @@ func splitCommands(line string) []string {
 	return cmds
 }
 
-// isDangerous reports whether line runs a command that can reboot a device or
-// erase or replace its configuration, spelled out or abbreviated.
-func isDangerous(line string) bool {
-	for _, cmd := range splitCommands(line) {
-		if dangerousCommand(cmd) {
-			return true
-		}
-	}
-	return false
-}
-
 func dangerousCommand(cmd string) bool {
 	words := strings.Fields(cmd)
 	if len(words) == 2 && words[1] == "cancel" && abbreviates(words[0], "reload", 3) {
@@ -152,7 +141,7 @@ const (
 	whyNetwork = "can cut the host off the network"
 	whyPackage = "removes software from the host"
 	whySysrq   = "triggers a kernel SysRq action, which can crash, reboot or sync-and-halt the host"
-	whyAnswer  = "answers the host's question (a yes/no prompt that no approved command raised)"
+	whyAnswer  = "answers the host's question (a yes/no prompt that no command sent through this session raised)"
 	whyBoot    = "is typed at a bootloader or firmware prompt, where commands can boot, erase or replace the software"
 	whyRecall  = "runs a line edited with cursor or editing keys, recalled from history or completed with tab, which can't be read for certain"
 	whyBreak   = "sends a serial BREAK: on Linux the next key typed is a SysRq command, and b reboots at once"
@@ -161,6 +150,7 @@ const (
 	whyBMC     = "is typed at the BMC's own command line, where commands can power off or reset the server or the BMC"
 	whyEscape  = "leaves the host console for the BMC's own command line"
 	whyForce   = "ends another SOL session on this host"
+	whyJoin    = "joins the console the user is working in, in their own oob window, so what it types goes into their live session"
 )
 
 // extras are risks checked on top of dangerousRE, each with its reason. They
@@ -231,10 +221,6 @@ var (
 		`are you sure|proceed\s*\?|continue\s*\?|is this ok|do you want to`)
 	// promptEnd finds where a prompt may end and typing begin.
 	promptEnd = regexp.MustCompile(`[#>$%]`)
-	// paging matches a pager's question, such as --More--.
-	paging = regexp.MustCompile(`(?i)-\s*more|\(more|q quit|\(end\)|lines \d+-\d+`)
-	// loginPrompt matches a login or password question on the cursor line.
-	loginPrompt = regexp.MustCompile(`(?i)(login|username|password)( for \S+)?: ?$`)
 )
 
 // lineRisk is risk for the host's cursor line, prompt and all. The prompt

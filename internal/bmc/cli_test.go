@@ -182,3 +182,94 @@ func TestSkipEcho(t *testing.T) {
 		}
 	})
 }
+
+func TestAwaitConsole(t *testing.T) {
+	sess := func(out string) *cliSession {
+		r, w := io.Pipe()
+		go func() { _, _ = io.WriteString(w, out) }()
+		s := newCLISession(r, io.Discard, iloSpec)
+		// The writer stays open until cleanup so the silent case waits out
+		// its timeout; closing both ends then ends the pipe goroutines.
+		t.Cleanup(func() {
+			s.Close()
+			_ = w.Close()
+			_ = r.Close()
+		})
+		return s
+	}
+	// Another session holds VSP: the iLO says so and shows its prompt again.
+	s := sess("Starting virtual serial port\r\nPress 'ESC (' to return to the CLI Session\r\n" +
+		"xyzVirtual Serial Port is already in use: from vsp.\r\r\n\r\n</>hpeiLO-> ")
+	if err := s.awaitConsole(iloSpec.entered, time.Second); err == nil || !strings.Contains(err.Error(), "didn't start: Virtual Serial Port is already in use") {
+		t.Errorf("busy console: err = %v, want 'already in use'", err)
+	}
+	// The console started: no error, and its output is still there to show.
+	s = sess("Starting virtual serial port\r\nVirtual Serial Port Active: COM1\r\nnode01 login: ")
+	if err := s.awaitConsole(iloSpec.entered, time.Second); err != nil {
+		t.Fatalf("started console: %v", err)
+	}
+	buf := make([]byte, 256)
+	n, _ := s.Read(buf)
+	if !strings.Contains(string(buf[:n]), "Virtual Serial Port Active") {
+		t.Errorf("console output lost: %q", buf[:n])
+	}
+	// Neither within the wait: assume the console is up.
+	s = sess("Starting virtual serial port\r\n")
+	if err := s.awaitConsole(iloSpec.entered, 100*time.Millisecond); err != nil {
+		t.Errorf("silent console: %v", err)
+	}
+}
+
+func TestCLILinkMapInput(t *testing.T) {
+	arrow := []byte("a\x1b[Ab")
+	lone := []byte("\x1b")
+	for _, tc := range []struct {
+		name     string
+		sp       cliSpec
+		atPrompt bool
+		plain    bool
+		mapped   bool
+	}{
+		{"ilo in the console", iloSpec, false, false, true},
+		{"ilo at the BMC prompt", iloSpec, true, false, false},
+		{"ilo over plain ssh", iloSpec, false, true, false},
+		{"idrac", idracSpec, false, false, false},
+		{"supermicro", smcSpec, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newCLILink(&sshLink{}, tc.sp, tc.atPrompt, tc.plain)
+			out, note := l.MapInput(arrow)
+			if tc.mapped {
+				if string(out) != "ab" || note == "" {
+					t.Errorf("arrow: got %q %q, want it dropped with a note", out, note)
+				}
+				if out, _ := l.MapInput(lone); string(out) != "\x1b\x1b" {
+					t.Errorf("lone ESC: got %q, want ESC ESC", out)
+				}
+				return
+			}
+			if string(out) != string(arrow) || note != "" {
+				t.Errorf("arrow: got %q %q, want it unchanged", out, note)
+			}
+			if out, _ := l.MapInput(lone); string(out) != string(lone) {
+				t.Errorf("lone ESC: got %q, want it unchanged", out)
+			}
+		})
+	}
+}
+
+func TestILOMapInputFollowsToggle(t *testing.T) {
+	l, f := newFakeCLI(iloSpec, false, "hpeiLO-> ")
+	if out, _ := l.MapInput([]byte("\x1b")); string(out) != "\x1b\x1b" {
+		t.Fatalf("in the console: %q", out)
+	}
+	if _, at, err := l.Toggle(); err != nil || !at {
+		t.Fatalf("toggle: %v %v", at, err)
+	}
+	if len(f.sent) != 1 || f.sent[0] != "\x1b(" {
+		t.Fatalf("the console escape sent %q, want ESC ( through the link", f.sent)
+	}
+	if out, _ := l.MapInput([]byte("\x1b")); string(out) != "\x1b" {
+		t.Errorf("at the BMC prompt: %q, want unchanged", out)
+	}
+}

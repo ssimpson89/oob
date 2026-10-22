@@ -29,6 +29,7 @@ const (
 	actPower
 	actDisconnect
 	actHelp
+	actAI          // pause the AI tool, or let it type again
 	actCancel      // left command mode with nothing done (unknown key, n)
 	actStop        // clear the typing queue (x, or esc in command mode)
 	actPaste       // bracketed paste finished: action.text is the pasted text
@@ -73,6 +74,7 @@ var commandKeys = []binding{
 	{"b", actBreak, "break", "Send BREAK", 7, true},
 	{"c", actBMC, "bmc prompt", "Toggle between the host console and the BMC's own CLI prompt (iLO, iDRAC, Supermicro SSH SOL; not IPMI SOL)", 3, true},
 	{"r", actSysrq, "r+key", "SysRq: BREAK, then the next key (r then b reboots a Linux console)", 6, true},
+	{"i", actAI, "pause AI", "Pause the AI tool using this shared console, or let it type again", 5, false},
 	{"x", actStop, "clear queue", "Drop what is still queued to be typed, such as a big paste (esc does the same)", 1, false},
 	{"p", actPower, "power cycle", "Power cycle the machine (asks y/n; ipmitool, or off then on over a second SSH connection on an iLO)", 5, true},
 	{"]", actLiteral, "send ^]", "Send ctrl+] itself", 2, true},
@@ -80,13 +82,8 @@ var commandKeys = []binding{
 	{"?", actHelp, "help", "Show every key", keepAlways, false},
 }
 
-// shortKey abbreviates a key for narrow windows: "ctrl+]" -> "^]".
-func shortKey(k string) string {
-	if rest, ok := strings.CutPrefix(k, "ctrl+"); ok {
-		return "^" + rest
-	}
-	return k
-}
+// shortKey is ctrl+] abbreviated for narrow windows.
+const shortKey = "^]"
 
 // helpText is the full key list, printed by the ? key.
 func helpText() string {
@@ -120,7 +117,6 @@ const escWait = 50 * time.Millisecond
 // marker or an arrow key is held until the next Feed or Flush.
 type keyParser struct {
 	mode    keyMode
-	started bool // false until the first byte: the session start counts as a line start
 	midLine bool // the last byte forwarded was not CR or LF
 	tilde   bool // a ~ at line start is held back until the next byte
 	paste   bool // between the paste markers: bytes are collected, not typed
@@ -224,7 +220,6 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 		}
 		if p.paste {
 			p.midLine = c != '\r' && c != '\n'
-			p.started = true
 			switch {
 			case p.over:
 			case len(p.pasted) >= pasteMax: // too big: drop it all, and the rest up to the end marker
@@ -235,8 +230,18 @@ func (p *keyParser) feed(b []byte, final bool) (fwd []byte, acts []action) {
 			continue
 		}
 		if p.mode == modeConsole {
-			if !p.started {
-				p.started = true
+			if c == 0x1b && i+2 < len(b) && b[i+1] == '[' && (b[i+2] == 'I' || b[i+2] == 'O') {
+				// A terminal's focus report (ESC [ I, ESC [ O, sent once a program
+				// has turned on ?1004h, such as vim). It isn't typing: forward it
+				// whole, and don't let it end the line start that ~. needs.
+				if p.tilde { // a held ~ was typed before it
+					p.tilde = false
+					fwd = append(fwd, '~')
+					p.midLine = true
+				}
+				fwd = append(fwd, b[i:i+3]...)
+				i += 2
+				continue
 			}
 			if p.tilde {
 				// ssh-style escapes: ~. disconnects, ~~ sends one ~, ~x sends both.
@@ -331,6 +336,8 @@ func (p *keyParser) command(c byte) []action {
 		return nil
 	case ']', escapeByte: // ctrl+] twice also sends it, as in telnet
 		return []action{{act: actLiteral}}
+	case 'i':
+		return []action{{act: actAI}}
 	case 'x':
 		return []action{{act: actStop}}
 	case 'p':

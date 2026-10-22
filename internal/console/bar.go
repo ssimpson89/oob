@@ -1,6 +1,6 @@
 // Copyright (c) 2026 ssimpson89. MIT License. See THIRD_PARTY.md.
 //
-// seg, fitLine, the hint-dropping layouts and shortKey follow bauddy's
+// seg, fitLine and the hint-dropping layouts follow bauddy's
 // internal/tui/view.go, reworked to plain ANSI (no lipgloss) so the bar can be
 // painted on the bottom row of the normal screen.
 
@@ -107,6 +107,13 @@ type barState struct {
 	noteErr  bool
 	// sending is "1.2k/4k" while a big queue is being typed, else "".
 	sending string
+	// shared is the console's other users, as "shared · AI connected"; "" when
+	// the console is shared with nobody, or not shared.
+	shared string
+	// sharing: the console is shared, so the i key does something.
+	sharing bool
+	// aiPaused: the i key resumes the AI tool.
+	aiPaused bool
 }
 
 // commandLayouts builds the command-mode bar: all hints first, then one fewer
@@ -124,6 +131,10 @@ func commandLayouts(st barState) []layout {
 			keys[i].short = "auto-size off"
 		case keys[i].act == actStop && st.sending == "":
 			keys[i].short = ""
+		case keys[i].act == actAI && !st.sharing:
+			keys[i].short = ""
+		case keys[i].act == actAI && st.aiPaused:
+			keys[i].short = "resume AI"
 		}
 	}
 	dropped := 0
@@ -141,7 +152,7 @@ func commandLayouts(st barState) []layout {
 			}
 			hints = append(hints, hint(b.key, label)...)
 		}
-		lead := []seg{{" " + shortKey("ctrl+]") + " ", true}}
+		lead := []seg{{" " + shortKey + " ", true}}
 		layouts = append(layouts, layout{slices.Concat(lead, hints), right})
 		// drop the lowest-keep hint still present
 		idx := -1
@@ -191,17 +202,20 @@ func barLine(st barState, w int) string {
 	if st.logging {
 		log = []seg{{"  [log]", false}}
 	}
+	if st.shared != "" {
+		log = append(log, seg{"  [" + st.shared + "]", false})
+	}
 	var note, noteShort []seg
 	switch {
 	case st.sending != "":
 		progress := "  sending " + st.sending
-		note = []seg{{progress, true}, {" (" + shortKey("ctrl+]") + " x clears)", false}}
+		note = []seg{{progress, true}, {" (" + shortKey + " x clears)", false}}
 		noteShort = []seg{{progress, true}}
 	case st.note != "":
 		note = []seg{{"  " + st.note, st.noteErr}}
 		noteShort = note
 	}
-	keys := []seg{{shortKey("ctrl+]"), true}, {" keys ", false}}
+	keys := []seg{{shortKey, true}, {" keys ", false}}
 	quit := slices.Concat([]seg{{"~.", true}, {" quit  ", false}}, keys)
 	layouts := []layout{
 		{slices.Concat(name, log, note), quit},
@@ -217,7 +231,6 @@ func barLine(st barState, w int) string {
 	}
 	layouts = append(layouts,
 		layout{slices.Concat(name, log), quit},
-		layout{slices.Concat(name, log), keys},
 		layout{slices.Concat(name, log), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}, log, noteShort), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}, log), keys},
@@ -323,12 +336,47 @@ func (t *escTracker) Idle() bool { return t.state == trkText && t.utf == 0 }
 // (CSI ! p), clear screen (CSI 2J or 3J), or switching the alternate screen
 // (CSI ? 47, 1047 or 1049 h or l). Full-screen programs do these.
 func clobbers(b []byte) bool {
+	clob, _, _ := scanSeqs(b)
+	return clob
+}
+
+// tailMax caps the cut-off sequence start kept between reads.
+const tailMax = 64
+
+// clobberScan runs clobbers across chunk boundaries: the start of a sequence
+// cut off at the end of one read is kept and rescanned with the next, so a
+// split ESC [ 2 and J is still seen. It also reports bracketed paste being
+// turned off (CSI ? 2004 l), which bash 5.1+ does around each command.
+type clobberScan struct{ tail []byte }
+
+// Feed scans b after any held-over start of a sequence.
+func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
+	buf := b
+	if len(s.tail) > 0 {
+		buf = append(s.tail, b...)
+	}
+	clobber, pasteOff, cut := scanSeqs(buf)
+	s.tail = nil
+	if cut >= 0 && len(buf)-cut <= tailMax {
+		s.tail = append([]byte(nil), buf[cut:]...)
+	}
+	return clobber, pasteOff
+}
+
+// scanSeqs looks through b for sequences that clobber the bar and for ?2004l.
+// cut is where a sequence cut off by the end of b starts, or -1.
+func scanSeqs(b []byte) (clobber, pasteOff bool, cut int) {
+	cut = -1
 	for i := 0; i < len(b); i++ {
-		if b[i] != 0x1b || i+1 >= len(b) {
+		if b[i] != 0x1b {
 			continue
 		}
+		if i+1 >= len(b) {
+			cut = i
+			break
+		}
 		if b[i+1] == 'c' {
-			return true
+			clobber = true
 		}
 		if b[i+1] != '[' {
 			continue
@@ -338,32 +386,42 @@ func clobbers(b []byte) bool {
 			j++
 		}
 		if j >= len(b) {
+			cut = i
 			break
 		}
 		params := string(b[i+2 : j])
 		switch b[j] {
 		case 'r':
 			if !strings.HasPrefix(params, "?") {
-				return true
+				clobber = true
 			}
 		case 'p':
 			if params == "!" {
-				return true
+				clobber = true
 			}
 		case 'J':
-			if params == "2" || params == "3" {
-				return true
+			// CSI J (no parameter) and 0J erase through the bottom row, the
+			// bar's, whatever the scroll region is.
+			if params == "" || params == "0" || params == "2" || params == "3" {
+				clobber = true
 			}
 		case 'h', 'l':
 			if rest, ok := strings.CutPrefix(params, "?"); ok {
 				for _, p := range strings.Split(rest, ";") {
-					if n, err := strconv.Atoi(p); err == nil && (n == 47 || n == 1047 || n == 1049) {
-						return true
+					n, err := strconv.Atoi(p)
+					if err != nil {
+						continue
+					}
+					if n == 47 || n == 1047 || n == 1049 {
+						clobber = true
+					}
+					if n == 2004 && b[j] == 'l' {
+						pasteOff = true
 					}
 				}
 			}
 		}
 		i = j
 	}
-	return false
+	return clobber, pasteOff, cut
 }

@@ -15,9 +15,9 @@ import (
 	"github.com/ssimpson89/oob/internal/config"
 	"github.com/ssimpson89/oob/internal/console"
 	"github.com/ssimpson89/oob/internal/detect"
+	"github.com/ssimpson89/oob/internal/share"
 	"github.com/ssimpson89/oob/internal/sshx"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 // The generic SSH CLI console shared by the vendor drivers: an interactive
@@ -132,6 +132,55 @@ func (s *cliSession) expectPrompt(timeout time.Duration) (string, error) {
 	}
 }
 
+// awaitConsole is called after the command that starts the console. It reads
+// until the console says it started (started), or the CLI prompt comes back,
+// which means the console didn't start (on iLO: "Virtual Serial Port is
+// already in use"). Without either within timeout it assumes the console is
+// up. Everything read stays pending, so the console still shows it.
+func (s *cliSession) awaitConsole(started *regexp.Regexp, timeout time.Duration) error {
+	var buf []byte
+	defer func() { s.pending = append(buf, s.pending...) }()
+	tm := time.NewTimer(timeout)
+	defer tm.Stop()
+	for {
+		text := ansiRE.ReplaceAllString(string(buf), "")
+		if started.MatchString(text) {
+			return nil
+		}
+		if s.prompt.MatchString(text) {
+			return fmt.Errorf("the serial console didn't start: %s", firstLine(console.CleanRemote(text)))
+		}
+		select {
+		case b, ok := <-s.ch:
+			if !ok {
+				return nil // the console's own read reports the closed connection
+			}
+			buf = append(buf, b...)
+		case <-tm.C:
+			return nil
+		}
+	}
+}
+
+var inUseRE = regexp.MustCompile(`(?i)(virtual serial port|serial port|console)[^\n]*(in use|busy)[^\n]*`)
+
+// firstLine is the first non-empty line of s that isn't the start command's
+// banner, trimmed, for an error message.
+func firstLine(s string) string {
+	// The BMC's own reason, when it gives one (output left over from an
+	// earlier session can sit in front of it on the same line).
+	if m := inUseRE.FindString(s); m != "" {
+		return strings.TrimSpace(m)
+	}
+	for _, l := range strings.Split(s, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.HasPrefix(strings.ToLower(l), "starting") && !strings.HasPrefix(strings.ToLower(l), "press") && !strings.HasPrefix(l, "vsp") {
+			return l
+		}
+	}
+	return "the BMC returned to its prompt"
+}
+
 // Send types s at the CLI.
 func (s *cliSession) Send(str string) error {
 	_, err := io.WriteString(s.w, str)
@@ -173,7 +222,9 @@ func startShell(c *ssh.Client, rows, cols int) (*ssh.Session, io.WriteCloser, io
 
 // cliDial connects, opens an interactive CLI and waits for the first prompt
 // (matched by sp.prompt). The returned session owns the SSH client.
-func cliDial(name string, h config.Host, sp cliSpec, rows, cols int) (*cliSession, *ssh.Session, io.WriteCloser, error) {
+// timeout (0: the default) limits the connect and noPrompt keeps the login from
+// asking for a passphrase, for runs without a user at the keyboard.
+func cliDial(name string, h config.Host, sp cliSpec, rows, cols int, timeout time.Duration, noPrompt bool) (*cliSession, *ssh.Session, io.WriteCloser, error) {
 	kh, err := sshx.KnownHostsPath()
 	if err != nil {
 		return nil, nil, nil, err
@@ -182,7 +233,7 @@ func cliDial(name string, h config.Host, sp cliSpec, rows, cols int) (*cliSessio
 		return nil, nil, nil, err
 	}
 	det := detect.NewDetector(name, h)
-	cl, err := sshx.ConnectOpts(h, kh, det.Banner)
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner, Timeout: timeout, NoPrompt: noPrompt})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}
@@ -299,6 +350,24 @@ func (l *cliLink) Serial() bool {
 	return !l.atPrompt
 }
 
+// MapInput fits what is typed to a console that reads ESC as a two-byte
+// escape (iLO VSP), in the console only: at the BMC's own prompt, on a plain
+// ssh session and on every other vendor the bytes go through as they are.
+// The console's own escape (Toggle, Disconnect) goes through Send, not here,
+// so it is the only way ESC ( is ever sent.
+func (l *cliLink) MapInput(b []byte) ([]byte, string) {
+	if !l.sp.vspEsc || l.plain {
+		return b, ""
+	}
+	l.mu.Lock()
+	at := l.atPrompt
+	l.mu.Unlock()
+	if at {
+		return b, ""
+	}
+	return console.MapVSPInput(b)
+}
+
 func (l *cliLink) SizeIsFree() bool { return l.plain }
 
 // stateLocked returns the bar label for where the session is now. The caller
@@ -404,14 +473,20 @@ type cliSpec struct {
 	start      []string       // commands typed at the prompt; the last one starts the console
 	esc        []byte         // console escape sequence: console -> CLI prompt
 	breakMsg   string
-	label      string // for the progress line
+	// vspEsc: the console reads ESC with the byte after it (iLO VSP), so input
+	// is mapped. See MapInput.
+	vspEsc bool
+	label  string // for the progress line
 }
+
+// consoleStartWait is how long cliOpen waits for a console to say it started.
+var consoleStartWait = 5 * time.Second
 
 // cliOpen opens the CLI over SSH, starts the console and returns it as a
 // console transport. It needs no terminal of its own: rows and cols are the
 // size the remote is told. Both the console bar and a headless front end use it.
 func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTransport, error) {
-	s, sess, stdin, err := cliDial(name, h, sp, rows, cols)
+	s, sess, stdin, err := cliDial(name, h, sp, rows, cols, 0, false)
 	if err != nil {
 		return nil, err
 	}
@@ -425,6 +500,15 @@ func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTr
 				s.Close()
 				return nil, err
 			}
+		}
+	}
+	// A console that announces itself (iLO VSP) can be refused, for example
+	// when another session already holds it; the BMC then shows its prompt
+	// again. Fail clearly instead of leaving the user at the BMC prompt.
+	if sp.entered != nil {
+		if err := s.awaitConsole(sp.entered, consoleStartWait); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	l := newCLILink(&sshLink{sess: sess, stdin: stdin}, sp, false, false)
@@ -445,22 +529,16 @@ func cliOpen(name string, h config.Host, sp cliSpec, rows, cols int) (*ConsoleTr
 	}, nil
 }
 
-// cliConsole opens the CLI, starts the console and hands over to the bar.
+// cliConsole opens the CLI, starts the console and hands over to the bar. The
+// console is shared: if another oob already has it open (an iLO allows one VSP
+// session, so a second connection couldn't work), this joins it instead.
 func cliConsole(name string, h config.Host, sp cliSpec, power func() (string, error)) (int, error) {
-	w, rows, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return 1, err
-	}
-	app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
-	tr, err := cliOpen(name, h, sp, console.RemoteRows(rows), w)
-	if err != nil {
-		return 1, err
-	}
-	defer tr.Close()
-	return console.Run(console.Setup{
-		Host: name, Kind: sp.kind,
-		Link: tr.Link, Out: tr.Out, Done: tr.Done,
-		Power: power, Pacing: tr.Pacing,
+	return share.RunConsole(h, name, share.Console{
+		Power: power,
+		Open: func(rows, cols int) (*ConsoleTransport, error) {
+			app.Progressf("connecting to %s via SSH (%s)...", name, sp.label)
+			return cliOpen(name, h, sp, rows, cols)
+		},
 	})
 }
 

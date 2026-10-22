@@ -21,7 +21,7 @@ import (
 
 	"github.com/ssimpson89/oob/internal/bmc"
 	"github.com/ssimpson89/oob/internal/console"
-	"github.com/ssimpson89/oob/internal/typer"
+	"github.com/ssimpson89/oob/internal/share"
 )
 
 const (
@@ -48,13 +48,10 @@ type session struct {
 	addr string // the BMC address and type the console was opened on
 	typ  string
 	tr   *bmc.ConsoleTransport
-	tx   *console.Transcript
-	// ty queues everything typed at the console, paced if the link is serial.
-	// txErr is the write error that ended it, if one did.
-	ty     *typer.Typer
-	stopTy context.CancelFunc
-	txErr  error // guarded by mu
-	wrote  int   // bytes the link has taken, ever; guarded by mu
+	// sh is the shared console the session types through: the hub owns the one
+	// typer and decides who may type.
+	sh *share.Client
+	tx *console.Transcript
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -71,15 +68,16 @@ type session struct {
 	answersAt int    // the prompt count when a command was last approved (-1: none)
 	typing    typing // what send_keys has typed since the last Enter
 	lastEsc   bool   // the last byte sent was ESC
-	breakAt   time.Time
 	lastUsed  time.Time
-	ended     bool
+	ended     bool // nothing more can be typed
+	marked    bool // the end is in the transcript, with its exit status
 	endMsg    string
 	changed   chan struct{} // closed and replaced whenever something arrives
 	logPath   string
 	closed    bool
 
 	doneC   chan struct{} // closed once the transport has ended
+	eofC    chan struct{} // closed once the output stream hit EOF: the console will say no more
 	result  console.Result
 	drained chan struct{} // closed once the output reader has finished
 	once    sync.Once
@@ -87,28 +85,12 @@ type session struct {
 }
 
 // newSession starts recording tr's output.
-func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcript) *session {
+func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcript, sh *share.Client) *session {
 	c := &session{
-		id: id, host: host, tr: tr, tx: tx, kind: tr.Kind, answersAt: -1,
+		id: id, host: host, tr: tr, tx: tx, sh: sh, kind: tr.Kind, answersAt: -1,
 		lastUsed: time.Now(), changed: make(chan struct{}),
-		doneC: make(chan struct{}), drained: make(chan struct{}),
+		doneC: make(chan struct{}), eofC: make(chan struct{}), drained: make(chan struct{}),
 	}
-	ctx, stop := context.WithCancel(context.Background())
-	c.stopTy = stop
-	c.ty = console.NewTyper(tr.Link, tr.Pacing)
-	go func() {
-		_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
-			err := tr.Link.Send(b)
-			c.mu.Lock()
-			if err != nil {
-				c.txErr = err
-			} else {
-				c.wrote += len(b)
-			}
-			c.mu.Unlock()
-			return len(b), err
-		}))
-	}()
 	go func() {
 		r := <-tr.Done
 		c.mu.Lock()
@@ -130,7 +112,13 @@ func (c *session) drain() {
 			c.feed(buf[:n])
 		}
 		if err != nil {
-			select { // the exit status is worth a moment
+			// Nothing more will arrive, so nothing typed now can be checked
+			// against what the console shows: a stale prompt would wave the
+			// rest of a batch through. Refuse new sends before anyone waiting
+			// on eofC can act on the hang-up.
+			c.endInput()
+			close(c.eofC)
+			select { // the exit status is worth a moment, collected apart from that
 			case <-c.doneC:
 			case <-time.After(2 * time.Second):
 			}
@@ -167,15 +155,27 @@ func (c *session) feed(b []byte) {
 	c.notifyLocked()
 }
 
-// markEnded records that the transport has gone.
+// endInput marks the session ended, so canSend refuses. The message is
+// provisional until markEnded has the exit status.
+func (c *session) endInput() {
+	c.mu.Lock()
+	if !c.ended {
+		c.ended = true
+		c.endMsg = "the console connection ended"
+	}
+	c.mu.Unlock()
+}
+
+// markEnded records that the transport has gone, with its exit status if it
+// gave one in time.
 func (c *session) markEnded() {
+	c.endInput()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.ended {
+	if c.marked {
 		return
 	}
-	c.ended = true
-	c.stopTy()
+	c.marked = true
 	switch {
 	case c.result.Err != nil:
 		c.endMsg = "the console connection ended: " + c.result.Err.Error()
@@ -232,6 +232,9 @@ func (c *session) canSend() error {
 	if c.ended {
 		return fmt.Errorf("%s, so nothing was sent. Disconnect and connect again", c.endMsg)
 	}
+	if c.sh.Status().Paused {
+		return errors.New(pausedText) // before anything else, so a paused tool is told so
+	}
 	return nil
 }
 
@@ -257,6 +260,15 @@ func (c *session) guarded(ctx context.Context, fn func() error) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		// A stop or a dropped link cancels the call without the write being stuck,
+		// and the write returns at once with its own error: let it.
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			select {
+			case err := <-done:
+				return err
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 	}
 	c.closeTransport()
 	select {
@@ -272,40 +284,31 @@ func (c *session) closeTransport() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
-	c.stopTy()
 	c.trOnce.Do(c.tr.Close)
 }
 
-// write types b at the console, within ctx: it queues the bytes and returns
-// when the last one is out. On a serial console that takes a while, since the
-// queue paces them.
+// write types b at the console, within ctx, and returns when the last byte is
+// out. On a serial console that takes a while, since the hub paces them.
 func (c *session) write(ctx context.Context, b []byte) error {
+	return c.writeUnits(ctx, [][]byte{b})
+}
+
+// writeUnits is write for a call made of separate keys and text: the hub fits
+// each to the console on its own, so "esc" then "enter" is ESC ESC CR and not
+// the Alt-Enter the joined bytes would read as, and it refuses the whole call if
+// the link would drop any of it.
+func (c *session) writeUnits(ctx context.Context, units [][]byte) error {
+	b := bytes.Join(units, nil)
 	c.mu.Lock()
 	c.lastEsc = len(b) > 0 && b[len(b)-1] == 0x1b
-	before := c.wrote
 	c.mu.Unlock()
 	err := c.guarded(ctx, func() error {
-		<-c.ty.Enqueue(b)
-		return nil
+		return c.sh.TypeKeys(context.Background(), units) // guarded ends it if ctx does
 	})
-	if err != nil {
+	if errors.Is(err, errStuck) {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// The queue closes its waiters for dropped bytes too, such as when the
-	// remote hangs up during pacing, so count what the link took.
-	switch got := c.wrote - before; {
-	case c.txErr != nil:
-		return c.txErr
-	case got < len(b) && c.ended:
-		return fmt.Errorf("%s, and only %d of %d bytes were typed. Disconnect and connect again", c.endMsg, got, len(b))
-	case c.closed:
-		return errors.New("the session was closed before everything was typed")
-	case got < len(b):
-		return fmt.Errorf("only %d of %d bytes were typed before sending stopped", got, len(b))
-	}
-	return nil
+	return shareError(err)
 }
 
 // typingBudget is the typing time for a wire payload: a LineDelay for each
@@ -316,18 +319,15 @@ func (c *session) typingBudget(wire []byte) time.Duration {
 	return c.typingTime(len(wire), lines+1)
 }
 
-// typingTime is how long the queue takes to type n bytes in lines lines, so a
+// typingTime is how long the hub takes to type n bytes in lines lines, so a
 // tool's time limit covers it. It is zero for a console that isn't paced.
 func (c *session) typingTime(n, lines int) time.Duration {
-	if c.ty.Paced == nil || !c.ty.Paced() {
+	l, ok := c.tr.Link.(interface{ Serial() bool })
+	if !ok || !l.Serial() || c.tr.Pacing.Char == nil || c.tr.Pacing.Line == nil {
 		return 0
 	}
-	return time.Duration(n)*c.ty.CharDelay + time.Duration(lines)*c.ty.LineDelay
+	return time.Duration(n)*(*c.tr.Pacing.Char) + time.Duration(lines)*(*c.tr.Pacing.Line)
 }
-
-type writerFunc func([]byte) (int, error)
-
-func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 
 // unread returns what the console printed since output was last returned,
 // ending with the line the cursor is on, and marks it returned.
@@ -356,7 +356,7 @@ func (c *session) notes() []string {
 		n = append(n, "This session is at the BMC's own command line, not the host console. Everything typed here needs the "+
 			"user's approval. bmc_prompt with to=console goes back.")
 	}
-	if loginPrompt.MatchString(c.tx.Partial()) {
+	if console.SecretPrompt.MatchString(c.tx.Partial()) {
 		n = append(n, "The console is asking for a login. Ask the user to log in or to give you credentials. Don't guess: "+
 			"failed logins can lock the account.")
 	}
@@ -391,6 +391,8 @@ func (c *session) settle(ctx context.Context, changed <-chan struct{}, limit tim
 		case <-quiet:
 			return
 		case <-c.doneC:
+			return
+		case <-c.eofC:
 			return
 		case <-changed:
 			changed = c.changes()
@@ -485,7 +487,7 @@ func shown(lines []string, cursor string, lost int) string {
 	}
 	var b strings.Builder
 	if cut := lost + len(lines) - keep; cut > 0 {
-		fmt.Fprintf(&b, "[%d earlier lines not shown; read_history has the last %d]\n", cut, console.HistoryLines)
+		fmt.Fprintf(&b, "[%d earlier lines not shown; read_output with lines has the last %d]\n", cut, console.HistoryLines)
 	} else if len(lines) == 0 {
 		b.WriteString("(no new lines; the cursor is on this one)\n")
 	}

@@ -51,7 +51,7 @@ if [ -z "$(cat)" ]; then echo "stdin was empty"; fi
 		tool string
 		args map[string]any
 	}{
-		{"power_status", map[string]any{"host": "node01"}},
+		{"status", map[string]any{"filter": "node01"}},
 		{"sensors", map[string]any{"host": "node01"}},
 		{"sel_list", map[string]any{"host": "node01"}},
 		{"power", map[string]any{"host": "node01", "action": "cycle"}},
@@ -115,7 +115,7 @@ func TestRunKeepsStdoutForTheProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "power_status", Arguments: map[string]any{"host": "node01"}})
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "status", Arguments: map[string]any{"filter": "node01"}})
 	if err != nil || res.IsError {
 		t.Fatalf("call: %v %+v", err, res)
 	}

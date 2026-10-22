@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -84,7 +85,12 @@ func (d *fakeDriver) OpenConsole(o bmc.OpenConsoleOptions) (*bmc.ConsoleTranspor
 	if d.h.openErr != nil {
 		return nil, d.h.openErr
 	}
-	fh := newFakeHost(d.h.t, d.name)
+	var fh *fakeHost
+	if d.h.initial != nil {
+		fh = newFakeHostShowing(d.h.t, d.name, *d.h.initial)
+	} else {
+		fh = newFakeHost(d.h.t, d.name)
+	}
 	if d.h.setup != nil {
 		d.h.setup(fh)
 	}
@@ -115,6 +121,7 @@ type fakeHost struct {
 	prompt   string
 	asking   string // a question waiting for y or n
 	toggle   bool   // behaves like iLO/iDRAC: has a BMC prompt
+	silent   bool   // the switch to the BMC prompt prints nothing until something is typed
 	atBMC    bool
 	respond  func(f *fakeHost, cmd string) bool // true if it handled the command
 
@@ -124,15 +131,24 @@ type fakeHost struct {
 	stuck       bool          // Send blocks, like an SSH channel that stopped taking input, until Close
 	unstick     chan struct{} // closed by Close
 	unstickOnce sync.Once
+	blocked     chan struct{} // receives once each time a Send blocks because the host is stuck
 
 	writes, maxWrite int           // Send calls and the longest one, to see whether a line is typed in one burst
 	sendDelay        time.Duration // each Send takes this long, like a slow serial link
+	vsp              bool          // maps input like an iLO VSP
 	serial           bool          // a serial console: the session paces what it types, by pacing
 	pacing           console.Pacing
 }
 
 func newFakeHost(t *testing.T, name string) *fakeHost {
-	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), unstick: make(chan struct{}), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
+	return newFakeHostShowing(t, name, "[root@"+name+" ~]# ")
+}
+
+// newFakeHostShowing is a host whose console starts by printing initial: a
+// banner with no prompt after it, as a console opened on a quiet serial port
+// looks.
+func newFakeHostShowing(t *testing.T, name, initial string) *fakeHost {
+	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), unstick: make(chan struct{}), blocked: make(chan struct{}, 16), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
 	f.pr, f.pw = io.Pipe()
 	go func() {
 		for b := range f.outq {
@@ -141,7 +157,7 @@ func newFakeHost(t *testing.T, name string) *fakeHost {
 			}
 		}
 	}()
-	f.emit(f.prompt)
+	f.emit(initial)
 	return f
 }
 
@@ -161,6 +177,10 @@ func (f *fakeHost) Send(b []byte) error {
 	f.mu.Lock()
 	if f.stuck {
 		f.mu.Unlock()
+		select {
+		case f.blocked <- struct{}{}:
+		default:
+		}
 		<-f.unstick
 		return io.ErrClosedPipe
 	}
@@ -289,8 +309,14 @@ func (f *fakeHost) Disconnect() error {
 
 func (f *fakeHost) Resize(rows, cols int) error  { return nil }
 func (f *fakeHost) FitSize(rows, cols int) error { return nil }
-func (f *fakeHost) SizeIsFree() bool             { return false }
-func (f *fakeHost) Serial() bool                 { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
+func (f *fakeHost) MapInput(b []byte) ([]byte, string) {
+	if !f.vsp {
+		return b, ""
+	}
+	return console.MapVSPInput(b)
+}
+func (f *fakeHost) SizeIsFree() bool { return false }
+func (f *fakeHost) Serial() bool     { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
 
 // finish ends the transport the way a hung-up console does.
 func (f *fakeHost) finish() {
@@ -361,6 +387,9 @@ func (f *fakeHost) transport() *bmc.ConsoleTransport {
 			f.atBMC = !f.atBMC
 			at := f.atBMC
 			f.mu.Unlock()
+			if f.silent {
+				return map[bool]string{true: "ilo cli", false: "vsp"}[at], at, nil
+			}
 			if at {
 				f.emit("\r\n</>hpiLO-> ")
 				return "ilo cli", true, nil
@@ -394,6 +423,8 @@ type harness struct {
 	asked   []string // the approval questions the user saw
 	setup   func(*fakeHost)
 	openErr error
+	initial *string // what a console prints when it opens, if not a prompt
+	onAsk   func()  // runs while the user is being asked, before the answer
 
 	mu       sync.Mutex
 	calls    []string
@@ -419,12 +450,26 @@ func (h *harness) host(name string) *fakeHost {
 // user to approve things, and the user answers: "accept" ticks "Allow it" and
 // accepts, "unticked" accepts without ticking, anything else is the action,
 // such as "decline".
+// shareState points the share sockets at a fresh short folder: a unix socket
+// path is limited to about 100 bytes, which t.TempDir often exceeds.
+func shareState(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "oob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", d)
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
+}
+
 func start(t *testing.T, opt Options, answer string) *harness {
 	return startVersion(t, opt, answer, "")
 }
 
 func startVersion(t *testing.T, opt Options, answer, version string) *harness {
 	t.Helper()
+	shareState(t)
 	oldQuiet := quietFor
 	quietFor = 25 * time.Millisecond
 	t.Cleanup(func() { quietFor = oldQuiet })
@@ -468,7 +513,11 @@ func startVersion(t *testing.T, opt Options, answer, version string) *harness {
 		copt.ElicitationHandler = func(_ context.Context, r *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 			h.mu.Lock()
 			h.asked = append(h.asked, r.Params.Message)
+			onAsk := h.onAsk
 			h.mu.Unlock()
+			if onAsk != nil {
+				onAsk()
+			}
 			switch answer {
 			case "accept":
 				return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"allow": true}}, nil

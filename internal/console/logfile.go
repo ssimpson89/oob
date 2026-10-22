@@ -7,6 +7,7 @@
 package console
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,13 +16,16 @@ import (
 	"time"
 
 	"github.com/ssimpson89/oob/internal/app"
+	"github.com/ssimpson89/oob/internal/termtext"
 )
 
 // logWriter is an open console log.
 type logWriter struct {
 	f    *os.File
 	path string
-	c    termCleaner
+	c    termtext.Cleaner
+	// held is marker text waiting for the open line to end.
+	held []byte
 }
 
 // openLog appends to path (creating it, mode 0600: logs can hold configs and
@@ -59,23 +63,43 @@ func openLog(path, header string, earlier []string, partial string) (*logWriter,
 func (l *logWriter) Path() string { return l.path }
 
 // Write logs raw output. Complete lines are written at once; a partial line
-// waits for its newline or Close.
+// waits for its newline or Close. Markers held back while a line was open go
+// out right after that line ends.
 func (l *logWriter) Write(raw []byte) error {
-	_, err := l.f.Write(l.c.Feed(raw))
-	return err
-}
-
-// Mark writes a marker line such as "--- 09:13:01 BREAK sent ---".
-func (l *logWriter) Mark(msg string) error {
-	out := l.c.Flush()
-	out = append(out, fmt.Sprintf("--- %s %s ---\n", time.Now().Format("15:04:05"), msg)...)
+	out := l.c.Feed(raw)
+	if len(l.held) > 0 && len(out) > 0 {
+		// The first line out is the one that was open: it ends at the first newline.
+		if i := bytes.IndexByte(out, '\n'); i >= 0 {
+			joined := make([]byte, 0, len(out)+len(l.held))
+			joined = append(joined, out[:i+1]...)
+			joined = append(joined, l.held...)
+			out = append(joined, out[i+1:]...)
+			l.held = nil
+		}
+	}
 	_, err := l.f.Write(out)
 	return err
 }
 
-// Close writes any partial line and closes the file.
+// Mark writes a marker line such as "--- 09:13:01 BREAK sent ---". A marker
+// never splits a line: while one is open the marker waits for its end.
+func (l *logWriter) Mark(msg string) error {
+	m := fmt.Sprintf("--- %s %s ---\n", time.Now().Format("15:04:05"), msg)
+	// Queue behind anything already held too: an erased line leaves Partial()
+	// empty while older markers still wait, and order must be kept.
+	if l.c.Partial() != "" || len(l.held) > 0 {
+		l.held = append(l.held, m...)
+		return nil
+	}
+	_, err := l.f.WriteString(m)
+	return err
+}
+
+// Close writes any partial line, then any held markers, and closes the file.
 func (l *logWriter) Close() error {
-	_, werr := l.f.Write(l.c.Flush())
+	out := append(l.c.Flush(), l.held...)
+	l.held = nil
+	_, werr := l.f.Write(out)
 	if err := l.f.Close(); err != nil {
 		return err
 	}

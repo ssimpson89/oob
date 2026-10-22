@@ -161,7 +161,7 @@ func noAgentEnv(t *testing.T) {
 func dialTest(t *testing.T, h config.Host, port int) error {
 	t.Helper()
 	h.IP, h.Port, h.User, h.Name = "127.0.0.1", port, "u", "bmc1"
-	cl, err := ConnectOpts(h, filepath.Join(t.TempDir(), "known_hosts"), nil)
+	cl, err := ConnectWith(h, filepath.Join(t.TempDir(), "known_hosts"), Options{})
 	if err == nil {
 		cl.Close()
 	}
@@ -229,6 +229,34 @@ func TestAuthAgentOnly(t *testing.T) {
 	})
 }
 
+// With a password and no key, the password goes before the agent's keys, so an
+// agent with many keys cannot trigger "too many authentication failures".
+func TestAuthPasswordBeforeAgentKeys(t *testing.T) {
+	noAgentEnv(t)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	startAgent(t, priv)
+	sp, _ := ssh.NewSignerFromKey(priv)
+
+	t.Run("password accepted: agent never tried", func(t *testing.T) {
+		as, _, port := newAuthServer(t, sp.PublicKey())
+		if err := dialTest(t, config.Host{Pass: "pw"}, port); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(as.tried(), ","); got != "none,password" {
+			t.Errorf("methods = %s", got)
+		}
+	})
+	t.Run("password rejected: agent key is the fallback", func(t *testing.T) {
+		as, _, port := newAuthServer(t, sp.PublicKey())
+		if err := dialTest(t, config.Host{Pass: "wrong"}, port); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(as.tried(), ","); got != "none,password,publickey" {
+			t.Errorf("methods = %s", got)
+		}
+	})
+}
+
 func TestAuthPasswordOnly(t *testing.T) {
 	noAgentEnv(t)
 	as, _, port := newAuthServer(t)
@@ -273,14 +301,14 @@ func TestKeyPassphrase(t *testing.T) {
 	t.Run("no terminal", func(t *testing.T) {
 		keyPassphrase = func(p string) ([]byte, error) { return orig(p) }
 		// stdin is not a terminal under go test
-		_, err := loadKeySigner(path)
+		_, err := loadKeySigner(path, false)
 		if err == nil || !strings.Contains(err.Error(), "ssh-agent") || strings.Contains(err.Error(), "s3cret") {
 			t.Errorf("err = %v", err)
 		}
 	})
 	t.Run("right passphrase", func(t *testing.T) {
 		keyPassphrase = func(string) ([]byte, error) { return []byte("s3cret"), nil }
-		s, err := loadKeySigner(path)
+		s, err := loadKeySigner(path, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,7 +318,7 @@ func TestKeyPassphrase(t *testing.T) {
 	})
 	t.Run("wrong passphrase", func(t *testing.T) {
 		keyPassphrase = func(string) ([]byte, error) { return []byte("nope"), nil }
-		_, err := loadKeySigner(path)
+		_, err := loadKeySigner(path, false)
 		if err == nil || !strings.Contains(err.Error(), "wrong passphrase") {
 			t.Errorf("err = %v", err)
 		}
@@ -300,21 +328,21 @@ func TestKeyPassphrase(t *testing.T) {
 func TestKeyPermsRefused(t *testing.T) {
 	for _, mode := range []os.FileMode{0o640, 0o604, 0o644, 0o660} {
 		path, _ := writeTestKey(t, mode, "")
-		_, err := loadKeySigner(path)
+		_, err := loadKeySigner(path, false)
 		if err == nil || !strings.Contains(err.Error(), "chmod 600") {
 			t.Errorf("mode %04o: err = %v", mode, err)
 		}
 	}
 	path, _ := writeTestKey(t, 0o400, "")
-	if _, err := loadKeySigner(path); err != nil {
+	if _, err := loadKeySigner(path, false); err != nil {
 		t.Errorf("0400: %v", err)
 	}
 	bad := filepath.Join(t.TempDir(), "junk")
 	os.WriteFile(bad, []byte("not a key"), 0o600)
-	if _, err := loadKeySigner(bad); err == nil || strings.Contains(err.Error(), "not a key") {
+	if _, err := loadKeySigner(bad, false); err == nil || strings.Contains(err.Error(), "not a key") {
 		t.Errorf("junk: %v", err)
 	}
-	if _, err := loadKeySigner(filepath.Join(t.TempDir(), "missing")); err == nil {
+	if _, err := loadKeySigner(filepath.Join(t.TempDir(), "missing"), false); err == nil {
 		t.Error("missing file accepted")
 	}
 }
@@ -325,7 +353,7 @@ func TestKeyHomeExpansion(t *testing.T) {
 	path, _ := writeTestKey(t, 0o600, "")
 	b, _ := os.ReadFile(path)
 	os.WriteFile(filepath.Join(home, "k"), b, 0o600)
-	if _, err := loadKeySigner("~/k"); err != nil {
+	if _, err := loadKeySigner("~/k", false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -346,10 +374,10 @@ func TestConnectNoPromptSkipsPassphrase(t *testing.T) {
 	old := keyPassphrase
 	keyPassphrase = func(string) ([]byte, error) { prompts++; return []byte("secret"), nil }
 	t.Cleanup(func() { keyPassphrase = old })
-	if _, err := loadKeySignerOpts(path, true); !errors.Is(err, ErrNeedsInput) || prompts != 0 {
+	if _, err := loadKeySigner(path, true); !errors.Is(err, ErrNeedsInput) || prompts != 0 {
 		t.Fatalf("err %v prompts %d", err, prompts)
 	}
-	if _, err := loadKeySignerOpts(path, false); err != nil || prompts != 1 {
+	if _, err := loadKeySigner(path, false); err != nil || prompts != 1 {
 		t.Fatalf("interactive: err %v prompts %d", err, prompts)
 	}
 }
