@@ -370,10 +370,10 @@ type writeFn func([]byte) (int, error)
 
 func (f writeFn) Write(b []byte) (int, error) { return f(b) }
 
-// A submission already counted by Enqueue but still blocked handing its text
-// to Run (because Run is stuck in a write) must not be written after Urgent or
-// Clear, whichever of them Run services first.
-func TestCancelDropsSubmissionBlockedInEnqueue(t *testing.T) {
+// While Run is stuck inside a write, Enqueue, Urgent, Clear and Queued must
+// return at once, and text queued before an Urgent or Clear must never be
+// written after it.
+func TestCallersNeverWaitOnABlockedWriter(t *testing.T) {
 	for _, name := range []string{"urgent", "clear"} {
 		t.Run(name, func(t *testing.T) {
 			gate := make(chan struct{})
@@ -396,33 +396,38 @@ func TestCancelDropsSubmissionBlockedInEnqueue(t *testing.T) {
 			})
 			go func() { _ = ty.Run(ctx, w) }()
 			ty.Enqueue([]byte("first"))
-			<-entered // Run is inside the write, so it cannot take from t.in
+			<-entered // Run is inside the write
+			calls := make(chan struct{})
 			var old <-chan struct{}
-			enq := make(chan struct{})
-			go func() { old = ty.Enqueue([]byte("OLD")); close(enq) }()
-			for ty.Queued() != len("first")+len("OLD") {
-				time.Sleep(time.Millisecond) // counted, so the producer is committed
-			}
-			time.Sleep(20 * time.Millisecond) // and parked on t.in
-			cancelled := make(chan struct{})
 			go func() {
+				old = ty.Enqueue([]byte("OLD"))
+				_ = ty.Queued()
 				if name == "urgent" {
 					ty.Urgent([]byte{0x03})
 				} else {
 					ty.Clear()
 				}
-				close(cancelled)
+				close(calls)
 			}()
-			for ty.gen.Load() == 0 {
-				time.Sleep(time.Millisecond)
+			select {
+			case <-calls:
+			case <-time.After(5 * time.Second):
+				t.Fatal("a caller blocked on the stuck writer")
 			}
-			close(gate)
-			<-cancelled
-			<-enq
 			isClosed(t, old)
-			ty.Clear() // a barrier: Run has seen everything sent so far
 			if got := ty.Queued(); got != 0 {
 				t.Errorf("Queued = %d, want 0", got)
+			}
+			close(gate)
+			deadline := time.Now().Add(5 * time.Second)
+			for name == "urgent" && time.Now().Before(deadline) {
+				mu.Lock()
+				n := len(out)
+				mu.Unlock()
+				if n >= 2 {
+					break
+				}
+				time.Sleep(time.Millisecond)
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -431,6 +436,62 @@ func TestCancelDropsSubmissionBlockedInEnqueue(t *testing.T) {
 					t.Fatalf("stale submission was written: %q", out)
 				}
 			}
+			if name == "urgent" && (len(out) != 2 || out[1] != "\x03") {
+				t.Errorf("out = %q, want first then ctrl+c", out)
+			}
 		})
 	}
+}
+
+// Regression: no char delay but a line delay, a paste in progress with the
+// writer stuck, an ordinary key read meanwhile, then ctrl+c. None of the
+// calls may block, and ctrl+c must be written before the paste's Enter.
+func TestCtrlCServicedBeforeEnterWhileWriterBlocked(t *testing.T) {
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var out []byte
+	entered := make(chan struct{})
+	ty := &Typer{LineDelay: ld, Wait: func(time.Duration) <-chan time.Time { return make(chan time.Time) }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := writeFn(func(b []byte) (int, error) {
+		mu.Lock()
+		first := len(out) == 0
+		out = append(out, b...)
+		mu.Unlock()
+		if first {
+			close(entered)
+			<-gate
+		}
+		return len(b), nil
+	})
+	go func() { _ = ty.Run(ctx, w) }()
+	ty.Enqueue([]byte("reboot\r"))
+	<-entered
+	done := make(chan struct{})
+	go func() {
+		ty.Enqueue([]byte("k")) // an ordinary key during the paste
+		ty.Urgent([]byte{0x03})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stdin handler blocked behind the stuck write")
+	}
+	close(gate)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := string(out)
+		mu.Unlock()
+		if strings.Contains(got, "\x03") {
+			if strings.Contains(got, "\r") {
+				t.Fatalf("wrote %q, ctrl+c must land before Enter", got)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("ctrl+c never written")
 }
