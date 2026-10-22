@@ -340,3 +340,21 @@ func TestILOStatusDeadline(t *testing.T) {
 		t.Errorf("took %v for a 300ms deadline", time.Since(start))
 	}
 }
+
+// A Redfish port that never answers the connect fails after the dial timeout,
+// as a dial error, so the SSH fallback is still reachable.
+func TestRedfishDialTimeoutIsFallback(t *testing.T) {
+	swap(t, &redfishDialTimeout, 50*time.Millisecond)
+	c := newRedfishClient("https://192.0.2.1:443", "u", "p")
+	start := time.Now()
+	_, err := c.PowerState(context.Background())
+	if err == nil {
+		t.Fatal("connected to TEST-NET")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("took %v with a 50ms dial timeout", time.Since(start))
+	}
+	if !redfishFallback(err) {
+		t.Errorf("not a fallback error: %v", err)
+	}
+}
