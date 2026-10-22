@@ -423,7 +423,7 @@ func (k *consoleKeys) do(a action) {
 	switch a.act {
 	case actPaste:
 		text := a.text
-		if _, ok := cs.Link.(InputMapper); ok {
+		if stripsPaste(cs.Link) {
 			text = StripEsc(text)
 		}
 		b := pasteBytes(text)

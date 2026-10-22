@@ -65,6 +65,12 @@ func (l *link) SizeIsFree() bool { return l.c.Status().SizeFree }
 // Serial reports whether typing goes to a serial line, so it is paced.
 func (l *link) Serial() bool { return l.c.Status().Serial }
 
+// StripsPaste reports whether the hub's link maps input, so a paste here has
+// its escape sequences stripped as it would on a local console. The mapping
+// itself is the hub's: this link must not be an InputMapper, or it would be
+// done twice.
+func (l *link) StripsPaste() bool { return l.c.Status().Maps }
+
 // SizeLine is the command that fits the size, if the console types one.
 func (l *link) SizeLine(rows, cols int) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

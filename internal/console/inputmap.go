@@ -17,6 +17,22 @@ type InputMapper interface {
 	MapInput(b []byte) (out []byte, note string)
 }
 
+// PasteStripper is a link whose input is mapped somewhere else, as a shared
+// window's is (the hub's link maps it): it can't be an InputMapper without
+// mapping twice, but a paste to it still has its escape sequences stripped.
+type PasteStripper interface {
+	StripsPaste() bool
+}
+
+// stripsPaste reports whether a paste to l has its escape sequences stripped.
+func stripsPaste(l Link) bool {
+	if _, ok := l.(InputMapper); ok {
+		return true
+	}
+	p, ok := l.(PasteStripper)
+	return ok && p.StripsPaste()
+}
+
 // VSPKeysNote is the bar note for keys the iLO VSP can't pass.
 const VSPKeysNote = "iLO VSP can't pass arrow/function keys: shell ctrl+p/n/b/f, vim h/j/k/l"
 

@@ -91,6 +91,7 @@ type Status struct {
 	Serial    bool   `json:"serial"`   // what is typed goes to a serial line, so it is paced
 	SizeFree  bool   `json:"sizeFree"` // resizing types nothing (ssh window change)
 	HasToggle bool   `json:"hasToggle"`
+	Maps      bool   `json:"maps"`   // the link maps input (an iLO VSP), so a paste has its escape sequences stripped
 	CharNS    int64  `json:"charNS"` // the hub's typing delays
 	LineNS    int64  `json:"lineNS"`
 	Windows   int    `json:"windows"` // windows on it, the receiver's included

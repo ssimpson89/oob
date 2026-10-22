@@ -1328,6 +1328,7 @@ func (h *hub) status() Status {
 	if sl, ok := h.tr.Link.(serialLink); ok {
 		s.Serial = sl.Serial()
 	}
+	_, s.Maps = h.tr.Link.(console.InputMapper)
 	if h.agent != nil {
 		s.Agent, s.Windows = h.agent.name, s.Windows-1
 	}

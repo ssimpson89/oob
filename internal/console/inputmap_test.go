@@ -316,3 +316,21 @@ func TestConsoleKeysForwardAHeldKeyWhenTheLinkStopsMapping(t *testing.T) {
 		t.Errorf("sent %q, want the held bytes forwarded", got)
 	}
 }
+
+// stripLink is a link whose input is mapped elsewhere (a shared window's): not
+// an InputMapper, but its pastes lose their escape sequences all the same.
+type stripLink struct{ fakeLink }
+
+func (*stripLink) StripsPaste() bool { return true }
+
+func TestPasteToAPasteStrippingLinkLosesWholeEscapeSequences(t *testing.T) {
+	fl := &stripLink{}
+	k, _ := vspKeys(t, fl)
+	k.Input([]byte("\x1b[200~echo \x1b[31mhi\x1b[0m\x1b[201~"))
+	for i := 0; i < 200 && len(fl.sentCopy()) < len("echo hi"); i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := string(fl.sentCopy()); got != "echo hi" {
+		t.Errorf("sent %q, want %q", got, "echo hi")
+	}
+}

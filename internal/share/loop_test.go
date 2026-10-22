@@ -284,3 +284,19 @@ func TestPausingKeepsTheOwnerOfAByteInsideABlockedSend(t *testing.T) {
 		return chars == 1
 	})
 }
+
+// A window's link doesn't map input (the hub does), but it says whether the
+// hub's link does, so a paste in the window is stripped as a local one is.
+func TestWindowLinkSaysWhetherPastesAreStripped(t *testing.T) {
+	env(t)
+	f := newFake() // maps input like an iLO VSP
+	win := host(t, f, Options{NoLinger: true})
+	l := win.Transport().Link
+	if _, ok := l.(console.InputMapper); ok {
+		t.Error("the window's link maps input too: it would be mapped twice")
+	}
+	ps, ok := l.(console.PasteStripper)
+	if !ok || !ps.StripsPaste() {
+		t.Errorf("the window's link doesn't strip pastes (%v) though the hub's link maps input", ok)
+	}
+}
