@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
@@ -35,12 +36,126 @@ type Host struct {
 	// Name is the host's name in the config. It is set by Lookup, never saved,
 	// and only used to name the host in messages.
 	Name string `json:"-"`
+
+	// extra holds keys this version does not know, so a load and save keeps
+	// them (for example fields written by a newer oob).
+	extra map[string]json.RawMessage
+}
+
+// jsonKeys lists the JSON keys of the fields of struct type t.
+func jsonKeys(t reflect.Type) map[string]bool {
+	keys := map[string]bool{}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if n, _, _ := strings.Cut(f.Tag.Get("json"), ","); n != "-" {
+			if n == "" {
+				n = f.Name
+			}
+			keys[n] = true
+		}
+	}
+	return keys
+}
+
+var hostKeys = jsonKeys(reflect.TypeOf(Host{}))
+
+// splitExtra returns the keys of the JSON object b that are not in known.
+func splitExtra(b []byte, known map[string]bool) (map[string]json.RawMessage, error) {
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(b, &all); err != nil {
+		return nil, err
+	}
+	for k := range all {
+		if known[k] {
+			delete(all, k)
+		}
+	}
+	if len(all) == 0 {
+		return nil, nil
+	}
+	return all, nil
+}
+
+// withExtra adds the unknown keys to the JSON object b.
+func withExtra(b []byte, extra map[string]json.RawMessage) ([]byte, error) {
+	if len(extra) == 0 {
+		return b, nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range extra {
+		if _, ok := m[k]; !ok {
+			m[k] = v
+		}
+	}
+	return json.Marshal(m)
+}
+
+type hostPlain Host
+
+// UnmarshalJSON decodes the known fields and keeps the unknown ones.
+func (h *Host) UnmarshalJSON(b []byte) error {
+	var p hostPlain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	extra, err := splitExtra(b, hostKeys)
+	if err != nil {
+		return err
+	}
+	*h = Host(p)
+	h.extra = extra
+	return nil
+}
+
+// MarshalJSON encodes the known fields and the kept unknown ones.
+func (h Host) MarshalJSON() ([]byte, error) {
+	b, err := json.Marshal(hostPlain(h))
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(b, h.extra)
 }
 
 // Config is the on-disk JSON document.
 type Config struct {
 	Defaults Host            `json:"defaults"`
 	Hosts    map[string]Host `json:"hosts"`
+
+	extra map[string]json.RawMessage // unknown top-level keys, kept on save
+}
+
+type configPlain Config
+
+var configKeys = jsonKeys(reflect.TypeOf(Config{}))
+
+// UnmarshalJSON decodes the known keys and keeps the unknown ones.
+func (c *Config) UnmarshalJSON(b []byte) error {
+	var p configPlain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	extra, err := splitExtra(b, configKeys)
+	if err != nil {
+		return err
+	}
+	*c = Config(p)
+	c.extra = extra
+	return nil
+}
+
+// MarshalJSON encodes the known keys and the kept unknown ones.
+func (c Config) MarshalJSON() ([]byte, error) {
+	b, err := json.Marshal(configPlain(c))
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(b, c.extra)
 }
 
 // ConfigPath returns the config file location: explicit override, env var,
@@ -207,6 +322,9 @@ func (c *Config) merge(h Host) Host {
 	}
 	if h.Cipher == "" {
 		h.Cipher = c.Defaults.Cipher
+	}
+	if h.Type == "" {
+		h.Type = c.Defaults.Type
 	}
 	if h.CharDelayMS == nil {
 		h.CharDelayMS = c.Defaults.CharDelayMS

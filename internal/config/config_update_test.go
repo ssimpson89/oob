@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -81,4 +82,37 @@ func containsName(s string) bool {
 		}
 	}
 	return false
+}
+
+func TestUnknownKeysSurviveRoundTrip(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "hosts.json")
+	in := `{"future":{"a":1},"defaults":{"user":"u","dflt_new":true},"hosts":{"n1":{"ip":"192.0.2.1","host_new":"x"}}}`
+	if err := os.WriteFile(p, []byte(in), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := updateConfigAt(p, func(c *Config) error {
+		h := c.Hosts["n1"]
+		h.Notes = "hi"
+		c.Hosts["n1"] = h
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	for _, want := range []string{`"future"`, `"dflt_new"`, `"host_new"`, `"notes": "hi"`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("missing %s in %s", want, b)
+		}
+	}
+}
+
+func TestDefaultsTypeApplies(t *testing.T) {
+	c := &Config{Defaults: Host{Type: "ilo"}, Hosts: map[string]Host{"a": {IP: "192.0.2.1"}, "b": {IP: "192.0.2.2", Type: "idrac"}}}
+	if _, h, _ := c.Lookup("a"); h.Type != "ilo" {
+		t.Errorf("a type %q", h.Type)
+	}
+	if _, h, _ := c.Lookup("b"); h.Type != "idrac" {
+		t.Errorf("b type %q", h.Type)
+	}
 }
