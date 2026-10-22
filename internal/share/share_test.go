@@ -909,9 +909,8 @@ func working(c *Client) bool { return c.Window().Status().Working }
 func leaseHeld(t *testing.T, c *Client) (held bool, id int) {
 	t.Helper()
 	h := hubOf(t, c)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.lease, h.leaseID
+	inHub(t, h, func() { held, id = h.lease, h.leaseID })
+	return held, id
 }
 
 func TestACancelledLeaseDoesNotLeaveTheHubHoldingTheKeyboard(t *testing.T) {
@@ -1110,9 +1109,9 @@ func TestAnUnfinishedKeyAtTheHubTimesOutAndTypingGoesOn(t *testing.T) {
 	// The hub shows its note when it gives up on the key: wait for that, not a guess at how long it takes.
 	h := hubOf(t, win)
 	eventually(t, "the hub gave up on the key", func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		return h.keysNoted
+		var noted bool
+		h.query(func() { noted = h.keysNoted })
+		return noted
 	})
 	win.Enqueue([]byte("C"))
 	eventually(t, "the next key is typed, not eaten", func() bool { return f.got() == "C" })
@@ -1254,7 +1253,11 @@ func TestOwnerDisconnectOverADirtyLineHangsUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "the line is typed", func() bool { return f.got() == "reboot" })
-	eventually(t, "the line is dirty", func() bool { return win.holder.hub.lineDirty.Load() })
+	eventually(t, "the line is dirty", func() bool {
+		var dirty bool
+		win.holder.hub.query(func() { win.holder.hub.drain(); dirty = win.holder.hub.lineDirty })
+		return dirty
+	})
 	if err := win.Transport().Link.Disconnect(); err != nil {
 		t.Fatal(err)
 	}
@@ -1279,8 +1282,8 @@ func TestOwnerDisconnectOverACleanLineDisconnects(t *testing.T) {
 	}
 }
 
-// An urgent write's endpoint is recorded before the bytes can be written, so
-// it is not counted twice: once everything is out, enqCount equals wrote.
+// An urgent write's bytes are accounted for once: when everything is out,
+// every byte that was handed to the typer has been matched with one written.
 func TestUrgentWriteIsCountedOnce(t *testing.T) {
 	env(t)
 	f := newFake()
@@ -1292,9 +1295,9 @@ func TestUrgentWriteIsCountedOnce(t *testing.T) {
 	}
 	eventually(t, "every ctrl+c is written", func() bool { return len(f.got()) == n })
 	eventually(t, "counts agree", func() bool {
-		h.enqMu.Lock()
-		defer h.enqMu.Unlock()
-		return h.enqCount == h.wrote.Load()
+		var agree bool
+		h.query(func() { h.drain(); agree = len(h.segs) == 0 && h.wrote == n })
+		return agree
 	})
 }
 
@@ -1320,19 +1323,15 @@ func TestWindowClearIsRefusedWhileBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := win.holder.hub
-	h.enq([]byte("abc")) // "a" goes out, "bc" waits out the first gap
+	inHub(t, h, func() { h.enqueue([]byte("abc"), byUser, nil) }) // "a" goes out, "bc" waits out the first gap
 	eventually(t, "the first byte is out", func() bool { return f.got() == "a" })
-	h.mu.Lock()
-	h.busy++
-	h.mu.Unlock()
+	inHub(t, h, func() { h.busy++ })
 	other.Clear()
 	time.Sleep(200 * time.Millisecond)
 	if q := h.ty.Queued(); q != 2 {
 		t.Fatalf("queued %d after a clear while busy, want 2 kept", q)
 	}
-	h.mu.Lock()
-	h.busy--
-	h.mu.Unlock()
+	inHub(t, h, func() { h.busy-- })
 	other.Clear()
 	eventually(t, "the clear goes through once idle", func() bool { return h.ty.Queued() == 0 })
 }

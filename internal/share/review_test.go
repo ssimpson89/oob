@@ -30,12 +30,25 @@ func agentPeer(t *testing.T, h *hub) *peer {
 	t.Helper()
 	var p *peer
 	eventually(t, "the agent joined", func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		p = h.agent
+		h.query(func() { p = h.agent })
 		return p != nil
 	})
 	return p
+}
+
+// inHub runs f in the hub's loop, where its state may be read and changed.
+func inHub(t *testing.T, h *hub, f func()) {
+	t.Helper()
+	if !h.query(f) {
+		t.Fatal("the hub has shut down")
+	}
+}
+
+// leaseNow asks the hub for p's lease, as p's request would.
+func leaseNow(t *testing.T, h *hub, p *peer, id int) (err error) {
+	t.Helper()
+	inHub(t, h, func() { err = h.agentOp(p, msg{Op: opLease, Lease: id}) })
+	return err
 }
 
 func (f *fakeConsole) set(fn func()) { f.mu.Lock(); fn(); f.mu.Unlock() }
@@ -59,18 +72,18 @@ func TestAFailedWriteIsNotCountedAsTypedAndItsErrorIsKnownToTheWriter(t *testing
 	if err == nil || !strings.Contains(err.Error(), "link down") {
 		t.Fatalf("Type over a failing link = %v, want the link's error", err)
 	}
-	if n := h.wrote.Load(); n != 0 {
-		t.Errorf("hub counted %d bytes as typed after a failed write", n)
-	}
-	if h.lineDirty.Load() {
-		t.Error("a failed write marked the line dirty")
-	}
-	h.mu.Lock()
-	got := h.txErr
-	h.mu.Unlock()
-	if got == nil {
-		t.Error("txErr not set")
-	}
+	inHub(t, h, func() {
+		h.drain()
+		if h.wrote != 0 {
+			t.Errorf("hub counted %d bytes as typed after a failed write", h.wrote)
+		}
+		if h.lineDirty {
+			t.Error("a failed write marked the line dirty")
+		}
+		if h.txErr == nil {
+			t.Error("txErr not set")
+		}
+	})
 }
 
 // What the AI tool types at a password prompt never reaches the windows, even
@@ -129,12 +142,13 @@ func TestALeaseForAClientThatHasLeftIsRefused(t *testing.T) {
 	win := host(t, f, Options{NoLinger: true})
 	h := hubOf(t, win)
 	ghost := &peer{agent: true, name: "gone"}
-	if err := h.agentOp(ghost, msg{Op: opLease, Lease: 1}); !errors.Is(err, errGone) {
-		t.Fatalf("lease for a peer that isn't registered = %v, want errGone", err)
-	}
-	h.mu.Lock()
-	leased := h.lease
-	h.mu.Unlock()
+	var leased bool
+	inHub(t, h, func() {
+		if err := h.agentOp(ghost, msg{Op: opLease, Lease: 1}); !errors.Is(err, errGone) {
+			t.Errorf("lease for a peer that isn't registered = %v, want errGone", err)
+		}
+		leased = h.lease
+	})
 	if leased {
 		t.Fatal("the hub holds the keyboard for a client that isn't there")
 	}
@@ -145,12 +159,12 @@ func TestALeaseForAClientThatHasLeftIsRefused(t *testing.T) {
 	// Also once the hub is closed.
 	ai := agent(t)
 	p := agentPeer(t, h)
-	h.mu.Lock()
-	h.closed = true
-	h.mu.Unlock()
-	if err := h.agentOp(p, msg{Op: opLease, Lease: 2}); err == nil {
-		t.Error("a lease was granted on a closed hub")
-	}
+	inHub(t, h, func() {
+		h.end(console.Result{})
+		if err := h.agentOp(p, msg{Op: opLease, Lease: 2}); err == nil {
+			t.Error("a lease was granted on a closed hub")
+		}
+	})
 	_ = ai
 }
 
@@ -165,9 +179,8 @@ func TestCancelledLeaseIDsAreKeptPerClientAndForgottenWhenItLeaves(t *testing.T)
 	w := rawAgent(t)
 	_ = w.send(msg{T: tReq, ID: 1, Op: opRelease, Lease: 7})
 	reply(t, w, 1)
-	h.mu.Lock()
-	n := len(h.cancelled)
-	h.mu.Unlock()
+	var n int
+	inHub(t, h, func() { n = len(h.cancelled) })
 	if n != 1 {
 		t.Fatalf("%d cancelled ids recorded, want 1", n)
 	}
@@ -181,9 +194,9 @@ func TestCancelledLeaseIDsAreKeptPerClientAndForgottenWhenItLeaves(t *testing.T)
 	reply(t, w, 3)
 	_ = w.w.(io.Closer).Close()
 	eventually(t, "the hub forgot the client", func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		return h.agent == nil && len(h.cancelled) == 0
+		var gone bool
+		h.query(func() { gone = h.agent == nil && len(h.cancelled) == 0 })
+		return gone
 	})
 	// The next client's lease 8 is its own.
 	w2 := rawAgent(t)
@@ -206,14 +219,12 @@ func TestLeaseIsRefusedWhileTheTyperHasPendingInput(t *testing.T) {
 	win.Enqueue([]byte("a\r"))
 	win.Enqueue([]byte("b\r"))
 	eventually(t, "queued", func() bool { return h.ty.Queued() > 0 })
-	h.mu.Lock()
-	h.lastKey, h.userTyped = time.Time{}, 0 // the typing window is over: only the queue speaks
-	h.mu.Unlock()
-	if err := h.agentOp(p, msg{Op: opLease, Lease: 5}); !errors.Is(err, ErrTyping) {
+	inHub(t, h, func() { h.lastKey, h.userTyped = time.Time{}, 0 }) // the typing window is over: only the queue speaks
+	if err := leaseNow(t, h, p, 5); !errors.Is(err, ErrTyping) {
 		t.Fatalf("lease with input pending = %v, want ErrTyping", err)
 	}
 	eventually(t, "typed", func() bool { return h.ty.Queued() == 0 })
-	if err := h.agentOp(p, msg{Op: opLease, Lease: 6}); err != nil {
+	if err := leaseNow(t, h, p, 6); err != nil {
 		t.Errorf("lease once the queue is empty: %v", err)
 	}
 	_ = ai

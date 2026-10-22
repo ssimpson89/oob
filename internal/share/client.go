@@ -269,6 +269,16 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 	h.addr, h.typ = c.opt.Addr, c.opt.Type
 	ho := &holder{hub: h, lock: lockFile}
 	if lockFile != nil {
+		h.unlock = func() { unlock(lockFile) }
+	}
+	// Whatever fails from here on has opened the console at the BMC: it is
+	// closed and released, and the lock goes once that is done.
+	fail := func(err error) error {
+		h.shutdown()
+		h.release()
+		return err
+	}
+	if lockFile != nil {
 		_ = os.Remove(sock) // left by an oob that died; ours now that we hold the lock
 		ln, err := net.Listen("unix", sock)
 		if err == nil {
@@ -278,14 +288,34 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 			if ln != nil {
 				ln.Close()
 			}
-			h.shutdown()
-			unlock(lockFile)
-			return fmt.Errorf("can't share this console: %w", err)
+			return fail(fmt.Errorf("can't share this console: %w", err))
 		}
 		ho.ln = ln
+		h.onClose = func() { ln.Close() }
+	}
+	// This process's own client joins before anyone else is let in, so its
+	// agent or window slot can't be taken by a client of the socket first.
+	mine, theirs := net.Pipe()
+	go h.serve(theirs, true)
+	c.mu.Lock()
+	c.holder = ho
+	c.mu.Unlock()
+	if hostHook != nil {
+		hostHook("listening", h)
+	}
+	if err := c.hello(mine); err != nil {
+		c.mu.Lock()
+		c.holder = nil
+		c.mu.Unlock()
+		return fail(err)
+	}
+	if hostHook != nil {
+		hostHook("joined", h)
+	}
+	if ho.ln != nil {
 		go func() {
 			for {
-				conn, err := ln.Accept()
+				conn, err := ho.ln.Accept()
 				if err != nil {
 					return
 				}
@@ -293,30 +323,14 @@ func (c *Client) host(lockFile *os.File, sock string) error {
 			}
 		}()
 	}
-	h.onClose = func() {
-		if ho.ln != nil {
-			ho.ln.Close()
-		}
-	}
-	if ho.lock != nil {
-		h.unlock = func() { unlock(ho.lock) }
-	}
-	mine, theirs := net.Pipe()
-	go h.serve(theirs, true)
-	c.mu.Lock()
-	c.holder = ho
-	c.mu.Unlock()
-	if err := c.hello(mine); err != nil {
-		c.mu.Lock()
-		c.holder = nil
-		c.mu.Unlock()
-		h.shutdown()
-		h.unlockHost() // nothing was typed or opened at the BMC for anyone: no release to wait for
-		return err
-	}
 	go c.run()
 	return nil
 }
+
+// hostHook, if set, is called at two points of opening a console, so a test can
+// act there: "listening" (the socket is up, no one is served yet) and "joined"
+// (this process's own client is in; the socket is about to be served).
+var hostHook func(stage string, h *hub)
 
 func (c *Client) join(sock string) error {
 	if err := checkSocket(sock); err != nil {
@@ -760,10 +774,7 @@ func (c *Client) Release() {
 	if ho == nil {
 		return
 	}
-	ho.hub.mu.Lock()
-	linger := ho.hub.orphan && !ho.hub.closed
-	ho.hub.mu.Unlock()
-	if !linger {
+	if !ho.hub.lingering() {
 		ho.hub.release()
 	}
 }
