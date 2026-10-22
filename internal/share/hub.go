@@ -575,9 +575,14 @@ func (h *hub) enq(b []byte) <-chan struct{} {
 
 // dropQueued drops what is queued and returns the part of the AI tool's
 // write in flight that was already typed. Call without mu.
-func (h *hub) dropQueued() (typed []byte) {
+func (h *hub) dropQueued() []byte {
 	h.enqMu.Lock()
 	defer h.enqMu.Unlock()
+	return h.dropQueuedLocked()
+}
+
+// dropQueuedLocked is dropQueued with enqMu held.
+func (h *hub) dropQueuedLocked() (typed []byte) {
 	h.ty.Clear()
 	w := h.wrote.Load()
 	if f := h.flight; f != nil {
@@ -706,12 +711,18 @@ func (h *hub) dropFragment(p *peer) {
 }
 
 // userClear is the window's x key: drop what is queued to be typed.
+//
+// enqMu is held from the check to the clear: a lease cannot be granted in
+// between (it takes enqMu too) and drop the AI tool's queue. An exclusive link
+// operation already running (busy) refuses the clear as it refuses typing.
 func (h *hub) userClear(p *peer) {
+	h.enqMu.Lock()
+	defer h.enqMu.Unlock()
 	h.mu.Lock()
-	skip := p.agent || h.lease || h.closed
+	skip := p.agent || h.lease || h.busy > 0 || h.closed
 	h.mu.Unlock()
 	if !skip {
-		h.dropQueued()
+		h.dropQueuedLocked()
 	}
 }
 

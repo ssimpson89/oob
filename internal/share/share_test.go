@@ -1275,3 +1275,42 @@ func TestUrgentWriteIsCountedOnce(t *testing.T) {
 		return h.enqCount == h.wrote.Load()
 	})
 }
+
+// A window's x while an exclusive link operation runs (busy) is refused, like
+// its typing; once the operation is over it clears.
+func TestWindowClearIsRefusedWhileBusy(t *testing.T) {
+	env(t)
+	f := newFake()
+	long := time.Hour
+	opt := Options{Host: "node01", NoLinger: true}
+	opt.Open = func() (*console.Transport, error) {
+		tr := f.transport()
+		tr.Pacing = console.Pacing{Char: &long, Line: &long}
+		return tr, nil
+	}
+	win, err := Open(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { win.Close() })
+	other, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := win.holder.hub
+	h.enq([]byte("abc")) // "a" goes out, "bc" waits out the first gap
+	eventually(t, "the first byte is out", func() bool { return f.got() == "a" })
+	h.mu.Lock()
+	h.busy++
+	h.mu.Unlock()
+	other.Clear()
+	time.Sleep(200 * time.Millisecond)
+	if q := h.ty.Queued(); q != 2 {
+		t.Fatalf("queued %d after a clear while busy, want 2 kept", q)
+	}
+	h.mu.Lock()
+	h.busy--
+	h.mu.Unlock()
+	other.Clear()
+	eventually(t, "the clear goes through once idle", func() bool { return h.ty.Queued() == 0 })
+}
