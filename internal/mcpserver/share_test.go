@@ -308,3 +308,27 @@ func TestAgentTypingAtTheBMCPromptAWindowSwitchedToNeedsApproval(t *testing.T) {
 		t.Errorf("the host ran %q", got)
 	}
 }
+
+// The approval was for joining the user's console. If it is gone by the time
+// the join runs, the agent doesn't fall back to opening it, which would end
+// the BMC's other session: that needs its own approval.
+func TestJoinApprovalDoesNotBecomeAForcedOpen(t *testing.T) {
+	h := start(t, Options{}, "accept")
+	f := newFakeHost(t, "node01")
+	user, err := share.Open(context.Background(), share.Options{Host: "node01", Addr: "192.0.2.11:22", Type: "ipmi", NoLinger: true,
+		Open: func() (*bmc.ConsoleTransport, error) { return f.transport(), nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { user.Close() })
+	old := beforeShareOpen
+	t.Cleanup(func() { beforeShareOpen = old })
+	beforeShareOpen = func() { user.Close(); eventually(t, "the console closes", f.isClosed) } // the window ends after the approval
+	out, isErr := h.call("connect", map[string]any{"host": "node01"})
+	if !isErr || !strings.Contains(out, "the shared console closed; call connect again") {
+		t.Fatalf("connect: %q %v", out, isErr)
+	}
+	if c := h.called(); strings.Contains(c, "open console") {
+		t.Errorf("the console was opened after a join-only approval: %q", c)
+	}
+}

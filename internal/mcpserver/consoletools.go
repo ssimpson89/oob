@@ -266,6 +266,10 @@ func pattern(q string) *regexp.Regexp {
 	return regexp.MustCompile(expr)
 }
 
+// beforeShareOpen is a test hook that runs after the approval and before the
+// console is joined or opened.
+var beforeShareOpen = func() {}
+
 func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in connectIn) (*mcp.CallToolResult, any, error) {
 	name, h, err := s.hostFor(in.Host, true)
 	if err != nil {
@@ -325,6 +329,7 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		cl  *share.Client
 		err error
 	}
+	beforeShareOpen()
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	ch := make(chan opened, 1)
@@ -335,6 +340,9 @@ func (s *server) connect(ctx context.Context, req *mcp.CallToolRequest, in conne
 		// otherwise open it here, and a window opened later joins this one.
 		cl, err := share.Open(ctx, share.Options{Host: name, Addr: addr, Type: typ, Agent: true, Name: who,
 			Open: func() (*bmc.ConsoleTransport, error) {
+				if joining { // the approval was for joining, not for taking the console over
+					return nil, errors.New("the shared console closed; call connect again")
+				}
 				return s.be.Driver(name, h).OpenConsole(bmc.OpenConsoleOptions{Rows: ptyRows, Cols: ptyCols, Force: in.Force})
 			}})
 		ch <- opened{cl, err}
