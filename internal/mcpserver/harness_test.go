@@ -130,6 +130,7 @@ type fakeHost struct {
 	stuck       bool          // Send blocks, like an SSH channel that stopped taking input, until Close
 	unstick     chan struct{} // closed by Close
 	unstickOnce sync.Once
+	blocked     chan struct{} // receives once each time a Send blocks because the host is stuck
 
 	writes, maxWrite int           // Send calls and the longest one, to see whether a line is typed in one burst
 	sendDelay        time.Duration // each Send takes this long, like a slow serial link
@@ -146,7 +147,7 @@ func newFakeHost(t *testing.T, name string) *fakeHost {
 // banner with no prompt after it, as a console opened on a quiet serial port
 // looks.
 func newFakeHostShowing(t *testing.T, name, initial string) *fakeHost {
-	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), unstick: make(chan struct{}), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
+	f := &fakeHost{t: t, name: name, outq: make(chan []byte, 4096), unstick: make(chan struct{}), blocked: make(chan struct{}, 16), done: make(chan console.Result, 1), prompt: "[root@" + name + " ~]# "}
 	f.pr, f.pw = io.Pipe()
 	go func() {
 		for b := range f.outq {
@@ -175,6 +176,10 @@ func (f *fakeHost) Send(b []byte) error {
 	f.mu.Lock()
 	if f.stuck {
 		f.mu.Unlock()
+		select {
+		case f.blocked <- struct{}{}:
+		default:
+		}
 		<-f.unstick
 		return io.ErrClosedPipe
 	}

@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -713,3 +714,96 @@ func TestDisconnectWithPendingInputHangsUp(t *testing.T) {
 		t.Errorf("clean line: hangups=%d disconnects=%d, want 0 and 1", hl2.hangups, hl2.disconnects)
 	}
 }
+
+// blockLink's Send blocks until the link is closed (Hangup), like a BMC that
+// stopped accepting input.
+type blockLink struct {
+	hangLink
+	closed  chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *blockLink) Send(p []byte) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.closed
+	return errors.New("link closed")
+}
+
+func (b *blockLink) Hangup() error {
+	_ = b.hangLink.Hangup()
+	select {
+	case <-b.closed:
+	default:
+		close(b.closed)
+	}
+	return nil
+}
+
+// Disconnect must not wait for a writer stuck in Send: it stops the queue and
+// closes the transport itself.
+func TestDisconnectDoesNotWaitOnBlockedSend(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "sol", 24, 80)
+	con.Start()
+	defer con.Close()
+	bl := &blockLink{closed: make(chan struct{}), entered: make(chan struct{})}
+	k := newKeys(&Setup{Link: bl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	esc := string(rune(escapeByte))
+
+	k.Input([]byte("reboot\r"))
+	select {
+	case <-bl.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send never reached the link")
+	}
+	done := make(chan struct{})
+	go func() { k.Input([]byte(esc + ".")); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("disconnect waited on the blocked writer")
+	}
+	select {
+	case <-bl.closed:
+	default:
+		t.Error("transport was not closed")
+	}
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	if bl.hangups != 1 {
+		t.Errorf("hangups = %d, want 1", bl.hangups)
+	}
+}
+
+// A clean-line Disconnect that itself blocks is bounded: after disconnectWait
+// the link is hung up.
+func TestDisconnectHangsUpWhenLinkDisconnectBlocks(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	old := disconnectWait
+	disconnectWait = 50 * time.Millisecond
+	defer func() { disconnectWait = old }()
+	var out bytes.Buffer
+	con := newConsole(&out, "h", "sol", 24, 80)
+	con.Start()
+	defer con.Close()
+	dl := &stuckDisconnect{closed: make(chan struct{})}
+	k := newKeys(&Setup{Link: dl}, con, func() {}, make(chan struct{}))
+	k.start(nil)
+	k.Input([]byte(string(rune(escapeByte)) + "."))
+	select {
+	case <-dl.closed:
+	default:
+		t.Error("transport was not closed")
+	}
+}
+
+type stuckDisconnect struct {
+	hangLink
+	closed chan struct{}
+}
+
+func (s *stuckDisconnect) Disconnect() error { <-s.closed; return nil }
+func (s *stuckDisconnect) Hangup() error     { close(s.closed); return nil }

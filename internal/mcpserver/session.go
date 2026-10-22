@@ -59,6 +59,7 @@ type session struct {
 	stopTy context.CancelFunc
 	txErr  error // guarded by mu
 	wrote  int   // bytes the link has taken, ever; guarded by mu
+	inSend bool  // the typer is inside the link's Send; guarded by mu
 
 	// sendMu lets one tool at a time type, including while it waits for the
 	// answer. Reads don't take it.
@@ -77,7 +78,8 @@ type session struct {
 	lastEsc   bool   // the last byte sent was ESC
 	breakAt   time.Time
 	lastUsed  time.Time
-	ended     bool
+	ended     bool // nothing more can be typed
+	marked    bool // the end is in the transcript, with its exit status
 	endMsg    string
 	changed   chan struct{} // closed and replaced whenever something arrives
 	logPath   string
@@ -118,8 +120,12 @@ func newSession(id, host string, tr *bmc.ConsoleTransport, tx *console.Transcrip
 // runTyper types the session's queue at the transport's link, when no hub does.
 func (c *session) runTyper(ctx context.Context, tr *bmc.ConsoleTransport) {
 	_ = c.ty.Run(ctx, writerFunc(func(b []byte) (int, error) {
+		c.mu.Lock()
+		c.inSend = true
+		c.mu.Unlock()
 		err := tr.Link.Send(b)
 		c.mu.Lock()
+		c.inSend = false
 		if err != nil {
 			c.txErr = err
 		} else {
@@ -140,12 +146,28 @@ func (c *session) drain() {
 			c.feed(buf[:n])
 		}
 		if err != nil {
+			// Nothing more will arrive, so nothing typed now can be checked
+			// against what the console shows: a stale prompt would wave the
+			// rest of a batch through. Stop the input and refuse new sends
+			// before anyone waiting on eofC can act on the hang-up.
+			c.endInput()
 			close(c.eofC)
-			select { // the exit status is worth a moment
+			select { // the exit status is worth a moment, collected apart from that
 			case <-c.doneC:
 			case <-time.After(2 * time.Second):
 			}
 			c.markEnded()
+			// A write still stuck in the link will never finish: the console
+			// is gone, and the typer is not waited on. Close the transport so
+			// the write fails and its goroutine ends. Not waited for, since
+			// closing can be slow; Release and the final Close stay with
+			// closeTransport, which runs the teardown once.
+			c.mu.Lock()
+			stuck := c.inSend
+			c.mu.Unlock()
+			if stuck {
+				go c.trOnce.Do(c.tr.Close)
+			}
 			return
 		}
 	}
@@ -178,15 +200,30 @@ func (c *session) feed(b []byte) {
 	c.notifyLocked()
 }
 
-// markEnded records that the transport has gone.
+// endInput marks the session ended and drops whatever is queued to be typed.
+// When it returns nothing more reaches the console and canSend refuses. The
+// message is provisional until markEnded has the exit status.
+func (c *session) endInput() {
+	c.mu.Lock()
+	if !c.ended {
+		c.ended = true
+		c.endMsg = "the console connection ended"
+	}
+	c.mu.Unlock()
+	c.stopTy()
+	c.ty.Clear() // drops the queue without waiting on the writer, which may be stuck in Send
+}
+
+// markEnded records that the transport has gone, with its exit status if it
+// gave one in time.
 func (c *session) markEnded() {
+	c.endInput()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.ended {
+	if c.marked {
 		return
 	}
-	c.ended = true
-	c.stopTy()
+	c.marked = true
 	switch {
 	case c.result.Err != nil:
 		c.endMsg = "the console connection ended: " + c.result.Err.Error()

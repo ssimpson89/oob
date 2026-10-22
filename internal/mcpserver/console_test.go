@@ -526,3 +526,151 @@ func TestRunLineStopsWhenOutputClosed(t *testing.T) {
 		t.Fatal("runLine kept waiting after the output closed")
 	}
 }
+
+// eofWhileRunning is a host whose "echo one" starts something that keeps
+// running: some output, no prompt.
+func eofWhileRunning(t *testing.T, h *harness) (*fakeHost, *session) {
+	t.Helper()
+	h.setup = func(f *fakeHost) {
+		f.respond = func(f *fakeHost, cmd string) bool {
+			if cmd != "echo one" {
+				return false
+			}
+			f.emit("one\r\nrunning")
+			return true
+		}
+	}
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, c
+}
+
+// closeOutputWhenShown waits until "echo one" has been entered and the
+// console shows non-prompt output, then hangs up the output with no exit
+// status ever sent.
+func closeOutputWhenShown(t *testing.T, f *fakeHost, c *session) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(f.entered()) == 0 || c.line().cursor != "running" {
+		if time.Now().After(deadline) {
+			t.Fatal("the command never showed output")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for len(f.outq) > 0 {
+		time.Sleep(time.Millisecond)
+	}
+	f.pw.Close() // output EOF; Done is withheld
+}
+
+// When the output hangs up while a command is still running, runLine must
+// return at once and without error: it typed the line, and the hang-up is
+// reported by the session, not by the call.
+func TestEOFEndsRunLineWithoutError(t *testing.T) {
+	h := start(t, Options{}, "")
+	f, c := eofWhileRunning(t, h)
+	res := make(chan error, 1)
+	go func() { res <- c.runLine(context.Background(), "echo one", 30*time.Second) }()
+	closeOutputWhenShown(t, f, c)
+	select {
+	case err := <-res:
+		if err != nil {
+			t.Errorf("runLine = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runLine kept waiting after the output closed")
+	}
+}
+
+// When the output hangs up in the middle of a batch, the shell prompt still
+// showing is stale: the rest of the batch must not be typed, and later calls
+// must be refused. The input is stopped before anyone waiting on the hang-up
+// is woken.
+func TestEOFStopsBatchAndRefusesSends(t *testing.T) {
+	h := start(t, Options{}, "")
+	f, c := eofWhileRunning(t, h)
+	type result struct {
+		out   string
+		isErr bool
+	}
+	res := make(chan result, 1)
+	go func() {
+		out, isErr := h.send("s1", "echo one\necho two\necho three")
+		res <- result{out, isErr}
+	}()
+	closeOutputWhenShown(t, f, c)
+	select {
+	case r := <-res:
+		if !strings.Contains(r.out, "Session ended") || !strings.Contains(r.out, "weren't sent") {
+			t.Errorf("batch cut short by EOF did not say so: %q %v", r.out, r.isErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the batch kept waiting after the output closed")
+	}
+	select {
+	case <-c.eofC:
+	default:
+		t.Fatal("output EOF not seen")
+	}
+	if err := c.canSend(); err == nil {
+		t.Error("canSend is nil after output EOF, before the exit status")
+	}
+	if out, isErr := h.send("s1", "echo four"); !isErr {
+		t.Errorf("send after EOF was accepted: %q", out)
+	}
+	if out, isErr := h.keys("s1", "echo five", "enter"); !isErr {
+		t.Errorf("send_keys after EOF was accepted: %q", out)
+	}
+	if got := f.entered(); len(got) != 1 || got[0] != "echo one" {
+		t.Errorf("host ran %q, want only the first line", got)
+	}
+}
+
+// Output EOF while a Send is stuck in the link and no exit status ever comes:
+// draining must not wait on the typer. The end is recorded within the status
+// grace period, and the transport is closed so the stuck write ends.
+func TestEOFWithBlockedSendDoesNotWaitOnTyper(t *testing.T) {
+	h := start(t, Options{}, "")
+	h.connect()
+	f := h.host("node01")
+	c, err := h.srv.session("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.setStuck()
+	res := make(chan error, 1)
+	go func() { res <- c.runLine(context.Background(), "uptime", 30*time.Second) }()
+	select {
+	case <-f.blocked: // the typer is inside Send
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send never blocked")
+	}
+	f.pw.Close() // output EOF; Done is withheld
+	select {
+	case <-c.eofC:
+	case <-time.After(time.Second):
+		t.Fatal("output EOF not seen: the drain waited on the blocked writer")
+	}
+	select {
+	case <-res:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the send kept waiting after the output closed")
+	}
+	deadline := time.Now().Add(6 * time.Second) // the 2s status wait, then the end is recorded
+	for {
+		c.mu.Lock()
+		marked := c.marked
+		c.mu.Unlock()
+		if marked && f.isClosed() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("end recorded %v, transport closed %v; want both", marked, f.isClosed())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
