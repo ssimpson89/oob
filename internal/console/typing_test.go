@@ -374,6 +374,8 @@ func TestCtrlXClearsTheQueue(t *testing.T) {
 		t.Fatalf("sending %q, pending %d; want progress on the bar", r.state().sending, r.con.Pending())
 	}
 	r.k.Input([]byte(string(rune(escapeByte)) + "x"))
+	// Clear no longer waits for Run, so the bar catches up a moment later.
+	settle(r.con)
 	if r.con.Pending() != 0 || r.state().sending != "" {
 		t.Errorf("pending %d, sending %q after ctrl+] x", r.con.Pending(), r.state().sending)
 	}
@@ -396,6 +398,7 @@ func TestCtrlCJumpsTheQueue(t *testing.T) {
 	if got := g.text(); got != "x\x03" {
 		t.Errorf("sent %q, want x then ctrl+c", got)
 	}
+	settle(r.con)
 	if r.con.Pending() != 0 {
 		t.Errorf("pending %d, want the queue dropped", r.con.Pending())
 	}
@@ -766,6 +769,14 @@ func TestLineStaysDirtyWhileCtrlCIsInFlight(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("line still dirty after ctrl+c was sent")
 		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// settle waits for the bar's pending count to reach zero. Clear and Urgent
+// don't wait for Run, so the bar is told a moment after they return.
+func settle(c *console) {
+	for deadline := time.Now().Add(5 * time.Second); c.Pending() != 0 && time.Now().Before(deadline); {
 		time.Sleep(time.Millisecond)
 	}
 }
