@@ -121,8 +121,11 @@ func (k *consoleKeys) start(tr *trace) {
 	guard(k.cleanup, func() {
 		w := writerFunc(func(b []byte) (int, error) {
 			tr.log("TX", b)
-			k.track(b)
-			return len(b), k.cs.Link.Send(b)
+			if err := k.cs.Link.Send(b); err != nil {
+				return 0, err
+			}
+			k.track(b) // only once it is out: the line stays dirty while a ctrl+c is in flight
+			return len(b), nil
 		})
 		if err := k.ty.Run(ctx, w); ctx.Err() == nil {
 			k.con.Note("typing stopped: "+err.Error(), true)

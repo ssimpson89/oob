@@ -1,6 +1,7 @@
 package bmc
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -48,5 +49,36 @@ func TestSOLDisconnectSendsEscape(t *testing.T) {
 	b, _ := io.ReadAll(r)
 	if string(b) != "\r\x1e." {
 		t.Errorf("Disconnect wrote %q", b)
+	}
+}
+
+func TestSOLExitCodeAfterHangup(t *testing.T) {
+	killed := func() *exec.ExitError {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		_ = cmd.Process.Kill()
+		var ee *exec.ExitError
+		if !errors.As(cmd.Wait(), &ee) {
+			t.Fatal("kill was not an exit error")
+		}
+		return ee
+	}()
+	if got := solExitCode(killed, true); got != 0 {
+		t.Errorf("hangup kill: code %d, want 0", got)
+	}
+	if got := solExitCode(killed, false); got != 1 {
+		t.Errorf("kill without hangup: code %d, want 1", got)
+	}
+	failed := func() *exec.ExitError {
+		var ee *exec.ExitError
+		if !errors.As(exec.Command("sh", "-c", "exit 3").Run(), &ee) {
+			t.Fatal("no exit error")
+		}
+		return ee
+	}()
+	if got := solExitCode(failed, true); got != 3 {
+		t.Errorf("real error after hangup: code %d, want 3", got)
 	}
 }

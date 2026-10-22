@@ -184,11 +184,35 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 		}
 		return nil
 	}
+	serveUrgent := func(b []byte) error {
+		drop()
+		if err := write(b); err != nil {
+			return err
+		}
+		if d := gap(b[len(b)-1], nil); d > 0 {
+			hold = wait(d)
+		}
+		return nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// Service Urgent and Clear before every write, so a ctrl+c lands
+		// between bytes even when no delay would have yielded to it.
 		if len(q) > 0 && hold == nil {
+			select {
+			case b := <-t.urgent:
+				if err := serveUrgent(b); err != nil {
+					return err
+				}
+				continue
+			case ack := <-t.clear:
+				drop()
+				close(ack)
+				continue
+			default:
+			}
 			n := 1
 			if !paced() {
 				n = len(q) // one write, as a plain writer would
@@ -223,12 +247,8 @@ func (t *Typer) Run(ctx context.Context, w io.Writer) error {
 			waiters = append(waiters, waiter{sent + len(q), it.done})
 			progress()
 		case b := <-t.urgent:
-			drop()
-			if err := write(b); err != nil {
+			if err := serveUrgent(b); err != nil {
 				return err
-			}
-			if d := gap(b[len(b)-1], nil); d > 0 {
-				hold = wait(d)
 			}
 		case ack := <-t.clear:
 			drop()
