@@ -74,8 +74,8 @@ func TestNoWayAroundTheChecks(t *testing.T) {
 		{"typed text ending like a prompt", func(h *harness) { h.keys("s1", "reboot #") }, "send_command", map[string]any{"line": "uname -r"}},
 		{"enter after text typed earlier", func(h *harness) { h.keys("s1", "sudo reboot") }, "send_keys", map[string]any{"keys": []string{"enter"}}},
 		{"text key by key", nil, "send_keys", map[string]any{"text": "reboo", "keys": []string{"t", "enter"}}},
-		{"answering a question nobody approved", func(h *harness) { h.send("s1", "dnf install foo") }, "send_keys", map[string]any{"text": "y", "keys": []string{"enter"}}},
-		{"answering with send_command", func(h *harness) { h.send("s1", "dnf install foo") }, "send_command", map[string]any{"line": "y"}},
+		{"answering a question nobody approved", func(h *harness) { h.unaskedQuestion() }, "send_keys", map[string]any{"text": "y", "keys": []string{"enter"}}},
+		{"answering with send_command", func(h *harness) { h.unaskedQuestion() }, "send_command", map[string]any{"line": "y"}},
 		{"recalled line", func(h *harness) { h.keys("s1", "", "up") }, "send_keys", map[string]any{"keys": []string{"enter"}}},
 		{"firmware key", nil, "send_keys", map[string]any{"keys": []string{"f10"}}},
 		{"bootloader prompt", func(h *harness) { h.send("s1", "grub") }, "send_command", map[string]any{"line": "boot"}},
@@ -109,16 +109,31 @@ func TestNoWayAroundTheChecks(t *testing.T) {
 }
 
 func TestAnsweringAQuestion(t *testing.T) {
-	// A question raised by a command nobody approved: answering yes needs the user.
+	// A question no command of ours raised (the user's own, say): answering yes needs the user.
 	h := start(t, Options{}, "accept")
 	h.connect()
-	h.send("s1", "dnf install foo")
+	h.unaskedQuestion()
 	h.keys("s1", "y", "enter")
 	if !strings.Contains(h.askedAll(), "answers the host's question") {
 		t.Errorf("the answer wasn't questioned: %q", h.askedAll())
 	}
-	if got := strings.Join(h.host("node01").entered(), "|"); got != "dnf install foo|y" {
+	if got := strings.Join(h.host("node01").entered(), "|"); got != "y" {
 		t.Errorf("host got %q", got)
+	}
+
+	// A question raised by a command that needed no approval: answering it needs none either.
+	h = start(t, Options{}, "")
+	h.connect()
+	h.send("s1", "dnf install foo")
+	if out, isErr := h.keys("s1", "y", "enter"); isErr || len(h.asked) != 0 {
+		t.Errorf("answering a harmless command's question asked or failed: %q %v %v", out, isErr, h.asked)
+	}
+	// ... and the same through send_command.
+	h = start(t, Options{}, "")
+	h.connect()
+	h.send("s1", "dnf install foo")
+	if out, isErr := h.send("s1", "y"); isErr || len(h.asked) != 0 {
+		t.Errorf("answering with send_command asked or failed: %q %v %v", out, isErr, h.asked)
 	}
 
 	// A question raised by a command the user approved: answering it needs nothing more.
@@ -147,7 +162,7 @@ func TestAnsweringAQuestion(t *testing.T) {
 	}{{"n", []string{"enter"}}, {"no", []string{"enter"}}, {"", []string{"ctrl+c"}}} {
 		h := start(t, Options{}, "")
 		h.connect()
-		h.send("s1", "dnf install foo")
+		h.unaskedQuestion()
 		if out, isErr := h.keys("s1", c.text, c.keys...); isErr {
 			t.Errorf("%q %v was refused: %q", c.text, c.keys, out)
 		}
@@ -399,4 +414,18 @@ func TestBMCPromptGoesByTheSharedConsolesState(t *testing.T) {
 	if out, isErr := h.call("bmc_prompt", map[string]any{"session": "s1", "to": "bmc"}); isErr || !strings.Contains(out, "Now at ilo cli") {
 		t.Errorf("to bmc: %q %v", out, isErr)
 	}
+}
+
+// unaskedQuestion has the host print a yes/no question that no command sent
+// through the session raised.
+func (h *harness) unaskedQuestion() {
+	f := h.host("node01")
+	f.mu.Lock()
+	f.asking = "y"
+	f.mu.Unlock()
+	f.emit("Is this ok [y/N]: ")
+	eventually(h.t, "the question is shown", func() bool {
+		c, _ := h.srv.session("s1")
+		return c.line().confirming()
+	})
 }

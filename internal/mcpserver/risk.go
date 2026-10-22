@@ -141,7 +141,7 @@ const (
 	whyNetwork = "can cut the host off the network"
 	whyPackage = "removes software from the host"
 	whySysrq   = "triggers a kernel SysRq action, which can crash, reboot or sync-and-halt the host"
-	whyAnswer  = "answers the host's question (a yes/no prompt that no approved command raised)"
+	whyAnswer  = "answers the host's question (a yes/no prompt that no command sent through this session raised)"
 	whyBoot    = "is typed at a bootloader or firmware prompt, where commands can boot, erase or replace the software"
 	whyRecall  = "runs a line edited with cursor or editing keys, recalled from history or completed with tab, which can't be read for certain"
 	whyBreak   = "sends a serial BREAK: on Linux the next key typed is a SysRq command, and b reboots at once"

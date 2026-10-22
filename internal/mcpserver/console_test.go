@@ -63,18 +63,18 @@ func TestConsoleSessionLifecycle(t *testing.T) {
 	if out, _ := h.call("read_output", map[string]any{"session": "s1", "wait_seconds": 0.2, "until": "never appears"}); !strings.Contains(out, "didn't appear") {
 		t.Errorf("until that never comes: %q", out)
 	}
-	out, _ = h.call("read_history", map[string]any{"session": "s1", "lines": 5})
+	out, _ = h.call("read_output", map[string]any{"session": "s1", "lines": 5})
 	if !strings.Contains(out, "5.14.0-test") || len(strings.Split(out, "\n")) > 5 {
 		t.Errorf("read_history: %q", out)
 	}
-	out, _ = h.call("read_history", map[string]any{"session": "s1", "search": "HEARTBEAT"}) // exact case: no match
+	out, _ = h.call("read_output", map[string]any{"session": "s1", "search": "HEARTBEAT"}) // exact case: no match
 	if out != "(nothing found)" {
 		t.Errorf("history is smart-case: %q", out)
 	}
-	if out, _ := h.call("read_history", map[string]any{"session": "s1", "search": "heartbeat"}); !strings.Contains(out, "kernel: heartbeat") {
+	if out, _ := h.call("read_output", map[string]any{"session": "s1", "search": "heartbeat"}); !strings.Contains(out, "kernel: heartbeat") {
 		t.Errorf("history search: %q", out)
 	}
-	if out, isErr := h.call("read_history", map[string]any{"session": "s1", "lines": 5000}); !isErr {
+	if out, isErr := h.call("read_output", map[string]any{"session": "s1", "lines": 5000}); !isErr {
 		t.Errorf("too many lines accepted: %q", out)
 	}
 
@@ -289,7 +289,7 @@ func TestConsoleOutputIsSanitized(t *testing.T) {
 		args map[string]any
 	}{
 		{"send_command", map[string]any{"session": "s1", "line": "evil", "wait_seconds": 0.5}},
-		{"read_history", map[string]any{"session": "s1"}},
+		{"read_output", map[string]any{"session": "s1", "lines": 50}},
 	} {
 		out, _ := h.call(c.tool, c.args)
 		if !strings.Contains(out, "red") || !strings.Contains(out, "ok") {
@@ -316,7 +316,7 @@ func TestConsoleOutputIsBounded(t *testing.T) {
 	if !strings.Contains(out, "earlier lines not shown") || !strings.Contains(out, "log line 2999") {
 		t.Errorf("should say lines were cut and keep the newest: %q", out[:min(len(out), 200)])
 	}
-	hist, _ := h.call("read_history", map[string]any{"session": "s1", "lines": 300})
+	hist, _ := h.call("read_output", map[string]any{"session": "s1", "lines": 300})
 	if len(hist) > shownBytesMax+2048 {
 		t.Errorf("history is %d bytes", len(hist))
 	}

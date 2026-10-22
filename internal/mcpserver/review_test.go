@@ -488,7 +488,7 @@ func TestLongListsArePagedAndBounded(t *testing.T) {
 		}
 	}
 	for _, tool := range []string{"list_hosts", "status"} {
-		arg := map[string]string{"list_hosts": "filter", "status": "selector"}[tool]
+		arg := "filter"
 		seen := map[string]int{}
 		offset, pages := 0, 0
 		for {
@@ -570,7 +570,7 @@ func TestStructuredOutputIsSanitized(t *testing.T) {
 	h.cfg.Hosts["evil\x1b[31mhost\x1b]0;title\x07"] = config.Host{IP: "192.0.2.50\x1b[2J\r\nx", Type: "ipmi\x1b[0m", Notes: "n\x1b[1mote", Tags: []string{"t\x1b[0mag"}}
 	h.statuses["evil\x1b[31mhost\x1b]0;title\x07"] = bmc.StatusResult{Text: "on\x1b[31m"}
 	for _, tool := range []string{"list_hosts", "status"} {
-		arg := map[string]string{"list_hosts": "filter", "status": "selector"}[tool]
+		arg := "filter"
 		res := h.result(tool, map[string]any{arg: "evil*"})
 		b, _ := json.Marshal(res.StructuredContent)
 		for _, bad := range []string{`\u001b`, `\u0007`, `\u001B`, "title", `\r`, `\n`} {

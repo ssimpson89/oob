@@ -487,7 +487,7 @@ func shown(lines []string, cursor string, lost int) string {
 	}
 	var b strings.Builder
 	if cut := lost + len(lines) - keep; cut > 0 {
-		fmt.Fprintf(&b, "[%d earlier lines not shown; read_history has the last %d]\n", cut, console.HistoryLines)
+		fmt.Fprintf(&b, "[%d earlier lines not shown; read_output with lines has the last %d]\n", cut, console.HistoryLines)
 	} else if len(lines) == 0 {
 		b.WriteString("(no new lines; the cursor is on this one)\n")
 	}

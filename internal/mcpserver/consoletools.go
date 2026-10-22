@@ -81,12 +81,8 @@ type readIn struct {
 	Session     string  `json:"session" jsonschema:"the session id connect returned"`
 	WaitSeconds float64 `json:"wait_seconds,omitempty" jsonschema:"how long to wait for output, at most 60. Returns once the console goes quiet, or with until, as soon as that appears. Default 0: return at once"`
 	Until       string  `json:"until,omitempty" jsonschema:"keep waiting until this text appears. Lowercase matches any case"`
-}
-
-type historyIn struct {
-	Session string `json:"session" jsonschema:"the session id connect returned"`
-	Lines   int    `json:"lines,omitempty" jsonschema:"how many lines to return, newest last. Default 50, at most 300"`
-	Search  string `json:"search,omitempty" jsonschema:"only lines containing this text. Lowercase matches any case"`
+	Lines       int     `json:"lines,omitempty" jsonschema:"read earlier output instead of what is new: this many lines, newest last, at most 300. Doesn't mark anything as read, and can't be combined with wait_seconds or until"`
+	Search      string  `json:"search,omitempty" jsonschema:"read earlier output instead of what is new: only lines containing this text (default 50 lines, or lines). Lowercase matches any case"`
 }
 
 type commandIn struct {
@@ -118,15 +114,10 @@ func (s *server) addConsoleTools(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "read_output",
 		Description: "Return what the console printed since output was last returned, ending with the line the cursor is " +
-			"on (usually the prompt). Can wait for output, or until some text appears, such as a login prompt after a reboot.",
+			"on (usually the prompt). Can wait for output, or until some text appears, such as a login prompt after a reboot. " +
+			fmt.Sprintf("With lines or search it returns earlier output instead (the last %d lines are kept): the last lines, or the last lines containing some text.", console.HistoryLines),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &yes},
 	}, s.readOutput)
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "read_history",
-		Description: fmt.Sprintf("Return earlier console output: the last lines, or the last lines containing some text. "+
-			"Keeps the last %d lines.", console.HistoryLines),
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &no},
-	}, s.readHistory)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "send_command",
 		Description: "Run a command at the console, or several on separate lines, and return the output. Waits for the " +
@@ -455,6 +446,12 @@ func (s *server) readOutput(ctx context.Context, _ *mcp.CallToolRequest, in read
 		return fail(err)
 	}
 	defer c.touch()
+	if in.Lines != 0 || in.Search != "" {
+		if in.WaitSeconds != 0 || in.Until != "" {
+			return fail("lines and search read earlier output; they can't be combined with wait_seconds or until")
+		}
+		return s.history(c, in)
+	}
 	wait, err := seconds(in.WaitSeconds, 0, readWaitMax)
 	if err != nil {
 		return fail(err)
@@ -473,12 +470,8 @@ func (s *server) readOutput(ctx context.Context, _ *mcp.CallToolRequest, in read
 	return text(false, c.output(), note), nil, nil
 }
 
-func (s *server) readHistory(_ context.Context, _ *mcp.CallToolRequest, in historyIn) (*mcp.CallToolResult, any, error) {
-	c, err := s.session(in.Session)
-	if err != nil {
-		return fail(err)
-	}
-	defer c.touch()
+// history is read_output with lines or search: earlier output.
+func (s *server) history(c *session, in readIn) (*mcp.CallToolResult, any, error) {
 	n := cmp.Or(in.Lines, historyShown)
 	if n < 1 || n > shownLinesMax {
 		return fail(fmt.Sprintf("lines must be between 1 and %d", shownLinesMax))
@@ -624,6 +617,16 @@ func describeGate(g gate) string {
 	return "at an empty prompt"
 }
 
+// noteBenign records that the command about to run at this prompt needed no
+// approval. A yes/no question it raises would be about that command, so
+// answering it needs no approval either: only a question no command of ours
+// raised (the user's, or one from before) is still asked about.
+func (c *session) noteBenign(at line) {
+	c.mu.Lock()
+	c.answersAt = at.prompts
+	c.mu.Unlock()
+}
+
 // sinceBreak reports whether a BREAK was sent recently enough that the next
 // key may be a SysRq command.
 func (c *session) sinceBreak() bool {
@@ -702,6 +705,8 @@ func (s *server) sendCommand(ctx context.Context, req *mcp.CallToolRequest, in c
 		c.mu.Lock()
 		c.answersAt = at.prompts
 		c.mu.Unlock()
+	} else if !at.confirming() {
+		c.noteBenign(at) // nothing here needed approval, so a question it raises doesn't either
 	}
 
 	ctx, why, release, err := c.keyboard(ctx)
@@ -934,6 +939,8 @@ func (s *server) sendKeys(ctx context.Context, req *mcp.CallToolRequest, in keys
 		c.mu.Lock()
 		c.answersAt = at.prompts
 		c.mu.Unlock()
+	} else if !at.confirming() && slices.Contains(in.Keys, "enter") {
+		c.noteBenign(at)
 	}
 
 	ctx, why, release, err := c.keyboard(ctx)

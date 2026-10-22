@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/ssimpson89/oob/internal/bmc"
+	"github.com/ssimpson89/oob/internal/config"
 )
 
 // The values the state-changing tools accept.
@@ -40,14 +41,14 @@ type mcResetIn struct {
 	Kind string `json:"kind" jsonschema:"warm or cold"`
 }
 
-// addChangeTools registers the tools that change state. Every one asks the
-// user first, and none can be told to skip it.
+// addChangeTools registers the tools that change state. Every one but uid (an
+// LED) asks the user first, and none can be told to skip it.
 func (s *server) addChangeTools(srv *mcp.Server) {
 	change := &mcp.ToolAnnotations{DestructiveHint: &yes, OpenWorldHint: &yes}
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "power",
 		Description: "Change a host's chassis power: on, off, cycle, reset or soft. Always asks the user to approve first; " +
-			"refused if their client can't ask. Exact host name only. Use power_status to check the result.",
+			"refused if their client can't ask. Exact host name only. Use status to check the result.",
 		InputSchema: schemaFor[powerIn](map[string][]string{"action": powerActions}),
 		Annotations: change,
 	}, s.power)
@@ -99,6 +100,11 @@ func (s *server) change(ctx context.Context, req *mcp.CallToolRequest, host, wha
 		}
 		return res, nil, nil
 	}
+	return s.runChange(ctx, name, h, what, fn)
+}
+
+// runChange runs fn against the host's driver with its output captured.
+func (s *server) runChange(ctx context.Context, name string, h config.Host, what string, fn func(bmc.Driver) error) (*mcp.CallToolResult, any, error) {
 	out, err := s.runBMC(ctx, changeTimeout, func() error { return fn(s.be.Driver(name, h)) })
 	if err != nil {
 		return bmcResult(name, what, out, err, changeTimeout, false, true)
@@ -142,8 +148,11 @@ func (s *server) uid(ctx context.Context, req *mcp.CallToolRequest, in uidIn) (*
 	if !slices.Contains(uidStates, in.State) {
 		return fail(fmt.Sprintf("state must be one of %v", uidStates))
 	}
-	return s.change(ctx, req, in.Host, "uid "+in.Host+" "+in.State, "changes the host's identify LED",
-		func(d bmc.Driver) error { return d.UID(in.State) })
+	name, h, err := s.hostFor(in.Host, true)
+	if err != nil {
+		return fail(err)
+	}
+	return s.runChange(ctx, name, h, "uid "+in.Host+" "+in.State, func(d bmc.Driver) error { return d.UID(in.State) })
 }
 
 func (s *server) nmi(ctx context.Context, req *mcp.CallToolRequest, in hostIn) (*mcp.CallToolResult, any, error) {

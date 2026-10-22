@@ -304,9 +304,10 @@ Host tools, which take host names from `list_hosts`:
 | Tool | What it does |
 | --- | --- |
 | `list_hosts` | Name, BMC address, type, tags and notes. Never passwords, keys or key paths. Long lists come in pages (`limit`, `offset`, `next_offset`) |
-| `power_status`, `status` | Power state of one host, or of many at once (glob, text or `tag:x`; paged like `list_hosts`) |
-| `sel_list`, `sensors`, `bmc_info` | Event log (newest entries when it is long), sensor readings, BMC identity |
-| `power`, `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset` | Change state. Always asks you first |
+| `status` | Power state. With `filter` set to one exact host name it reads that host from its BMC; otherwise `filter` is a glob, text or `tag:x` (the same as in `list_hosts`) and many hosts are read at once, paged like `list_hosts`. Hosts not reached before the overall time ran out show `skipped` |
+| `sel_list`, `sensors`, `bmc_info` | Event log (newest entries when it is long), sensor readings, BMC identity. On iLO and iDRAC these use IPMI over LAN, and a failure says how to enable it |
+| `uid` | Turn the identify LED on or off. Doesn't ask |
+| `power`, `boot`, `nmi`, `sel_clear`, `mc_reset` | Change state. Always asks you first |
 
 Console tools, for the server's own serial console (its login prompt, GRUB, kernel messages), reached the
 same way as `oob sol`: IPMI SOL, iLO VSP over SSH, iDRAC `console com2`:
@@ -314,7 +315,7 @@ same way as `oob sol`: IPMI SOL, iLO VSP over SSH, iDRAC `console com2`:
 | Tool | What it does |
 | --- | --- |
 | `connect` | Open the console and return a session id. `force` clears a stale IPMI SOL session (asks first) |
-| `read_output`, `read_history` | What is new since the last read (it can wait for some text), and earlier output (the last 10000 lines, searchable) |
+| `read_output` | What is new since the last read (it can wait for some text). With `lines` or `search`, earlier output instead (the last 10000 lines are kept) |
 | `send_command` | Run a command and return its output. Stops at a `[y/N]` question or a pager |
 | `send_keys` | Text and keys: enter, arrows, ctrl+c, function keys, for answers and for GRUB or BIOS menus |
 | `send_break` | Serial BREAK, IPMI SOL only (iLO and iDRAC have none, and say so) |
@@ -330,13 +331,13 @@ agent typed. Logs are off by default because a console can show secrets.
 
 The agent can't answer for you. Your client shows the exact request and you accept or decline:
 
-- every state change: `power` (all actions, including `on`), `boot`, `uid`, `nmi`, `sel_clear`, `mc_reset`
+- every state change: `power` (all actions, including `on`), `boot`, `nmi`, `sel_clear`, `mc_reset` (`uid`, the identify LED, is the one change that doesn't ask)
 - `connect` with `force`
 - console commands that reboot, power off, wipe, format or repartition, remove packages, cut the network or
   change accounts, and anything that triggers SysRq
 - anything typed at a bootloader prompt (GRUB, UEFI shell, U-Boot), or at the BMC's own command line
 - `send_break`, and the first keys typed after one (on Linux the next key is a SysRq command)
-- an answer to a yes/no question the agent's own command raised, unless the answer is no or ctrl+c
+- an answer to a yes/no question that none of the agent's commands raised, unless the answer is no or ctrl+c. A question raised by a command that needed your approval was covered by it, and one raised by a harmless command needs none
 
 If your client can't ask, oob refuses and tells the agent so. There is no switch to skip this, and
 `-y` doesn't apply. State changes take exact host names, never a prefix.

@@ -32,7 +32,7 @@ func toolNames(t *testing.T, h *harness) []string {
 func TestToolList(t *testing.T) {
 	h := start(t, Options{}, "")
 	want := []string{"bmc_info", "bmc_prompt", "boot", "connect", "disconnect", "list_hosts", "mc_reset", "nmi", "power",
-		"power_status", "read_history", "read_output", "sel_clear", "sel_list", "send_break", "send_command", "send_keys",
+		"read_output", "sel_clear", "sel_list", "send_break", "send_command", "send_keys",
 		"sensors", "status", "uid"}
 	if got := toolNames(t, h); !slices.Equal(got, want) {
 		t.Errorf("tools\n got %v\nwant %v", got, want)
@@ -43,11 +43,11 @@ func TestToolList(t *testing.T) {
 			t.Errorf("%s has no description or annotations", tool.Name)
 		}
 		switch tool.Name {
-		case "list_hosts", "power_status", "status", "sel_list", "sensors", "bmc_info", "read_output", "read_history":
+		case "list_hosts", "status", "sel_list", "sensors", "bmc_info", "read_output":
 			if !tool.Annotations.ReadOnlyHint {
 				t.Errorf("%s should be read-only", tool.Name)
 			}
-		case "power", "boot", "uid", "nmi", "sel_clear", "mc_reset", "send_command", "send_keys", "send_break":
+		case "power", "boot", "nmi", "sel_clear", "mc_reset", "send_command", "send_keys", "send_break":
 			if tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
 				t.Errorf("%s should be marked destructive", tool.Name)
 			}
@@ -57,7 +57,7 @@ func TestToolList(t *testing.T) {
 
 func TestReadOnlyServerHasOnlyReadOnlyTools(t *testing.T) {
 	h := start(t, Options{ReadOnly: true}, "accept")
-	want := []string{"bmc_info", "list_hosts", "power_status", "sel_list", "sensors", "status"}
+	want := []string{"bmc_info", "list_hosts", "sel_list", "sensors", "status"}
 	if got := toolNames(t, h); !slices.Equal(got, want) {
 		t.Errorf("tools %v, want %v", got, want)
 	}
@@ -105,9 +105,9 @@ func TestListHostsNeverLeaksSecrets(t *testing.T) {
 
 func TestReadOnlyTools(t *testing.T) {
 	h := start(t, Options{}, "") // the client can't ask: read-only tools must not need to
-	out, isErr := h.call("power_status", map[string]any{"host": "node01"})
+	out, isErr := h.call("status", map[string]any{"filter": "node01"})
 	if isErr || !strings.Contains(out, "Chassis Power is on") {
-		t.Errorf("power_status: %q %v", out, isErr)
+		t.Errorf("status of one host: %q %v", out, isErr)
 	}
 	out, isErr = h.call("sel_list", map[string]any{"host": "node02"})
 	if isErr || !strings.Contains(out, "Presence detected") {
@@ -131,15 +131,19 @@ func TestReadOnlyTools(t *testing.T) {
 	if c := h.called(); !strings.Contains(c, "driver:node01 pass=true") || !strings.Contains(c, "node01:power status") {
 		t.Errorf("calls %q", c)
 	}
-	// A unique prefix is fine for read-only tools; an ambiguous one is an error.
-	if out, isErr := h.call("power_status", map[string]any{"host": "login"}); isErr || !strings.Contains(out, "Chassis Power") {
+	// Other tools take a unique prefix; an ambiguous one is an error.
+	if out, isErr := h.call("sel_list", map[string]any{"host": "login"}); isErr || !strings.Contains(out, "Presence") {
 		t.Errorf("prefix: %q %v", out, isErr)
 	}
-	if out, isErr := h.call("power_status", map[string]any{"host": "node"}); !isErr || !strings.Contains(out, "ambiguous") {
+	if out, isErr := h.call("sel_list", map[string]any{"host": "node"}); !isErr || !strings.Contains(out, "ambiguous") {
 		t.Errorf("ambiguous prefix: %q %v", out, isErr)
 	}
-	if out, isErr := h.call("power_status", map[string]any{"host": "nope"}); !isErr || !strings.Contains(out, "list_hosts") {
+	if out, isErr := h.call("sel_list", map[string]any{"host": "nope"}); !isErr || !strings.Contains(out, "list_hosts") {
 		t.Errorf("unknown host: %q %v", out, isErr)
+	}
+	// status with a part of a name is the bulk form: one row per match, quiet.
+	if out, isErr := h.call("status", map[string]any{"filter": "login"}); isErr || !strings.Contains(out, "login1\t") {
+		t.Errorf("status of a substring: %q %v", out, isErr)
 	}
 	for _, s := range []string{secretPass, secretKey} {
 		if all := h.called(); strings.Contains(all, s) {
@@ -151,7 +155,7 @@ func TestReadOnlyTools(t *testing.T) {
 func TestBulkStatus(t *testing.T) {
 	h := start(t, Options{}, "")
 	h.statuses["node02"] = bmc.StatusResult{Text: "ERROR: connection refused \x1b[31m", Failed: true}
-	res := h.result("status", map[string]any{"selector": "node*"})
+	res := h.result("status", map[string]any{"filter": "node*"})
 	if res.IsError {
 		t.Fatalf("status failed: %+v", res)
 	}
@@ -166,8 +170,11 @@ func TestBulkStatus(t *testing.T) {
 	if strings.Contains(out.Hosts[1].Status, "\x1b") {
 		t.Errorf("status not clean: %q", out.Hosts[1].Status)
 	}
-	if text, isErr := h.call("status", map[string]any{"selector": "zzz"}); !isErr || !strings.Contains(text, "no hosts match") {
-		t.Errorf("empty selector: %q %v", text, isErr)
+	// No match is the same for both tools: a plain "no hosts match", not an error.
+	for _, tool := range []string{"list_hosts", "status"} {
+		if text, isErr := h.call(tool, map[string]any{"filter": "zzz"}); isErr || text != "no hosts match" {
+			t.Errorf("%s with no match: %q %v", tool, text, isErr)
+		}
 	}
 	if text, isErr := h.call("status", nil); isErr || !strings.Contains(text, "login1") {
 		t.Errorf("all hosts: %q %v", text, isErr)
@@ -195,7 +202,7 @@ func TestReadToolsTimeOut(t *testing.T) {
 	h.srv.be.Driver = func(name string, _ config.Host) bmc.Driver { return &blockingDriver{release: release} }
 	t.Cleanup(func() { close(release) })
 	start := time.Now()
-	out, isErr := h.call("power_status", map[string]any{"host": "node01"})
+	out, isErr := h.call("status", map[string]any{"filter": "node01"})
 	if !isErr || !strings.Contains(out, "timed out") {
 		t.Errorf("got %q %v", out, isErr)
 	}
@@ -226,7 +233,6 @@ var changeCases = []struct {
 	{"power", map[string]any{"host": "node01", "action": "soft"}, "node01:power soft", "power soft node01"},
 	{"boot", map[string]any{"host": "node01", "device": "pxe", "legacy": true, "persistent": true}, "node01:boot pxe legacy=true persistent=true", "next boot device pxe"},
 	{"boot", map[string]any{"host": "node01", "device": "disk"}, "node01:boot disk legacy=false persistent=false", "next boot device disk"},
-	{"uid", map[string]any{"host": "node01", "state": "on"}, "node01:uid on", "uid node01 on"},
 	{"nmi", map[string]any{"host": "node01"}, "node01:nmi", "nmi node01"},
 	{"sel_clear", map[string]any{"host": "node01"}, "node01:sel clear", "sel clear node01"},
 	{"mc_reset", map[string]any{"host": "node01", "kind": "cold"}, "node01:mcreset cold", "cold BMC reset node01"},
