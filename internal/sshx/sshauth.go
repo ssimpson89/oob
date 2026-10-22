@@ -98,18 +98,15 @@ var keyPassphrase = func(path string) ([]byte, error) {
 	return b, err
 }
 
-// loadKeySigner reads a private key file. It refuses a file that group or
-// other can read (as OpenSSH does) and asks once for a passphrase if needed.
-// Nothing about the key is ever printed.
-func loadKeySigner(path string) (ssh.Signer, error) { return loadKeySignerOpts(path, false) }
-
 // ErrNeedsInput says a login would have to ask the user for something (a key
 // passphrase) and the caller asked not to be prompted.
 var ErrNeedsInput = errors.New("login needs interactive input (key passphrase)")
 
-// loadKeySignerOpts is loadKeySigner; with noPrompt a passphrase-protected key
-// returns ErrNeedsInput instead of asking.
-func loadKeySignerOpts(path string, noPrompt bool) (ssh.Signer, error) {
+// loadKeySigner reads a private key file. It refuses a file that group or
+// other can read (as OpenSSH does) and asks once for a passphrase if needed;
+// with noPrompt a passphrase-protected key returns ErrNeedsInput instead.
+// Nothing about the key is ever printed.
+func loadKeySigner(path string, noPrompt bool) (ssh.Signer, error) {
 	p, err := expandHome(path)
 	if err != nil {
 		return nil, err
@@ -158,7 +155,7 @@ func sshAuthMethods(h config.Host, noPrompt bool) ([]ssh.AuthMethod, func(), err
 	closeFn := func() {}
 	switch {
 	case h.Key != "":
-		s, err := loadKeySignerOpts(h.Key, noPrompt)
+		s, err := loadKeySigner(h.Key, noPrompt)
 		if err != nil {
 			return nil, nil, err
 		}

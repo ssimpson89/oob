@@ -232,7 +232,6 @@ func barLine(st barState, w int) string {
 	layouts = append(layouts,
 		layout{slices.Concat(name, log), quit},
 		layout{slices.Concat(name, log), keys},
-		layout{slices.Concat(name, log), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}, log, noteShort), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}, log), keys},
 		layout{slices.Concat([]seg{{" " + st.host, true}}), keys},

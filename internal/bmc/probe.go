@@ -40,15 +40,11 @@ func probeW() io.Writer {
 	return os.Stderr
 }
 
-// ProbeVendor logs in to the BMC over SSH like `oob ssh` does (same auth and
+// probeVendor logs in to the BMC over SSH like `oob ssh` does (same auth and
 // host key pinning), opens an interactive shell (some BMCs reject exec), reads
 // the pre-auth banner and the output up to the first prompt, and returns what
 // the vendor detector makes of it. typ is "" when nothing was recognized. It
 // saves nothing.
-func ProbeVendor(name string, h config.Host) (typ string, gen int, err error) {
-	return probeVendor(name, h, probeDialTimeout, probeReadTimeout)
-}
-
 func probeVendor(name string, h config.Host, dial, read time.Duration) (string, int, error) {
 	h.Name = name
 	kh, err := sshx.KnownHostsPath()

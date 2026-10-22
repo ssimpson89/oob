@@ -233,7 +233,7 @@ func cliDial(name string, h config.Host, sp cliSpec, rows, cols int) (*cliSessio
 		return nil, nil, nil, err
 	}
 	det := detect.NewDetector(name, h)
-	cl, err := sshx.ConnectOpts(h, kh, det.Banner)
+	cl, err := sshx.ConnectWith(h, kh, sshx.Options{Banner: det.Banner})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%s (%s): %w", name, h.IP, sshx.NameConnErr(err, name))
 	}

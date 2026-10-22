@@ -105,17 +105,6 @@ func splitCommands(line string) []string {
 	return cmds
 }
 
-// isDangerous reports whether line runs a command that can reboot a device or
-// erase or replace its configuration, spelled out or abbreviated.
-func isDangerous(line string) bool {
-	for _, cmd := range splitCommands(line) {
-		if dangerousCommand(cmd) {
-			return true
-		}
-	}
-	return false
-}
-
 func dangerousCommand(cmd string) bool {
 	words := strings.Fields(cmd)
 	if len(words) == 2 && words[1] == "cancel" && abbreviates(words[0], "reload", 3) {

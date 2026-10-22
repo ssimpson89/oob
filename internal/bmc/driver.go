@@ -96,13 +96,6 @@ func untestedNoteLater(vendor string) {
 	}
 }
 
-// resetUntestedNote lets tests see the note again.
-func resetUntestedNote() {
-	untestedMu.Lock()
-	untestedDone = false
-	untestedMu.Unlock()
-}
-
 // UnknownPowerError is the error for a power action no driver knows.
 func UnknownPowerError(act string) error { return fmt.Errorf("unknown power action %q", act) }
 

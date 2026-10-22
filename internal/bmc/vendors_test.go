@@ -151,13 +151,13 @@ func TestILODriverViaRedfish(t *testing.T) {
 	c, _, done := fakeRedfish(t, 401, "")
 	defer done()
 	d := &iloDriver{ipmiDriver: ipmiDriver{"x", config.Host{IP: "192.0.2.1", User: "u", Pass: "p"}}, rf: c}
-	handled, err := d.viaRedfish(true, func(ctx context.Context) error { _, err := c.PowerState(ctx); return err })
+	handled, err := d.viaRedfish(context.Background(), true, func(ctx context.Context) error { _, err := c.PowerState(ctx); return err })
 	if handled || err != nil {
 		t.Errorf("401: handled=%v err=%v", handled, err)
 	}
 	c2, _, done2 := fakeRedfish(t, 500, "")
 	defer done2()
-	handled, err = d.viaRedfish(true, func(ctx context.Context) error { return c2.Reset(ctx, "On") })
+	handled, err = d.viaRedfish(context.Background(), true, func(ctx context.Context) error { return c2.Reset(ctx, "On") })
 	if !handled || err == nil {
 		t.Errorf("500: handled=%v err=%v", handled, err)
 	}
@@ -169,12 +169,12 @@ func TestILODriverViaRedfish(t *testing.T) {
 	}
 	d.h.Pass = ""
 	t.Setenv("SSH_AUTH_SOCK", "")
-	if handled, err = d.viaRedfish(true, func(context.Context) error { return nil }); !handled || err == nil {
+	if handled, err = d.viaRedfish(context.Background(), true, func(context.Context) error { return nil }); !handled || err == nil {
 		t.Errorf("missing password should be an error, not a fallback: %v %v", handled, err)
 	}
 	// with an SSH key the SSH CLI can log in, so it takes over
 	d.h.Key = "/some/key"
-	if handled, err = d.viaRedfish(true, func(context.Context) error { return nil }); handled || err != nil {
+	if handled, err = d.viaRedfish(context.Background(), true, func(context.Context) error { return nil }); handled || err != nil {
 		t.Errorf("key and no password should use the SSH CLI: %v %v", handled, err)
 	}
 }
@@ -231,7 +231,7 @@ func newFakeIDRAC(f *fakeRacadm) *idracDriver {
 }
 
 func TestIDRACCommands(t *testing.T) {
-	resetUntestedNote()
+	swap(t, &untestedDone, false)
 	var buf strings.Builder
 	swap[io.Writer](t, &untestedOut, &buf)
 
