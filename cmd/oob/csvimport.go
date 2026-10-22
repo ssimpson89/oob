@@ -141,8 +141,8 @@ func ParseHostsCSV(in io.Reader) (*CSVResult, error) {
 		}
 	}
 	r := csv.NewReader(strings.NewReader(strings.Join(lines, "\n")))
+	r.Comment = '#' // must match the HasPrefix("#") counting above
 	r.FieldsPerRecord = -1
-	r.Comment = '#'
 
 	type rowErr struct {
 		row int

@@ -505,6 +505,7 @@ func TestShorthandDashArgsAndResetFlagParse(t *testing.T) {
 func TestWebURL(t *testing.T) {
 	for in, want := range map[string]string{
 		"192.0.2.1": "https://192.0.2.1/", "bmc.example.com": "https://bmc.example.com/", "2001:db8::1": "https://[2001:db8::1]/",
+		"example.com:8443": "https://example.com:8443/", "192.0.2.1:8443": "https://192.0.2.1:8443/", "[2001:db8::1]": "https://[2001:db8::1]/",
 	} {
 		if got := webURL(in); got != want {
 			t.Errorf("%q: %q", in, got)

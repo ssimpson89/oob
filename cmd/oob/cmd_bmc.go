@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -304,9 +305,10 @@ func bmcCmds() []*cobra.Command {
 	return cmds
 }
 
-// webURL is the BMC's https URL, with an IPv6 address in brackets.
+// webURL is the BMC's https URL, with an IPv6 literal in brackets.
 func webURL(ip string) string {
-	if strings.Contains(ip, ":") && !strings.HasPrefix(ip, "[") {
+	// Only a real IPv6 literal needs brackets; host:port and names do not.
+	if a := net.ParseIP(ip); a != nil && a.To4() == nil && strings.Contains(ip, ":") {
 		ip = "[" + ip + "]"
 	}
 	return "https://" + ip + "/"

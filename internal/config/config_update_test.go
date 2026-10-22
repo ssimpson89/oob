@@ -1,10 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -100,10 +100,20 @@ func TestUnknownKeysSurviveRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(p)
-	for _, want := range []string{`"future"`, `"dflt_new"`, `"host_new"`, `"notes": "hi"`} {
-		if !strings.Contains(string(b), want) {
-			t.Errorf("missing %s in %s", want, b)
-		}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("saved config is not valid JSON: %v\n%s", err, b)
+	}
+	if f, _ := got["future"].(map[string]any); f == nil || f["a"] != float64(1) {
+		t.Errorf("future key lost: %v", got["future"])
+	}
+	if d, _ := got["defaults"].(map[string]any); d == nil || d["dflt_new"] != true || d["user"] != "u" {
+		t.Errorf("defaults not preserved: %v", got["defaults"])
+	}
+	hosts, _ := got["hosts"].(map[string]any)
+	n1, _ := hosts["n1"].(map[string]any)
+	if n1 == nil || n1["host_new"] != "x" || n1["notes"] != "hi" || n1["ip"] != "192.0.2.1" {
+		t.Errorf("host n1 not preserved/updated: %v", hosts["n1"])
 	}
 }
 

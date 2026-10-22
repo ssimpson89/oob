@@ -248,8 +248,9 @@ func newRoot() *cobra.Command {
 			return sshCmd.RunE(cmd, args)
 		},
 	}
-	// `<name> --reset-hostkey` is the ssh shorthand with its flag; the rest of
-	// the line is the remote command, as in `ssh`.
+	// `--reset-hostkey <name>` is the ssh shorthand with its flag. Flags must
+	// come before the host name (interspersing is off): everything after the
+	// name is the remote command, as in `ssh`.
 	root.Flags().AddFlag(sshCmd.Flags().Lookup("reset-hostkey"))
 	root.Flags().SetInterspersed(false)
 	root.PersistentFlags().StringVarP(&cfgFlag, "config", "c", "", "config file (default ~/.config/"+AppName+"/hosts.json, or $XDG_CONFIG_HOME/"+AppName+"/hosts.json when set; must exist unless the command is add or import)")
