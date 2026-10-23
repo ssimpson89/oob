@@ -127,6 +127,7 @@ type vspLink struct {
 
 func (l *vspLink) MapInput(b []byte) ([]byte, string) { return MapVSPInput(b, l.alt.Load()) }
 func (l *vspLink) SetAltScreen(on bool)               { l.alt.Store(on) }
+func (*vspLink) Serial() bool                         { return true } // typing is paced, as on the real VSP
 
 func vspKeys(t *testing.T, l Link) (*consoleKeys, *console) {
 	t.Helper()
@@ -397,5 +398,46 @@ func TestPasteToAPasteStrippingLinkLosesWholeEscapeSequences(t *testing.T) {
 	}
 	if got := string(fl.sentCopy()); got != "echo hi" {
 		t.Errorf("sent %q, want %q", got, "echo hi")
+	}
+}
+
+func TestEnterAfterALongPasteGoesLast(t *testing.T) {
+	paste := strings.Repeat("pAssw0rd-", 34)[:300]
+	for _, tc := range []struct {
+		name  string
+		reads []string
+	}{
+		{"bracketed", []string{"\x1b[200~" + paste[:100], paste[100:] + "\x1b[201~", "\r"}},
+		{"bracketed, one read", []string{"\x1b[200~" + paste + "\x1b[201~", "\r"}},
+		{"markers off, plain keystrokes", []string{paste[:100], paste[100:200], paste[200:], "\r"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			fl := &vspLink{}
+			ms := time.Millisecond
+			con := newConsole(&bytes.Buffer{}, "h", "vsp", 24, 80)
+			con.Start()
+			defer con.Close()
+			k := newKeys(&Setup{Link: fl, Pacing: Pacing{Char: &ms, Line: &ms}}, con, func() {}, make(chan struct{}))
+			k.start(nil)
+			for _, r := range tc.reads {
+				k.Input([]byte(r))
+			}
+			if n := barNote(con); n != "Enter will be sent after the paste" {
+				t.Errorf("bar note = %q, want the Enter note", n)
+			}
+			for i := 0; i < 600; i++ {
+				fl.mu.Lock()
+				n := len(fl.sent)
+				fl.mu.Unlock()
+				if n >= len(paste)+1 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := string(fl.sentCopy()); got != paste+"\r" {
+				t.Errorf("sent %q, want the paste then CR", got)
+			}
+		})
 	}
 }

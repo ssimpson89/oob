@@ -142,11 +142,24 @@ func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 func (k *consoleKeys) typeKeys(b []byte) {
 	b, note := k.filter.Map(k.cs.Link, b)
 	k.showKeysNote(note)
+	if bytes.IndexByte(b, '\r') >= 0 && k.queuedBig() {
+		// Typing is in order, so this Enter waits behind the paste.
+		k.con.Note("Enter will be sent after the paste", false)
+	}
 	if i := bytes.LastIndexByte(b, 0x03); i >= 0 {
 		k.q.Urgent([]byte{0x03})
 		b = b[i+1:]
 	}
 	k.q.Enqueue(b)
+}
+
+// queuedBig reports whether a paste-sized amount is still waiting to be typed.
+// A local typer knows at once; a shared one is told by the hub's progress.
+func (k *consoleKeys) queuedBig() bool {
+	if k.ty != nil && k.ty.Queued() > sendShowMin {
+		return true
+	}
+	return k.con.Pending() > sendShowMin
 }
 
 func (k *consoleKeys) showKeysNote(note string) {

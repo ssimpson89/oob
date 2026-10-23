@@ -1342,3 +1342,38 @@ func TestWindowClearIsRefusedWhileBusy(t *testing.T) {
 	other.Clear()
 	eventually(t, "the clear goes through once idle", func() bool { return h.ty.Queued() == 0 })
 }
+
+func TestArrowAtAFreshBashPromptReachesTheLink(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	win := host(t, f, Options{NoLinger: true})
+	f.emit("\x1b[?2004hroot@node01:~# ")
+	time.Sleep(50 * time.Millisecond)
+	win.Enqueue([]byte("\x1b[A"))
+	win.Enqueue([]byte("\x1b[H"))
+	win.Enqueue([]byte("\x1bOA"))
+	eventually(t, "arrows typed as ctrl keys", func() bool { return f.got() == "\x10\x01\x10" })
+}
+
+func TestEnterAfterALongPasteGoesLast(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reads int
+	}{{"one write", 1}, {"plain keystrokes in many reads", 30}} {
+		t.Run(tc.name, func(t *testing.T) {
+			env(t)
+			f := newFake()
+			f.vsp = true
+			f.delay = 2 * time.Millisecond
+			win := host(t, f, Options{NoLinger: true})
+			paste := strings.Repeat("pAssw0rd-", 34)[:300]
+			step := len(paste) / tc.reads
+			for i := 0; i < len(paste); i += step {
+				win.Enqueue([]byte(paste[i:min(len(paste), i+step)]))
+			}
+			win.Enqueue([]byte("\r"))
+			eventually(t, "paste then enter", func() bool { return f.got() == paste+"\r" })
+		})
+	}
+}
