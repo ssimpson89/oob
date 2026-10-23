@@ -208,7 +208,8 @@ func Run(cs Setup) (int, error) {
 		})
 	}
 
-	var keysP atomic.Pointer[consoleKeys] // set once the keys exist; the output loop starts first
+	keys := newKeys(&cs, con, cleanup, stop) // before the output loop: it looks at the keys
+	keys.auto = auto
 	outDone := make(chan struct{})
 	guard(cleanup, func() {
 		defer close(outDone)
@@ -219,8 +220,8 @@ func Run(cs Setup) (int, error) {
 			tr.log("RX", buf[:n])
 			con.Output(buf[:n])
 			alt.Follow(cs.Link, buf[:n])
-			if k := keysP.Load(); k != nil && cs.SizeOnce && n > 0 {
-				k.sizeOnce()
+			if cs.SizeOnce && n > 0 {
+				keys.sizeOnce()
 			}
 			if o, ok := cs.Link.(observer); ok && n > 0 {
 				if kind, at, changed := o.Observe(buf[:n]); changed {
@@ -233,9 +234,6 @@ func Run(cs Setup) (int, error) {
 		}
 	})
 
-	keys := newKeys(&cs, con, cleanup, stop)
-	keys.auto = auto
-	keysP.Store(keys)
 	keys.start(tr)
 
 	// Window changes: follow the size at once, type stty only if asked.
@@ -348,6 +346,7 @@ type consoleKeys struct {
 
 	noted  atomic.Bool // the link's input note was shown
 	sized  atomic.Bool // the size was sent automatically at the first shell prompt
+	sizing atomic.Bool // an automatic size request to the hub is in flight
 	filter InputFilter // holds the start of an escape sequence a read ended in; used from the input loop only
 
 	// lineDirty: the last byte written was neither Enter nor ctrl+c, so the

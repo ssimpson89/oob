@@ -1377,3 +1377,53 @@ func TestEnterAfterALongPasteGoesLast(t *testing.T) {
 		})
 	}
 }
+
+type autoSizer interface {
+	AutoSize(rows, cols int) (string, bool)
+}
+
+func TestAutoSizeIsDecidedAtTheHub(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.delay = 5 * time.Millisecond
+	win := host(t, f, Options{NoLinger: true})
+	win2, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := func(c *Client) bool {
+		_, sent := c.Transport().Link.(autoSizer).AutoSize(23, 80)
+		return sent
+	}
+	f.emit("\r\nroot@node01:~# ")
+	time.Sleep(50 * time.Millisecond)
+
+	// Input queued just before: not sent.
+	win.Enqueue([]byte(strings.Repeat("a", 30)))
+	if size(win) {
+		t.Fatal("size queued behind input")
+	}
+	eventually(t, "input out", func() bool { return len(f.got()) == 30 })
+	// A line with text on it is not a clean prompt (the echo shows it).
+	f.emit("ls")
+	time.Sleep(50 * time.Millisecond)
+	if size(win) {
+		t.Fatal("size typed on a line with text")
+	}
+	f.emit("\r\nroot@node01:~# ")
+	time.Sleep(50 * time.Millisecond)
+	// Only the window that opened the console does it.
+	if size(win2) {
+		t.Fatal("a joined window typed the size")
+	}
+	// The write just before leaves the line dirty until Enter goes out.
+	win.Enqueue([]byte("\r"))
+	eventually(t, "enter out", func() bool { return strings.HasSuffix(f.got(), "\r") })
+	if !size(win) {
+		t.Fatal("size not sent at a clean prompt")
+	}
+	eventually(t, "size typed", func() bool { return strings.HasSuffix(f.got(), "stty\r") })
+	if size(win) {
+		t.Error("size sent twice")
+	}
+}

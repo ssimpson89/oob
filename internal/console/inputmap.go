@@ -145,6 +145,9 @@ type AltTracker struct {
 	on   bool
 }
 
+// On reports whether the remote is on the alternate screen.
+func (t *AltTracker) On() bool { return t.on }
+
 // Follow scans b, the remote's next output, and updates l if it is an
 // AltScreenSetter and the state changed.
 func (t *AltTracker) Follow(l Link, b []byte) {
@@ -152,7 +155,7 @@ func (t *AltTracker) Follow(l Link, b []byte) {
 	if len(t.tail) > 0 {
 		buf = append(t.tail, b...)
 	}
-	_, _, alt, cut := scanSeqs(buf)
+	_, _, alt, _, cut := scanSeqs(buf)
 	t.tail = nil
 	if cut >= 0 && len(buf)-cut <= tailMax {
 		t.tail = bytes.Clone(buf[cut:])

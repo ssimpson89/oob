@@ -424,8 +424,11 @@ func TestEnterAfterALongPasteGoesLast(t *testing.T) {
 			for _, r := range tc.reads {
 				k.Input([]byte(r))
 			}
-			if n := barNote(con); n != "Enter will be sent after the paste" {
-				t.Errorf("bar note = %q, want the Enter note", n)
+			con.mu.Lock()
+			wait, line := con.st.enterWait, barLine(con.st, 80)
+			con.mu.Unlock()
+			if !wait || !strings.Contains(line, "Enter") {
+				t.Errorf("enterWait = %v, bar = %q, want the Enter note with the progress", wait, line)
 			}
 			for i := 0; i < 600; i++ {
 				fl.mu.Lock()
@@ -478,59 +481,93 @@ func (*sizeLink) SizeLine(r, c int) (string, bool) {
 }
 
 func TestSizeOnceAtTheFirstShellPrompt(t *testing.T) {
-	fl := &sizeLink{}
-	k, con := vspKeys(t, fl)
-	sent := func() string { return string(fl.sentCopy()) }
-	wait := func(want string) {
-		t.Helper()
-		for i := 0; i < 200 && sent() != want; i++ {
-			time.Sleep(5 * time.Millisecond)
-		}
-		if got := sent(); got != want {
-			t.Fatalf("sent %q, want %q", got, want)
-		}
-	}
-	notOut := func(why string) {
+	const prompt = "\r\nroot@node01:~# "
+	sentOf := func(fl *sizeLink) string { return string(fl.sentCopy()) }
+	quiet := func(t *testing.T, fl *sizeLink, why string) {
 		t.Helper()
 		time.Sleep(60 * time.Millisecond)
-		if got := sent(); got != "" {
+		if got := sentOf(fl); got != "" {
 			t.Fatalf("%s: sent %q", why, got)
 		}
 	}
 
-	for _, out := range []string{"node01 login: ", "Password: ", "hpeiLO-> ", "\r\nLast login: Mon\r\n"} {
-		con.Output([]byte(out))
+	t.Run("not a shell prompt, or full screen", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		for _, out := range []string{"node01 login: ", "Password: ", "hpeiLO-> ", "\r\nLast login: Mon\r\n"} {
+			con.Output([]byte(out))
+			k.sizeOnce()
+		}
+		quiet(t, fl, "not a shell prompt")
+		con.Output([]byte("\x1b[?1049h~\r\nroot@node01:~# "))
 		k.sizeOnce()
-	}
-	notOut("not a shell prompt")
+		quiet(t, fl, "full screen")
+	})
 
-	con.Output([]byte("\x1b[?1049h~\r\nroot@node01:~# ")) // full screen
-	k.sizeOnce()
-	notOut("full screen")
-	con.Output([]byte("\x1b[?1049l\r\nroot@node01:~# "))
+	t.Run("input queued just before", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		con.Output([]byte(prompt))
+		k.q.Enqueue([]byte(strings.Repeat("a", 40))) // paced: still queued
+		k.sizeOnce()
+		for i := 0; i < 20 && len(fl.sentCopy()) == 0; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := sentOf(fl); strings.Contains(got, "stty") {
+			t.Fatalf("size typed over queued input: %q", got)
+		}
+	})
 
-	k.Input([]byte("ls")) // input still pending: the prompt line is no longer empty
+	t.Run("typed on the line", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		k.Input([]byte("ls"))
+		for i := 0; i < 200 && sentOf(fl) != "ls"; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		con.Output([]byte(prompt))
+		k.sizeOnce()
+		time.Sleep(60 * time.Millisecond)
+		if got := sentOf(fl); got != "ls" {
+			t.Fatalf("size typed on a line with text: %q", got)
+		}
+	})
+
+	t.Run("fires once", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		con.Output([]byte(prompt))
+		k.sizeOnce()
+		for i := 0; i < 200 && sentOf(fl) != "stty rows 23 cols 80\r"; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := sentOf(fl); got != "stty rows 23 cols 80\r" {
+			t.Fatalf("sent %q", got)
+		}
+		if n := barNote(con); n != "sent size 23x80" {
+			t.Errorf("bar note = %q", n)
+		}
+		con.Output([]byte(prompt))
+		k.sizeOnce()
+		time.Sleep(60 * time.Millisecond)
+		if got := sentOf(fl); got != "stty rows 23 cols 80\r" {
+			t.Errorf("repeated: %q", got)
+		}
+	})
+}
+
+func TestSizeOnceForAPromptThatArrivedBeforeTheKeysRan(t *testing.T) {
+	// Run starts the keys before the output loop; the prompt is already in the
+	// console's line when the first chunk is looked at.
+	fl := &sizeLink{}
+	k, con := vspKeys(t, fl)
+	con.Output([]byte("Last login\r\nroot@node01:~# "))
 	k.sizeOnce()
-	wait("ls")
-	con.Output([]byte("\r\nroot@node01:~# "))
-	fl.mu.Lock()
-	fl.sent = nil
-	fl.mu.Unlock()
-	con.SetSend(5, 5) // typed but not out yet
-	k.sizeOnce()
-	notOut("input pending")
-	con.SetSend(0, 0)
-	k.sizeOnce()
-	wait("stty rows 23 cols 80\r")
-	if n := barNote(con); n != "sent size 23x80" {
-		t.Errorf("bar note = %q", n)
+	for i := 0; i < 200 && len(fl.sentCopy()) < len("stty rows 23 cols 80\r"); i++ {
+		time.Sleep(5 * time.Millisecond)
 	}
-	k.sizeOnce() // never again
-	con.Output([]byte("\r\nroot@node01:~# "))
-	k.sizeOnce()
-	time.Sleep(60 * time.Millisecond)
-	if got := sent(); got != "stty rows 23 cols 80\r" {
-		t.Errorf("repeated: %q", got)
+	if got := string(fl.sentCopy()); got != "stty rows 23 cols 80\r" {
+		t.Fatalf("sent %q", got)
 	}
 }
 
@@ -548,3 +585,36 @@ func TestSizeOnceNotOnAFreeSizeLink(t *testing.T) {
 type freeLink struct{ sizeLink }
 
 func (*freeLink) SizeIsFree() bool { return true }
+
+func TestEnterNoteStaysUntilTheQueueEmptiesAndFitsTheBar(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	con := newConsole(&bytes.Buffer{}, "node01", "vsp", 24, 80)
+	con.SetSend(200, 300)
+	con.EnterWait()
+	for _, w := range []int{80, 50, 30} {
+		con.mu.Lock()
+		line := barLine(con.st, w)
+		con.mu.Unlock()
+		if !strings.Contains(line, "sending") {
+			t.Errorf("width %d lost the progress: %q", w, line)
+		}
+	}
+	con.mu.Lock()
+	if !strings.Contains(barLine(con.st, 80), "Enter after paste") {
+		t.Error("progress layout lacks the Enter note")
+	}
+	con.mu.Unlock()
+	con.SetSend(100, 300) // still sending: still shown
+	con.mu.Lock()
+	still := con.st.enterWait
+	con.mu.Unlock()
+	if !still {
+		t.Fatal("note dropped while the queue was not empty")
+	}
+	con.SetSend(0, 0)
+	con.mu.Lock()
+	defer con.mu.Unlock()
+	if con.st.enterWait || strings.Contains(barLine(con.st, 80), "Enter") {
+		t.Error("note kept after the queue emptied")
+	}
+}

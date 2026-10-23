@@ -126,6 +126,10 @@ func (c *console) write(s string) { _, _ = io.WriteString(c.out, s) }
 // reassert re-applies the region and repaints the bar. Caller holds mu and has
 // checked that the stream is idle.
 func (c *console) reassert() {
+	if c.alt { // the program owns the screen, margins included: touch nothing
+		c.dirty = false
+		return
+	}
 	small := c.rows < minBarRows
 	if small && !c.dirty && c.staleRow == 0 {
 		return
@@ -141,11 +145,8 @@ func (c *console) reassert() {
 		seq += fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.staleRow)
 		c.staleRow = 0
 	}
-	if small || c.alt { // no bar: the whole screen is the remote's
+	if small { // no bar: the whole screen is the remote's
 		seq += "\x1b[r"
-		if c.alt && !small {
-			seq += fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.rows)
-		}
 	} else {
 		seq += c.regionSeq() + c.paintSeq()
 	}
@@ -210,7 +211,20 @@ func (c *console) Output(b []byte) {
 	if c.closed {
 		return
 	}
-	_, _ = c.out.Write(b)
+	// The alternate screen is entered with the region released first, before
+	// the program's first frame: it draws the whole screen, and our margins
+	// would clip it. The bar row isn't touched (it belongs to the screen being
+	// left, which is restored as it was).
+	clob, paste := c.scan.Feed(b)
+	enter := c.scan.alt > 0 && !c.alt
+	if enter {
+		end := min(len(b), c.scan.altEnd)
+		_, _ = c.out.Write(b[:end])
+		c.write("\x1b7\x1b[r\x1b8")
+		_, _ = c.out.Write(b[end:])
+	} else {
+		_, _ = c.out.Write(b)
+	}
 	if c.sticky {
 		c.sticky, c.st.note = false, ""
 		c.dirty = true
@@ -223,10 +237,9 @@ func (c *console) Output(b []byte) {
 			c.stopLogLocked("log write failed, logging stopped: " + err.Error())
 		}
 	}
-	clob, paste := c.scan.Feed(b)
 	switch a := c.scan.alt; {
-	case a > 0 && !c.alt: // a full-screen program: give it the whole screen
-		c.alt, c.dirty, clob = true, true, false
+	case a > 0 && !c.alt: // a full-screen program: it has the whole screen now
+		c.alt, clob = true, false
 	case a < 0 && c.alt: // it ended: the region and bar come back
 		c.alt, c.dirty = false, true
 	case c.alt:
@@ -329,8 +342,20 @@ func (c *console) SetSend(pending, total int) {
 	if pending > sendShowMin {
 		label = sendLabel(total-pending, total)
 	}
-	if c.st.sending != label {
-		c.st.sending = label
+	wait := c.st.enterWait && pending > 0
+	if c.st.sending != label || c.st.enterWait != wait {
+		c.st.sending, c.st.enterWait = label, wait
+		c.repaint()
+	}
+}
+
+// EnterWait shows that an Enter is queued behind a paste, until the queue
+// empties.
+func (c *console) EnterWait() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.st.enterWait {
+		c.st.enterWait = true
 		c.repaint()
 	}
 }

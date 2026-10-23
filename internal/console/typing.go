@@ -144,7 +144,7 @@ func (k *consoleKeys) typeKeys(b []byte) {
 	k.showKeysNote(note)
 	if bytes.IndexByte(b, '\r') >= 0 && k.queuedBig() {
 		// Typing is in order, so this Enter waits behind the paste.
-		k.con.Note("Enter will be sent after the paste", false)
+		k.con.EnterWait()
 	}
 	if i := bytes.LastIndexByte(b, 0x03); i >= 0 {
 		k.q.Urgent([]byte{0x03})
@@ -244,8 +244,11 @@ func (t *trace) log(dir string, b []byte) {
 // sizeOnce types the size the first time the cursor line is an empty shell
 // prompt on a serial console (the remote doesn't know the window size, and
 // full-screen programs draw for the wrong one). It does nothing in a
-// full-screen program, with input still queued, or on a link that follows the
-// window size by itself, and it never repeats: ctrl+] s still sends it by hand.
+// full-screen program, with input queued or typed on the line, or on a link
+// that follows the window size by itself, and it never repeats: ctrl+] s still
+// sends it by hand. Whether the queue is empty and the line clean is decided
+// where the queue is, in one step with queueing the line: at the hub for a
+// shared console, at the typer for a local one.
 func (k *consoleKeys) sizeOnce() {
 	if k.sized.Load() || k.cs.Link.SizeIsFree() {
 		return
@@ -254,22 +257,37 @@ func (k *consoleKeys) sizeOnce() {
 		return
 	}
 	line, alt := k.con.cursorLine()
-	if alt || !ShellPrompt(line) || k.queuedAny() {
-		return
-	}
-	if !k.sized.CompareAndSwap(false, true) {
+	if alt || !ShellPrompt(line) {
 		return
 	}
 	rows, cols := k.con.Size()
 	rows = RemoteRows(rows)
-	if err := k.fitSize(rows, cols); err != nil {
-		k.con.Note(sizeError(err), true)
+	if a, ok := k.cs.Link.(autoSizer); ok { // shared: the hub decides, off this goroutine (it reads the output the hub's reply may be waiting behind)
+		if k.sizing.CompareAndSwap(false, true) {
+			go func() {
+				defer k.sizing.Store(false)
+				if _, sent := a.AutoSize(rows, cols); sent {
+					k.sized.Store(true)
+					k.con.Note(fmt.Sprintf("sent size %dx%d", rows, cols), false)
+				}
+			}()
+		}
 		return
 	}
+	sl, ok := k.cs.Link.(sizeLiner)
+	if !ok || k.ty == nil || k.lineDirty.Load() {
+		return
+	}
+	text, ok := sl.SizeLine(rows, cols)
+	if !ok || !k.ty.EnqueueIfIdle([]byte(text+"\r")) {
+		return
+	}
+	k.sized.Store(true)
 	k.con.Note(fmt.Sprintf("sent size %dx%d", rows, cols), false)
 }
 
-// queuedAny reports whether anything typed is still waiting to go out.
-func (k *consoleKeys) queuedAny() bool {
-	return k.con.Pending() > 0 || (k.ty != nil && k.ty.Queued() > 0)
+// autoSizer is a link whose owner can have the size typed once, if the
+// console's queue is empty and its line is a clean shell prompt.
+type autoSizer interface {
+	AutoSize(rows, cols int) (line string, sent bool)
 }

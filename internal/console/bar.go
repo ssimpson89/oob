@@ -107,6 +107,8 @@ type barState struct {
 	noteErr  bool
 	// sending is "1.2k/4k" while a big queue is being typed, else "".
 	sending string
+	// enterWait: an Enter is queued behind a paste. Shown until the queue empties.
+	enterWait bool
 	// shared is the console's other users, as "shared · AI connected"; "" when
 	// the console is shared with nobody, or not shared.
 	shared string
@@ -205,12 +207,19 @@ func barLine(st barState, w int) string {
 	if st.shared != "" {
 		log = append(log, seg{"  [" + st.shared + "]", false})
 	}
-	var note, noteShort []seg
+	var note, noteShort, tiny []seg
 	switch {
 	case st.sending != "":
 		progress := "  sending " + st.sending
+		tiny = []seg{{progress, true}}
+		if st.enterWait {
+			progress += " · Enter after paste"
+		}
 		note = []seg{{progress, true}, {" (" + shortKey + " x clears)", false}}
 		noteShort = []seg{{progress, true}}
+	case st.enterWait:
+		note = []seg{{"  Enter will be sent after the paste", false}}
+		noteShort = note
 	case st.note != "":
 		note = []seg{{"  " + st.note, st.noteErr}}
 		noteShort = note
@@ -227,6 +236,8 @@ func barLine(st barState, w int) string {
 		layouts = append(layouts,
 			layout{slices.Concat([]seg{{" " + st.host, true}}, noteShort), keys},
 			layout{noteShort, keys},
+			layout{slices.Concat([]seg{{" " + st.host, true}}, tiny), keys},
+			layout{tiny, keys},
 		)
 	}
 	layouts = append(layouts,
@@ -336,7 +347,7 @@ func (t *escTracker) Idle() bool { return t.state == trkText && t.utf == 0 }
 // (CSI ! p), clear screen (CSI 2J or 3J), or switching the alternate screen
 // (CSI ? 47, 1047 or 1049 h or l). Full-screen programs do these.
 func clobbers(b []byte) bool {
-	clob, _, _, _ := scanSeqs(b)
+	clob, _, _, _, _ := scanSeqs(b)
 	return clob
 }
 
@@ -348,8 +359,9 @@ const tailMax = 64
 // split ESC [ 2 and J is still seen. It also reports bracketed paste being
 // turned off (CSI ? 2004 l), which bash 5.1+ does around each command.
 type clobberScan struct {
-	tail []byte
-	alt  int // the last Feed's alternate-screen switch: 1 on, -1 off, 0 none
+	tail   []byte
+	alt    int // the last Feed's alternate-screen switch: 1 on, -1 off, 0 none
+	altEnd int // where in that Feed's b the switch sequence ends
 }
 
 // Feed scans b after any held-over start of a sequence.
@@ -358,8 +370,8 @@ func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
 	if len(s.tail) > 0 {
 		buf = append(s.tail, b...)
 	}
-	clobber, pasteOff, alt, cut := scanSeqs(buf)
-	s.alt = alt
+	clobber, pasteOff, alt, altEnd, cut := scanSeqs(buf)
+	s.alt, s.altEnd = alt, max(0, altEnd-(len(buf)-len(b)))
 	s.tail = nil
 	if cut >= 0 && len(buf)-cut <= tailMax {
 		s.tail = append([]byte(nil), buf[cut:]...)
@@ -369,8 +381,8 @@ func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
 
 // scanSeqs looks through b for sequences that clobber the bar and for ?2004l.
 // alt is 1 if the last alternate-screen switch in b turned it on, -1 off, 0 if
-// there was none. cut is where a sequence cut off by the end of b starts, or -1.
-func scanSeqs(b []byte) (clobber, pasteOff bool, alt, cut int) {
+// there was none, and altEnd is the index just after that sequence. cut is where a sequence cut off by the end of b starts, or -1.
+func scanSeqs(b []byte) (clobber, pasteOff bool, alt, altEnd, cut int) {
 	cut = -1
 	for i := 0; i < len(b); i++ {
 		if b[i] != 0x1b {
@@ -419,7 +431,7 @@ func scanSeqs(b []byte) (clobber, pasteOff bool, alt, cut int) {
 					}
 					if n == 47 || n == 1047 || n == 1049 {
 						clobber = true
-						alt = -1
+						alt, altEnd = -1, j+1
 						if b[j] == 'h' {
 							alt = 1
 						}
@@ -432,5 +444,5 @@ func scanSeqs(b []byte) (clobber, pasteOff bool, alt, cut int) {
 		}
 		i = j
 	}
-	return clobber, pasteOff, alt, cut
+	return clobber, pasteOff, alt, altEnd, cut
 }

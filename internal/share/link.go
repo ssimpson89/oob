@@ -84,3 +84,14 @@ func (l *link) SizeLine(rows, cols int) (string, bool) {
 // goes. The window uses it when a disconnect or a BMC prompt switch doesn't
 // answer.
 func (l *link) Hangup() error { return l.c.Close() }
+
+// AutoSize has the hub type the size line once, if nothing is queued or typed
+// and the cursor line is an empty shell prompt (only the window that opened
+// the console is let to). The hub decides in its own loop, so input can't
+// arrive between the check and the typing.
+func (l *link) AutoSize(rows, cols int) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := l.c.call(ctx, msg{Op: opAutoSize, Rows: rows, Cols: cols})
+	return r.Text, err == nil && r.OK
+}
