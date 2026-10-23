@@ -34,12 +34,12 @@ func stripsPaste(l Link) bool {
 }
 
 // VSPKeysNote is the bar note for keys the iLO VSP can't pass.
-const VSPKeysNote = "iLO VSP can't pass arrow/function keys: shell ctrl+p/n/b/f, vim h/j/k/l"
+const VSPKeysNote = "iLO VSP can't pass arrow keys in full-screen programs: use h/j/k/l in vim"
 
 // ErrKeysDropped is what an AI tool is told when what it sent can't go through
 // an input-mapping link: it would have been dropped, so none of it is typed.
-var ErrKeysDropped = errors.New("this console is an iLO VSP, which can't pass arrow keys, function keys or Alt-keys, so nothing was sent. " +
-	"Use shell ctrl+p/n/b/f or vim h/j/k/l instead, or ssh to the server")
+var ErrKeysDropped = errors.New("this console is an iLO VSP, which can't pass function keys or Alt-keys, or arrow keys in a full-screen program, so nothing was sent. " +
+	"In vim use h/j/k/l, or ssh to the server")
 
 // MapInput maps b for l: unchanged unless l is an InputMapper.
 func MapInput(l Link, b []byte) (out []byte, note string) {
@@ -50,8 +50,11 @@ func MapInput(l Link, b []byte) (out []byte, note string) {
 }
 
 // MapVSPInput is the iLO VSP's mapping, for a link that is in the console:
-// a lone ESC is typed as ESC ESC (the only way one gets through); a CSI
-// sequence (ESC [ ... final) and an SS3 sequence (ESC O x) are dropped with
+// a lone ESC is typed as ESC ESC (the only way one gets through). Arrow, Home
+// and End keys (CSI and SS3 forms) are typed as the readline controls ctrl+p,
+// n, f, b, a and e unless fullScreen (the remote is on the alternate screen,
+// where those mean nothing); every other CSI sequence (ESC [ ... final) and SS3
+// sequence (ESC O x), and those keys in full screen, are dropped with
 // VSPKeysNote, since the VSP would drop the ESC and the next byte anyway. ESC
 // followed by a printable byte is a lone ESC and that key: a fast "<Esc>:wq"
 // arrives in one read, and the VSP can't pass an Alt-key whichever it was. ESC
@@ -59,7 +62,7 @@ func MapInput(l Link, b []byte) (out []byte, note string) {
 // (ESC [ I, ESC [ O) are dropped silently. An ESC at the end of b is lone: the
 // key parser only hands one over by itself after the key had time to be a
 // whole key. Two ESCs in a row are two lone ESCs.
-func MapVSPInput(b []byte) (out []byte, note string) {
+func MapVSPInput(b []byte, fullScreen bool) (out []byte, note string) {
 	if bytes.IndexByte(b, 0x1b) < 0 {
 		return b, ""
 	}
@@ -80,10 +83,18 @@ func MapVSPInput(b []byte) (out []byte, note string) {
 				i += n
 				continue
 			}
-			note = VSPKeysNote
+			if k := readlineKey(rest[:n]); k != 0 && !fullScreen {
+				out = append(out, k)
+			} else {
+				note = VSPKeysNote
+			}
 			i += n
 		case rest[0] == 'O':
-			note = VSPKeysNote
+			if len(rest) > 1 && !fullScreen && readlineKey(rest[:2]) != 0 {
+				out = append(out, readlineKey(rest[:2]))
+			} else {
+				note = VSPKeysNote
+			}
 			if len(rest) > 1 && rest[1] != 0x03 {
 				i += 2
 			} else {
@@ -97,6 +108,62 @@ func MapVSPInput(b []byte) (out []byte, note string) {
 		}
 	}
 	return out, note
+}
+
+// readlineKey is the readline control for an unmodified arrow, Home or End key
+// given as seq (the bytes after ESC: "[A", "OH", "[1~"), or 0 if it is not one.
+// Delete is not mapped: ctrl+d on an empty line ends the shell.
+func readlineKey(seq []byte) byte {
+	switch string(seq) {
+	case "[A", "OA":
+		return 0x10
+	case "[B", "OB":
+		return 0x0e
+	case "[C", "OC":
+		return 0x06
+	case "[D", "OD":
+		return 0x02
+	case "[H", "OH", "[1~", "[7~":
+		return 0x01
+	case "[F", "OF", "[4~", "[8~":
+		return 0x05
+	}
+	return 0
+}
+
+// AltScreenSetter is a link whose input mapping depends on whether the remote
+// is in a full-screen program.
+type AltScreenSetter interface {
+	SetAltScreen(on bool)
+}
+
+// AltTracker follows remote output for the alternate screen (CSI ?1049, 1047
+// or 47, h or l), across reads, and tells the link when it changes. One per
+// output stream; it has no lock of its own.
+type AltTracker struct {
+	tail []byte
+	on   bool
+}
+
+// Follow scans b, the remote's next output, and updates l if it is an
+// AltScreenSetter and the state changed.
+func (t *AltTracker) Follow(l Link, b []byte) {
+	buf := b
+	if len(t.tail) > 0 {
+		buf = append(t.tail, b...)
+	}
+	_, _, alt, cut := scanSeqs(buf)
+	t.tail = nil
+	if cut >= 0 && len(buf)-cut <= tailMax {
+		t.tail = bytes.Clone(buf[cut:])
+	}
+	if alt == 0 || (alt > 0) == t.on {
+		return
+	}
+	t.on = alt > 0
+	if s, ok := l.(AltScreenSetter); ok {
+		s.SetAltScreen(t.on)
+	}
 }
 
 // csiLen is how many bytes of rest (which starts with '[') belong to a CSI

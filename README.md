@@ -202,12 +202,16 @@ under iLO Settings > Access > IPMI/DCMI over LAN, off by default on iLO 7). oob 
 a dead BMC fails in about 11 seconds instead of 21.
 
 The iLO VSP reads ESC together with the byte after it: `ESC ESC` passes both, `ESC (` returns to the
-iLO CLI, and `ESC` plus anything else is dropped. So an arrow key, function key or Alt-key never
-reaches the server (measured on iLO 7). In the console, oob types the Esc key as `ESC ESC` and drops
-the other escape sequences, with a one-time note on the bar. Arrows work in plain shell with
-`ctrl+p`, `ctrl+n`, `ctrl+b` and `ctrl+f`, and in vim with `h`, `j`, `k` and `l`. An AI tool's
-`send_keys` with an arrow or function key gets an error instead. For full keys, `ssh` to the
-server itself (`oob ssh` reaches the iLO, not the server), or use IPMI SOL if IPMI over LAN is enabled.
+iLO CLI, and `ESC` plus anything else is dropped. So an escape sequence never reaches the server
+(measured on iLO 7). In the console, oob types the Esc key as `ESC ESC`. At a shell prompt it sends
+the arrow keys as `ctrl+p`, `ctrl+n`, `ctrl+f` and `ctrl+b`, and Home and End as `ctrl+a` and
+`ctrl+e`, which readline understands. Delete, function keys and Alt-keys are dropped, with a note on
+the bar. When the remote switches to the alternate screen (vim, less, top) the bar is hidden so the
+program has the whole screen, and arrow keys are dropped (use `h`, `j`, `k` and `l` in vim); the bar
+comes back when the program exits. An AI tool's `send_keys` gets the same arrow translation at a
+shell, and an error for an arrow key in a full-screen program or for a function key. For full keys,
+`ssh` to the server itself (`oob ssh` reaches the iLO, not the server), or use IPMI SOL if IPMI over
+LAN is enabled.
 
 ## Dell iDRAC (untested)
 

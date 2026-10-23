@@ -336,7 +336,7 @@ func (t *escTracker) Idle() bool { return t.state == trkText && t.utf == 0 }
 // (CSI ! p), clear screen (CSI 2J or 3J), or switching the alternate screen
 // (CSI ? 47, 1047 or 1049 h or l). Full-screen programs do these.
 func clobbers(b []byte) bool {
-	clob, _, _ := scanSeqs(b)
+	clob, _, _, _ := scanSeqs(b)
 	return clob
 }
 
@@ -347,7 +347,10 @@ const tailMax = 64
 // cut off at the end of one read is kept and rescanned with the next, so a
 // split ESC [ 2 and J is still seen. It also reports bracketed paste being
 // turned off (CSI ? 2004 l), which bash 5.1+ does around each command.
-type clobberScan struct{ tail []byte }
+type clobberScan struct {
+	tail []byte
+	alt  int // the last Feed's alternate-screen switch: 1 on, -1 off, 0 none
+}
 
 // Feed scans b after any held-over start of a sequence.
 func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
@@ -355,7 +358,8 @@ func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
 	if len(s.tail) > 0 {
 		buf = append(s.tail, b...)
 	}
-	clobber, pasteOff, cut := scanSeqs(buf)
+	clobber, pasteOff, alt, cut := scanSeqs(buf)
+	s.alt = alt
 	s.tail = nil
 	if cut >= 0 && len(buf)-cut <= tailMax {
 		s.tail = append([]byte(nil), buf[cut:]...)
@@ -364,8 +368,9 @@ func (s *clobberScan) Feed(b []byte) (clobber, pasteOff bool) {
 }
 
 // scanSeqs looks through b for sequences that clobber the bar and for ?2004l.
-// cut is where a sequence cut off by the end of b starts, or -1.
-func scanSeqs(b []byte) (clobber, pasteOff bool, cut int) {
+// alt is 1 if the last alternate-screen switch in b turned it on, -1 off, 0 if
+// there was none. cut is where a sequence cut off by the end of b starts, or -1.
+func scanSeqs(b []byte) (clobber, pasteOff bool, alt, cut int) {
 	cut = -1
 	for i := 0; i < len(b); i++ {
 		if b[i] != 0x1b {
@@ -414,6 +419,10 @@ func scanSeqs(b []byte) (clobber, pasteOff bool, cut int) {
 					}
 					if n == 47 || n == 1047 || n == 1049 {
 						clobber = true
+						alt = -1
+						if b[j] == 'h' {
+							alt = 1
+						}
 					}
 					if n == 2004 && b[j] == 'l' {
 						pasteOff = true
@@ -423,5 +432,5 @@ func scanSeqs(b []byte) (clobber, pasteOff bool, cut int) {
 		}
 		i = j
 	}
-	return clobber, pasteOff, cut
+	return clobber, pasteOff, alt, cut
 }

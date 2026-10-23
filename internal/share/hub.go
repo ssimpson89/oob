@@ -74,6 +74,7 @@ type hangupper interface {
 // input and new leases are refused.
 type hub struct {
 	tr      *console.Transport
+	alt     console.AltTracker // whether the remote is in a full-screen program; the loop's
 	ty      *typer.Typer
 	closeTr func() // closes the transport, once
 	stop    context.CancelFunc
@@ -415,6 +416,7 @@ func (h *hub) pump() {
 // everyone. The state goes first, so a client that reads it with the data
 // sees where the console was when that data arrived.
 func (h *hub) output(b []byte) {
+	h.alt.Follow(h.tr.Link, b)
 	if h.tr.Observe != nil {
 		if kind, at, _ := h.tr.Observe(b); kind != h.kind || at != h.atPrompt {
 			h.kind, h.atPrompt = kind, at

@@ -60,6 +60,7 @@ type console struct {
 	lastOut time.Time
 	dirty   bool // the region or bar needs repainting once the stream is idle
 	scan    clobberScan
+	alt     bool // the remote is on the alternate screen: no region, no bar
 	// pasteLost: the remote turned bracketed paste off; turn it back on at the
 	// next repaint.
 	pasteLost bool
@@ -140,8 +141,11 @@ func (c *console) reassert() {
 		seq += fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.staleRow)
 		c.staleRow = 0
 	}
-	if small { // no bar: the whole screen is the remote's
+	if small || c.alt { // no bar: the whole screen is the remote's
 		seq += "\x1b[r"
+		if c.alt && !small {
+			seq += fmt.Sprintf("\x1b[%d;1H\x1b[2K", c.rows)
+		}
 	} else {
 		seq += c.regionSeq() + c.paintSeq()
 	}
@@ -153,7 +157,7 @@ func (c *console) repaint() {
 	if c.closed {
 		return
 	}
-	if c.rows < minBarRows {
+	if c.rows < minBarRows || c.alt {
 		return
 	}
 	c.dirty = true
@@ -220,6 +224,14 @@ func (c *console) Output(b []byte) {
 		}
 	}
 	clob, paste := c.scan.Feed(b)
+	switch a := c.scan.alt; {
+	case a > 0 && !c.alt: // a full-screen program: give it the whole screen
+		c.alt, c.dirty, clob = true, true, false
+	case a < 0 && c.alt: // it ended: the region and bar come back
+		c.alt, c.dirty = false, true
+	case c.alt:
+		clob = false
+	}
 	if clob || paste {
 		c.dirty = true
 	}

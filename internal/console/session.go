@@ -208,10 +208,12 @@ func Run(cs Setup) (int, error) {
 	guard(cleanup, func() {
 		defer close(outDone)
 		buf := make([]byte, 32<<10)
+		var alt AltTracker
 		for {
 			n, err := cs.Out.Read(buf)
 			tr.log("RX", buf[:n])
 			con.Output(buf[:n])
+			alt.Follow(cs.Link, buf[:n])
 			if o, ok := cs.Link.(observer); ok && n > 0 {
 				if kind, at, changed := o.Observe(buf[:n]); changed {
 					con.SetKind(kind, at)

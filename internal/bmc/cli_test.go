@@ -240,8 +240,12 @@ func TestCLILinkMapInput(t *testing.T) {
 			l := newCLILink(&sshLink{}, tc.sp, tc.atPrompt, tc.plain)
 			out, note := l.MapInput(arrow)
 			if tc.mapped {
-				if string(out) != "ab" || note == "" {
-					t.Errorf("arrow: got %q %q, want it dropped with a note", out, note)
+				if string(out) != "a\x10b" || note != "" {
+					t.Errorf("arrow: got %q %q, want ctrl+p and no note", out, note)
+				}
+				l.SetAltScreen(true)
+				if out, note := l.MapInput(arrow); string(out) != "ab" || note == "" {
+					t.Errorf("arrow in full screen: got %q %q, want it dropped with a note", out, note)
 				}
 				if out, _ := l.MapInput(lone); string(out) != "\x1b\x1b" {
 					t.Errorf("lone ESC: got %q, want ESC ESC", out)
