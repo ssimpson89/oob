@@ -49,6 +49,7 @@ const (
 	opDisconnect = "disconnect" // host window: end the console
 	opResize     = "resize"     // host window: the terminal changed size
 	opFit        = "fit"        // host window: make the remote agree with the size
+	opAutoSize   = "autosize"   // host window: type the size once if the queue is empty and the line is a clean shell prompt
 	opSizeLine   = "sizeline"   // the command that fits the size, if it is typed
 )
 

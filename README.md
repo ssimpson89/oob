@@ -202,12 +202,16 @@ under iLO Settings > Access > IPMI/DCMI over LAN, off by default on iLO 7). oob 
 a dead BMC fails in about 11 seconds instead of 21.
 
 The iLO VSP reads ESC together with the byte after it: `ESC ESC` passes both, `ESC (` returns to the
-iLO CLI, and `ESC` plus anything else is dropped. So an arrow key, function key or Alt-key never
-reaches the server (measured on iLO 7). In the console, oob types the Esc key as `ESC ESC` and drops
-the other escape sequences, with a one-time note on the bar. Arrows work in plain shell with
-`ctrl+p`, `ctrl+n`, `ctrl+b` and `ctrl+f`, and in vim with `h`, `j`, `k` and `l`. An AI tool's
-`send_keys` with an arrow or function key gets an error instead. For full keys, `ssh` to the
-server itself (`oob ssh` reaches the iLO, not the server), or use IPMI SOL if IPMI over LAN is enabled.
+iLO CLI, and `ESC` plus anything else is dropped. So an escape sequence never reaches the server
+(measured on iLO 7). In the console, oob types the Esc key as `ESC ESC`. At a shell prompt it sends
+the arrow keys as `ctrl+p`, `ctrl+n`, `ctrl+f` and `ctrl+b`, and Home and End as `ctrl+a` and
+`ctrl+e`, which readline understands. Delete, function keys and Alt-keys are dropped, with a note on
+the bar. When the remote switches to the alternate screen (vim, less, top) the bar is hidden so the
+program has the whole screen, and arrow keys are dropped (use `h`, `j`, `k` and `l` in vim); the bar
+comes back when the program exits. An AI tool's `send_keys` gets the same arrow translation at a
+shell, and an error for an arrow key in a full-screen program or for a function key. For full keys,
+`ssh` to the server itself (`oob ssh` reaches the iLO, not the server), or use IPMI SOL if IPMI over
+LAN is enabled.
 
 ## Dell iDRAC (untested)
 
@@ -243,6 +247,7 @@ Press `ctrl+]`, then one key. Everything else you type goes to the machine.
 | Key | What it does |
 | --- | --- |
 | `s` | Send the window size (`stty rows R cols C` over SOL, a window change over SSH) |
+| (automatic) | On a serial console (SOL, iLO VSP, iDRAC com2, Supermicro SOL) oob types the size once, the first time it sees an empty shell prompt such as `root@node01:~# ` after connecting, with the bar note `sent size RxC`. It skips login and password questions, BMC prompts, bootloaders, full-screen programs and anything still queued, and never repeats on its own. Only the window that opened a shared console does it |
 | `a` | Toggle sending the size whenever you resize (off by default for SOL, since it types into the shell) |
 | `l` | Start or stop logging (includes the last 10000 lines you already saw) |
 | `b` | Send BREAK |

@@ -994,3 +994,77 @@ func TestLogMarkersKeepOrderAfterErasedLine(t *testing.T) {
 		t.Errorf("markers out of order (first=%d second=%d):\n%s", i, j, b)
 	}
 }
+
+func TestConsoleReleasesRegionOnAlternateScreen(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	c := newConsole(&out, "node01", "vsp", 24, 80)
+	c.Start()
+	out.Reset()
+
+	// vim starts, its start split across reads: the region is released and the
+	// bar row blanked, and nothing paints the bar while it runs.
+	c.Output([]byte("\x1b[?10"))
+	c.Output([]byte("49h\x1b[2J~\r\n"))
+	s := out.String()
+	if !strings.Contains(s, "\x1b[r") {
+		t.Fatalf("alternate screen: region not released: %q", s)
+	}
+	if strings.Contains(s, "\x1b[24;1H") || strings.Contains(s, "\x1b[2K") {
+		t.Errorf("alternate screen: the bar row was touched: %q", s)
+	}
+	if strings.Contains(s, "\x1b[1;23r") {
+		t.Errorf("region set while on the alternate screen: %q", s)
+	}
+	out.Reset()
+	c.SetMode(modeCommand)
+	c.Note("hello", false)
+	c.Output([]byte("\x1b[r\x1b[2Jmore"))
+	if s := out.String(); strings.Contains(s, "\x1b[1;23r") || strings.Contains(s, "hello") {
+		t.Errorf("bar painted on the alternate screen: %q", s)
+	}
+	out.Reset()
+
+	// vim exits: the region and bar are back at once.
+	c.Output([]byte("\x1b[r\x1b[?1049l$ "))
+	if s := out.String(); !strings.Contains(s, "\x1b[1;23r") || !strings.Contains(s, "\x1b[24;1H") {
+		t.Errorf("leaving the alternate screen: region and bar not restored: %q", s)
+	}
+}
+
+func TestConsoleBareRegionResetAtShellRestores(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	c := newConsole(&out, "node01", "vsp", 24, 80)
+	c.Start()
+	out.Reset()
+	c.Output([]byte("x\x1b[r"))
+	if s := out.String(); !strings.Contains(s, "\x1b[1;23r") || !strings.Contains(s, "\x1b[24;1H") {
+		t.Errorf("CSI r at a shell: region and bar not restored: %q", s)
+	}
+}
+
+func TestAlternateScreenFirstFrameInTheSameChunk(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var out bytes.Buffer
+	c := newConsole(&out, "node01", "vsp", 24, 80)
+	c.Start()
+	out.Reset()
+	frame := "\x1b[1;1Htop\x1b[24;1Hlast row\x1b[1;24r\x1b[24;80H"
+	c.Output([]byte("$ vim\r\n\x1b[?1049h" + frame))
+	s := out.String()
+	sw, rel := strings.Index(s, "\x1b[?1049h"), strings.Index(s, "\x1b7\x1b[r\x1b8")
+	if sw < 0 || rel < sw+len("\x1b[?1049h") || rel > strings.Index(s, frame) {
+		t.Fatalf("region not released between the switch and the frame: %q", s)
+	}
+	if !strings.HasSuffix(s, frame) {
+		t.Errorf("something was written after the first frame: %q", s[strings.Index(s, frame)+len(frame):])
+	}
+	// Leaving restores the region and bar after the leave sequence.
+	out.Reset()
+	c.Output([]byte("\x1b[?1049l$ "))
+	s = out.String()
+	if i, j := strings.Index(s, "\x1b[?1049l"), strings.Index(s, "\x1b[1;23r"); i < 0 || j < i || !strings.Contains(s, "\x1b[24;1H") {
+		t.Errorf("leaving: region and bar not restored after the leave: %q", s)
+	}
+}

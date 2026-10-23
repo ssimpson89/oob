@@ -2,7 +2,9 @@ package console
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,23 +19,25 @@ func TestMapVSPInput(t *testing.T) {
 		{"lone esc", esc, esc + esc, false},
 		{"lone esc after text", "ab" + esc, "ab" + esc + esc, false},
 		{"two esc keys", esc + esc, esc + esc + esc + esc, false},
-		{"csi arrow", esc + "[A", "", true},
+		{"csi arrow", esc + "[A", "\x10", false},
 		{"csi with params", esc + "[1;5C", "", true},
-		{"csi tilde", esc + "[3~", "", true},
+		{"delete is dropped", esc + "[3~", "", true},
+		{"function key", esc + "[15~", "", true},
 		{"csi cut off", "a" + esc + "[1;", "a", true},
 		{"ss3", esc + "OP", "", true},
 		{"ss3 cut off", esc + "O", "", true},
 		{"esc then a printable key", esc + "x", esc + esc + "x", false},
 		{"fast esc :wq", esc + ":wq\r", esc + esc + ":wq\r", false},
 		{"alt paren is never sent", esc + "(", "", true},
-		{"text around an arrow", "a" + esc + "[Ab", "ab", true},
+		{"text around an arrow", "a" + esc + "[Ab", "a\x10b", false},
+		{"text around a function key", "a" + esc + "OPb", "ab", true},
 		{"focus in", esc + "[I", "", false},
 		{"focus out", esc + "[O", "", false},
 		{"focus then text", esc + "[Ix", "x", false},
-		{"esc then arrow", esc + esc + "[A", esc + esc, true}, // the first is lone, the arrow is dropped
+		{"esc then arrow", esc + esc + "[A", esc + esc + "\x10", false}, // the first is lone
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, note := MapVSPInput([]byte(tc.in))
+			out, note := MapVSPInput([]byte(tc.in), false)
 			if string(out) != tc.out {
 				t.Errorf("out = %q, want %q", out, tc.out)
 			}
@@ -47,6 +51,56 @@ func TestMapVSPInput(t *testing.T) {
 				t.Errorf("ESC ( produced: %q", out)
 			}
 		})
+	}
+}
+
+func TestMapVSPArrowsAsReadline(t *testing.T) {
+	const esc = "\x1b"
+	for _, tc := range []struct{ in, ctl string }{
+		{"[A", "\x10"}, {"OA", "\x10"},
+		{"[B", "\x0e"}, {"OB", "\x0e"},
+		{"[C", "\x06"}, {"OC", "\x06"},
+		{"[D", "\x02"}, {"OD", "\x02"},
+		{"[H", "\x01"}, {"OH", "\x01"}, {"[1~", "\x01"}, {"[7~", "\x01"},
+		{"[F", "\x05"}, {"OF", "\x05"}, {"[4~", "\x05"}, {"[8~", "\x05"},
+	} {
+		out, note := MapVSPInput([]byte(esc+tc.in), false)
+		if string(out) != tc.ctl || note != "" {
+			t.Errorf("shell %q: got %q %q, want %q and no note", tc.in, out, note, tc.ctl)
+		}
+		out, note = MapVSPInput([]byte(esc+tc.in), true)
+		if len(out) != 0 || note != VSPKeysNote {
+			t.Errorf("full screen %q: got %q %q, want it dropped with the note", tc.in, out, note)
+		}
+	}
+	// Delete is never mapped, even at a shell (ctrl+d would end the shell).
+	if out, note := MapVSPInput([]byte(esc+"[3~"), false); len(out) != 0 || note == "" {
+		t.Errorf("delete: got %q %q", out, note)
+	}
+}
+
+func TestAltTrackerAcrossSplitOutput(t *testing.T) {
+	l := &vspLink{}
+	var tr AltTracker
+	for _, c := range []struct {
+		chunk string
+		want  bool
+	}{
+		{"prompt$ vim\r\n", false},
+		{"\x1b[?10", false},
+		{"49h~\r\n", true},
+		{"\x1b[?25l", true},
+		{"\x1b[?1049", true},
+		{"l$ ", false},
+		{"\x1b[?47h", true},
+		{"\x1b[?47l", false},
+		{"\x1b[?1047h", true},
+		{"\x1b[?1047l", false},
+	} {
+		tr.Follow(l, []byte(c.chunk))
+		if got := l.alt.Load(); got != c.want {
+			t.Fatalf("after %q: alt = %v, want %v", c.chunk, got, c.want)
+		}
 	}
 }
 
@@ -69,9 +123,12 @@ func TestStripEsc(t *testing.T) {
 // vspLink is a fakeLink that maps input like an iLO VSP in the console.
 type vspLink struct {
 	fakeLink
+	alt atomic.Bool
 }
 
-func (*vspLink) MapInput(b []byte) ([]byte, string) { return MapVSPInput(b) }
+func (l *vspLink) MapInput(b []byte) ([]byte, string) { return MapVSPInput(b, l.alt.Load()) }
+func (l *vspLink) SetAltScreen(on bool)               { l.alt.Store(on) }
+func (*vspLink) Serial() bool                         { return true } // typing is paced, as on the real VSP
 
 func vspKeys(t *testing.T, l Link) (*consoleKeys, *console) {
 	t.Helper()
@@ -115,31 +172,41 @@ func TestConsoleKeysOnAVSPLink(t *testing.T) {
 		t.Errorf("a lone ESC gave a note: %q", n)
 	}
 
-	// An arrow key is dropped, with the note.
+	// An arrow key at a shell is ctrl+p, with no note.
 	k.Input([]byte("a\x1b[Ab"))
-	wait("\x1b\x1bab")
+	wait("\x1b\x1ba\x10b")
+	if n := barNote(con); n != "" {
+		t.Errorf("an arrow key at a shell gave a note: %q", n)
+	}
+
+	// In a full-screen program it is dropped, with the note.
+	fl.alt.Store(true)
+	k.Input([]byte("\x1b[A"))
+	k.Input([]byte("c"))
+	wait("\x1b\x1ba\x10bc")
 	if n := barNote(con); n != VSPKeysNote {
 		t.Errorf("bar note = %q, want the VSP note", n)
 	}
+	fl.alt.Store(false)
 
 	// The note shows once per session: clear it, press another, and it stays clear.
 	con.mu.Lock()
 	con.st.note = ""
 	con.mu.Unlock()
 	k.Input([]byte("\x1bOP"))
-	k.Input([]byte("\x1b(c")) // ESC ( is dropped, never typed
-	wait("\x1b\x1babc")
+	k.Input([]byte("\x1b(d")) // ESC ( is dropped, never typed
+	wait("\x1b\x1ba\x10bcd")
 	if n := barNote(con); n != "" {
 		t.Errorf("the note showed twice: %q", n)
 	}
 
 	// A paste has its escape sequences stripped, and types the rest.
 	k.Input([]byte("\x1b[200~echo \x1b[31mhi\x1b[201~"))
-	wait("\x1b\x1babcecho hi")
+	wait("\x1b\x1ba\x10bcdecho hi")
 
 	// A fast Esc, :wq and Enter in one read is a lone ESC and the keys.
 	k.Input([]byte("\x1b:wq\r"))
-	wait("\x1b\x1babcecho hi\x1b\x1b:wq\r")
+	wait("\x1b\x1ba\x10bcdecho hi\x1b\x1b:wq\r")
 }
 
 func TestConsoleKeysOnANonVSPLinkAreUnchanged(t *testing.T) {
@@ -172,13 +239,13 @@ func TestInputFilterDropsAFragmentedKeyWhole(t *testing.T) {
 		reads []string
 		want  string
 	}{
-		{"ss3 split", []string{esc + "O", "A"}, ""},
+		{"ss3 split", []string{esc + "O", "A"}, "\x10"},
 		{"csi split after the params", []string{esc + "[1;5", "C"}, ""},
-		{"csi split after the bracket", []string{esc + "[", "A"}, ""},
+		{"csi split after the bracket", []string{esc + "[", "A"}, "\x10"},
 		{"split in three", []string{esc + "[1", ";5", "C"}, ""},
-		{"text around a split key", []string{"a" + esc + "O", "Ab"}, "ab"},
-		{"two split keys", []string{esc + "[1", "A" + esc + "[", "Bc"}, "c"},
-		{"whole keys are as before", []string{esc + "[A", "x" + esc + "OP"}, "x"},
+		{"text around a split key", []string{"a" + esc + "O", "Ab"}, "a\x10b"},
+		{"two split keys", []string{esc + "[1", "A" + esc + "[", "Bc"}, "\x0ec"},
+		{"whole keys are as before", []string{esc + "[A", "x" + esc + "OP"}, "\x10x"},
 		{"lone esc is typed at once", []string{esc}, esc + esc},
 		{"esc then text", []string{esc, "x"}, esc + esc + "x"},
 		{"ctrl+c inside a half key still goes", []string{esc + "[1", "\x03"}, "\x03"},
@@ -238,11 +305,11 @@ func TestConsoleKeysDropAFragmentedArrowWhole(t *testing.T) {
 	k.Input([]byte("Ab"))
 	k.Input([]byte("\x1b[1;5"))
 	k.Input([]byte("Cd"))
-	for i := 0; i < 200 && sent() != "abd"; i++ {
+	for i := 0; i < 200 && sent() != "a\x10bd"; i++ {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := sent(); got != "abd" {
-		t.Fatalf("typed %q, want abd (the halves of an arrow key must not be typed)", got)
+	if got := sent(); got != "a\x10bd" {
+		t.Fatalf("typed %q, want a ctrl+p b d (the halves of an arrow key must not be typed)", got)
 	}
 	if n := barNote(con); n != VSPKeysNote {
 		t.Errorf("bar note = %q", n)
@@ -254,11 +321,11 @@ func TestConsoleKeysDropAFragmentedArrowWhole(t *testing.T) {
 	}
 	k.Flush()
 	k.Input([]byte("e"))
-	for i := 0; i < 200 && sent() != "abde"; i++ {
+	for i := 0; i < 200 && sent() != "a\x10bde"; i++ {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := sent(); got != "abde" {
-		t.Errorf("typed %q, want abde", got)
+	if got := sent(); got != "a\x10bde" {
+		t.Errorf("typed %q, want a ctrl+p bde", got)
 	}
 }
 
@@ -273,7 +340,7 @@ func (l *togglingLink) MapInput(b []byte) ([]byte, string) {
 	if l.off {
 		return b, ""
 	}
-	return MapVSPInput(b)
+	return MapVSPInput(b, false)
 }
 
 func TestInputFilterHoldsNothingWhileTheLinkIsNotMapping(t *testing.T) {
@@ -332,5 +399,222 @@ func TestPasteToAPasteStrippingLinkLosesWholeEscapeSequences(t *testing.T) {
 	}
 	if got := string(fl.sentCopy()); got != "echo hi" {
 		t.Errorf("sent %q, want %q", got, "echo hi")
+	}
+}
+
+func TestEnterAfterALongPasteGoesLast(t *testing.T) {
+	paste := strings.Repeat("pAssw0rd-", 34)[:300]
+	for _, tc := range []struct {
+		name  string
+		reads []string
+	}{
+		{"bracketed", []string{"\x1b[200~" + paste[:100], paste[100:] + "\x1b[201~", "\r"}},
+		{"bracketed, one read", []string{"\x1b[200~" + paste + "\x1b[201~", "\r"}},
+		{"markers off, plain keystrokes", []string{paste[:100], paste[100:200], paste[200:], "\r"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			fl := &vspLink{}
+			ms := time.Millisecond
+			con := newConsole(&bytes.Buffer{}, "h", "vsp", 24, 80)
+			con.Start()
+			defer con.Close()
+			k := newKeys(&Setup{Link: fl, Pacing: Pacing{Char: &ms, Line: &ms}}, con, func() {}, make(chan struct{}))
+			k.start(nil)
+			for _, r := range tc.reads {
+				k.Input([]byte(r))
+			}
+			con.mu.Lock()
+			wait, line := con.st.enterWait, barLine(con.st, 80)
+			con.mu.Unlock()
+			if !wait || !strings.Contains(line, "Enter") {
+				t.Errorf("enterWait = %v, bar = %q, want the Enter note with the progress", wait, line)
+			}
+			for i := 0; i < 600; i++ {
+				fl.mu.Lock()
+				n := len(fl.sent)
+				fl.mu.Unlock()
+				if n >= len(paste)+1 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := string(fl.sentCopy()); got != paste+"\r" {
+				t.Errorf("sent %q, want the paste then CR", got)
+			}
+		})
+	}
+}
+
+func TestShellPrompt(t *testing.T) {
+	for line, want := range map[string]bool{
+		"root@node01:~# ":            true,
+		"[user@node01 dir]$ ":        true,
+		"user@node01:/var/log$ ":     true,
+		"bash-5.1$ ":                 true,
+		"sh-4.4# ":                   true,
+		"root@node01:~# ls":          false,
+		"root@node01:~#":             false,
+		"node01 login: ":             false,
+		"Password: ":                 false,
+		"[sudo] password for u: ":    false,
+		"hpeiLO-> ":                  false,
+		"grub> ":                     false,
+		"</>hpiLO-> ":                false,
+		"-- INSERT --":               false,
+		"~":                          false,
+		"user@node01's password: ":   false,
+		"Press any key to continue ": false,
+		"":                           false,
+	} {
+		if got := ShellPrompt(line); got != want {
+			t.Errorf("ShellPrompt(%q) = %v, want %v", line, got, want)
+		}
+	}
+}
+
+// sizeLink is a serial VSP-like link that types its size with stty.
+type sizeLink struct{ vspLink }
+
+func (*sizeLink) SizeLine(r, c int) (string, bool) {
+	return fmt.Sprintf("stty rows %d cols %d", r, c), true
+}
+
+func TestSizeOnceAtTheFirstShellPrompt(t *testing.T) {
+	const prompt = "\r\nroot@node01:~# "
+	sentOf := func(fl *sizeLink) string { return string(fl.sentCopy()) }
+	quiet := func(t *testing.T, fl *sizeLink, why string) {
+		t.Helper()
+		time.Sleep(60 * time.Millisecond)
+		if got := sentOf(fl); got != "" {
+			t.Fatalf("%s: sent %q", why, got)
+		}
+	}
+
+	t.Run("not a shell prompt, or full screen", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		for _, out := range []string{"node01 login: ", "Password: ", "hpeiLO-> ", "\r\nLast login: Mon\r\n"} {
+			con.Output([]byte(out))
+			k.sizeOnce()
+		}
+		quiet(t, fl, "not a shell prompt")
+		con.Output([]byte("\x1b[?1049h~\r\nroot@node01:~# "))
+		k.sizeOnce()
+		quiet(t, fl, "full screen")
+	})
+
+	t.Run("input queued just before", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		con.Output([]byte(prompt))
+		k.q.Enqueue([]byte(strings.Repeat("a", 40))) // paced: still queued
+		k.sizeOnce()
+		for i := 0; i < 20 && len(fl.sentCopy()) == 0; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := sentOf(fl); strings.Contains(got, "stty") {
+			t.Fatalf("size typed over queued input: %q", got)
+		}
+	})
+
+	t.Run("typed on the line", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		k.Input([]byte("ls"))
+		for i := 0; i < 200 && sentOf(fl) != "ls"; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		con.Output([]byte(prompt))
+		k.sizeOnce()
+		time.Sleep(60 * time.Millisecond)
+		if got := sentOf(fl); got != "ls" {
+			t.Fatalf("size typed on a line with text: %q", got)
+		}
+	})
+
+	t.Run("fires once", func(t *testing.T) {
+		fl := &sizeLink{}
+		k, con := vspKeys(t, fl)
+		con.Output([]byte(prompt))
+		k.sizeOnce()
+		for i := 0; i < 200 && sentOf(fl) != "stty rows 23 cols 80\r"; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := sentOf(fl); got != "stty rows 23 cols 80\r" {
+			t.Fatalf("sent %q", got)
+		}
+		if n := barNote(con); n != "sent size 23x80" {
+			t.Errorf("bar note = %q", n)
+		}
+		con.Output([]byte(prompt))
+		k.sizeOnce()
+		time.Sleep(60 * time.Millisecond)
+		if got := sentOf(fl); got != "stty rows 23 cols 80\r" {
+			t.Errorf("repeated: %q", got)
+		}
+	})
+}
+
+func TestSizeOnceForAPromptThatArrivedBeforeTheKeysRan(t *testing.T) {
+	// Run starts the keys before the output loop; the prompt is already in the
+	// console's line when the first chunk is looked at.
+	fl := &sizeLink{}
+	k, con := vspKeys(t, fl)
+	con.Output([]byte("Last login\r\nroot@node01:~# "))
+	k.sizeOnce()
+	for i := 0; i < 200 && len(fl.sentCopy()) < len("stty rows 23 cols 80\r"); i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := string(fl.sentCopy()); got != "stty rows 23 cols 80\r" {
+		t.Fatalf("sent %q", got)
+	}
+}
+
+func TestSizeOnceNotOnAFreeSizeLink(t *testing.T) {
+	fl := &freeLink{}
+	k, con := vspKeys(t, fl)
+	con.Output([]byte("root@node01:~# "))
+	k.sizeOnce()
+	time.Sleep(60 * time.Millisecond)
+	if len(fl.sentCopy()) != 0 || len(fl.fits) != 0 {
+		t.Errorf("plain ssh: sent %q fits %v", fl.sentCopy(), fl.fits)
+	}
+}
+
+type freeLink struct{ sizeLink }
+
+func (*freeLink) SizeIsFree() bool { return true }
+
+func TestEnterNoteStaysUntilTheQueueEmptiesAndFitsTheBar(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	con := newConsole(&bytes.Buffer{}, "node01", "vsp", 24, 80)
+	con.SetSend(200, 300)
+	con.EnterWait()
+	for _, w := range []int{80, 50, 30} {
+		con.mu.Lock()
+		line := barLine(con.st, w)
+		con.mu.Unlock()
+		if !strings.Contains(line, "sending") {
+			t.Errorf("width %d lost the progress: %q", w, line)
+		}
+	}
+	con.mu.Lock()
+	if !strings.Contains(barLine(con.st, 80), "Enter after paste") {
+		t.Error("progress layout lacks the Enter note")
+	}
+	con.mu.Unlock()
+	con.SetSend(100, 300) // still sending: still shown
+	con.mu.Lock()
+	still := con.st.enterWait
+	con.mu.Unlock()
+	if !still {
+		t.Fatal("note dropped while the queue was not empty")
+	}
+	con.SetSend(0, 0)
+	con.mu.Lock()
+	defer con.mu.Unlock()
+	if con.st.enterWait || strings.Contains(barLine(con.st, 80), "Enter") {
+		t.Error("note kept after the queue emptied")
 	}
 }

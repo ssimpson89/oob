@@ -440,10 +440,12 @@ func TestSendKeysOnAnILOVSP(t *testing.T) {
 	h.connect()
 	f := h.host("node01")
 
+	f.alt.Store(true)
 	out, isErr := h.keys("s1", "", "up")
-	if !isErr || !strings.Contains(out, "iLO VSP, which can't pass arrow keys") {
-		t.Fatalf("arrow key: got %q %v, want an error naming the VSP limitation", out, isErr)
+	if !isErr || !strings.Contains(out, "iLO VSP, which can't pass") {
+		t.Fatalf("arrow key in full screen: got %q %v, want an error naming the VSP limitation", out, isErr)
 	}
+	f.alt.Store(false)
 	out, isErr = h.keys("s1", "", "f1")
 	if !isErr || !strings.Contains(out, "iLO VSP") {
 		t.Fatalf("function key: got %q %v", out, isErr)
@@ -451,6 +453,19 @@ func TestSendKeysOnAnILOVSP(t *testing.T) {
 	if got := f.rawSent(); got != "" {
 		t.Fatalf("refused keys still typed %q", got)
 	}
+
+	for key, want := range map[string]string{"up": "\x10", "down": "\x0e", "right": "\x06", "left": "\x02", "home": "\x01", "end": "\x05"} {
+		before := f.rawSent()
+		if out, isErr = h.keys("s1", "", key); isErr {
+			t.Fatalf("%s at a shell: %q", key, out)
+		}
+		if got := f.rawSent()[len(before):]; got != want {
+			t.Errorf("%s typed %q, want %q", key, got, want)
+		}
+	}
+	f.mu.Lock()
+	f.sent = nil
+	f.mu.Unlock()
 
 	if out, isErr = h.keys("s1", "", "esc"); isErr {
 		t.Fatalf("esc: %q", out)
@@ -487,9 +502,9 @@ func TestSendKeysEscThenEnterKeepsTheKeysApartOnAnILOVSP(t *testing.T) {
 	// Text then a key keeps its boundary too, and the whole call is still
 	// checked first: one key the VSP can't pass sends nothing at all.
 	before := f.rawSent()
-	out, isErr := h.keys("s1", "abc", "esc", "up")
+	out, isErr := h.keys("s1", "abc", "esc", "f1")
 	if !isErr || !strings.Contains(out, "iLO VSP") {
-		t.Fatalf("esc, up: %q %v", out, isErr)
+		t.Fatalf("esc, f1: %q %v", out, isErr)
 	}
 	if got := f.rawSent(); got != before {
 		t.Errorf("a refused call still typed %q", got[len(before):])

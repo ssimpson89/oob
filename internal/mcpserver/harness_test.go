@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,6 +110,7 @@ type fakeHost struct {
 	pr   *io.PipeReader
 	outq chan []byte
 	done chan console.Result
+	alt  atomic.Bool
 
 	mu       sync.Mutex
 	sent     []byte
@@ -313,10 +315,11 @@ func (f *fakeHost) MapInput(b []byte) ([]byte, string) {
 	if !f.vsp {
 		return b, ""
 	}
-	return console.MapVSPInput(b)
+	return console.MapVSPInput(b, f.alt.Load())
 }
-func (f *fakeHost) SizeIsFree() bool { return false }
-func (f *fakeHost) Serial() bool     { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
+func (f *fakeHost) SetAltScreen(on bool) { f.alt.Store(on) }
+func (f *fakeHost) SizeIsFree() bool     { return false }
+func (f *fakeHost) Serial() bool         { f.mu.Lock(); defer f.mu.Unlock(); return f.serial }
 
 // finish ends the transport the way a hung-up console does.
 func (f *fakeHost) finish() {

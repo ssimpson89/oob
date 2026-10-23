@@ -125,6 +125,27 @@ func (t *Typer) Enqueue(b []byte) <-chan struct{} {
 	return done
 }
 
+// EnqueueIfIdle queues b only if nothing is queued, being written or waiting
+// as urgent, and reports whether it did. The check and the queueing are one
+// step, so nothing can be queued in between.
+func (t *Typer) EnqueueIfIdle(b []byte) bool {
+	t.init()
+	t.mu.Lock()
+	if t.stopped || len(t.q) > 0 || t.flight > 0 || len(t.urgent) > 0 {
+		t.mu.Unlock()
+		return false
+	}
+	t.total = 0
+	t.q = append(t.q, b...)
+	t.accepted += len(b)
+	t.total += len(b)
+	t.waiters = append(t.waiters, waiter{t.accepted, make(chan struct{})})
+	t.report = true
+	t.mu.Unlock()
+	t.poke()
+	return true
+}
+
 // Queued is how many bytes Enqueue has accepted that are neither written nor
 // dropped yet. Unlike Progress it is exact the moment Enqueue is called, from
 // any goroutine.

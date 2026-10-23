@@ -74,6 +74,7 @@ type hangupper interface {
 // input and new leases are refused.
 type hub struct {
 	tr      *console.Transport
+	alt     console.AltTracker // whether the remote is in a full-screen program; the loop's
 	ty      *typer.Typer
 	closeTr func() // closes the transport, once
 	stop    context.CancelFunc
@@ -101,6 +102,7 @@ type hub struct {
 	kind      string
 	atPrompt  bool
 	keysNoted bool // the link's input note was shown
+	sized     bool // the size was typed automatically (once per hub)
 
 	lease   bool
 	leaseID int // which acquisition holds the keyboard, while lease is set
@@ -415,6 +417,7 @@ func (h *hub) pump() {
 // everyone. The state goes first, so a client that reads it with the data
 // sees where the console was when that data arrived.
 func (h *hub) output(b []byte) {
+	h.alt.Follow(h.tr.Link, b)
 	if h.tr.Observe != nil {
 		if kind, at, _ := h.tr.Observe(b); kind != h.kind || at != h.atPrompt {
 			h.kind, h.atPrompt = kind, at
@@ -1172,12 +1175,40 @@ func (h *hub) agentWrite(p *peer, m msg, reply func(error)) {
 	})
 }
 
+// autoSize types the size line, once per hub, if the host window asks, the
+// console is serial, nothing is queued, typed or leased, and the cursor line is
+// an empty shell prompt outside a full-screen program. All of it is checked and
+// the line queued inside the loop, so no input can slip in between.
+func (h *hub) autoSize(p *peer, rows, cols int) (string, bool) {
+	sl, ok := h.tr.Link.(sizeLiner)
+	if !ok || p != h.local || p.agent || h.sized || h.closed || h.lease || h.busy > 0 || h.writing ||
+		h.pending() > 0 || h.lineDirty || h.alt.On() || h.tr.Link.SizeIsFree() ||
+		!console.ShellPrompt(h.cursorText()) {
+		return "", false
+	}
+	if s, ok := h.tr.Link.(serialLink); !ok || !s.Serial() {
+		return "", false
+	}
+	text, ok := sl.SizeLine(rows, cols)
+	if !ok {
+		return "", false
+	}
+	h.sized = true
+	h.lastKey = time.Now()
+	h.enqueue([]byte(text+"\r"), byUser, nil)
+	return text, true
+}
+
 // linkOp runs an operation on the transport's link. It is admitted here; the
 // link is used in a goroutine of its own, with the hub busy, and the result
 // comes back as a message.
 func (h *hub) linkOp(p *peer, m msg, reply func(msg, error)) {
 	local := p == h.local
 	switch m.Op {
+	case opAutoSize:
+		text, ok := h.autoSize(p, m.Rows, m.Cols)
+		reply(msg{Text: text, OK: ok}, nil)
+		return
 	case opSizeLine:
 		sl, ok := h.tr.Link.(sizeLiner)
 		if !local || p.agent || !ok { // like resize and fit: a joined window doesn't change the host's console, and typing this line would

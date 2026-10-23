@@ -30,6 +30,7 @@ type fakeConsole struct {
 	pr   *io.PipeReader
 	pw   *io.PipeWriter
 	done chan console.Result
+	alt  atomic.Bool
 
 	mu                   sync.Mutex
 	sent                 []byte
@@ -124,8 +125,10 @@ func (f *fakeConsole) MapInput(b []byte) ([]byte, string) {
 	if !f.vsp {
 		return b, ""
 	}
-	return console.MapVSPInput(b)
+	return console.MapVSPInput(b, f.alt.Load())
 }
+
+func (f *fakeConsole) SetAltScreen(on bool) { f.alt.Store(on) }
 
 func (f *fakeConsole) got() string {
 	f.mu.Lock()
@@ -755,9 +758,17 @@ func TestVSPInputIsMappedAtTheHub(t *testing.T) {
 	win2.Enqueue([]byte("a"))
 	eventually(t, "a typed after it", func() bool { return f.got() == "\x1b\x1ba" })
 
-	// An arrow key is dropped, with one note to the windows; typing around it goes on.
-	win.Enqueue([]byte("b\x1b[Ac\x1b[Ad"))
-	eventually(t, "typed around the arrow keys", func() bool { return f.got() == "\x1b\x1babcd" })
+	// An arrow key at a shell is ctrl+p; in a full-screen program (seen in the
+	// remote's output) it is dropped, with one note to the windows.
+	win.Enqueue([]byte("b\x1b[Ac"))
+	eventually(t, "arrow at a shell", func() bool { return f.got() == "\x1b\x1bab\x10c" })
+	f.emit("\x1b[?10")
+	f.emit("49h~")
+	eventually(t, "alt screen seen", func() bool { return f.alt.Load() })
+	win.Enqueue([]byte("\x1b[A\x1b[Ad"))
+	eventually(t, "typed around the arrow keys", func() bool { return f.got() == "\x1b\x1bab\x10cd" })
+	f.emit("\x1b[?1049l")
+	eventually(t, "alt screen left", func() bool { return !f.alt.Load() })
 	notes := 0
 	timeout := time.After(300 * time.Millisecond)
 loop:
@@ -777,7 +788,7 @@ loop:
 
 	// Focus reports are dropped without a word, and ESC ( is never produced.
 	win.Enqueue([]byte("\x1b[I\x1b[O\x1b(e"))
-	eventually(t, "e typed", func() bool { return f.got() == "\x1b\x1babcde" })
+	eventually(t, "e typed", func() bool { return f.got() == "\x1b\x1bab\x10cde" })
 	if strings.Contains(f.got(), "\x1b(") {
 		t.Errorf("ESC ( reached the link: %q", f.got())
 	}
@@ -794,16 +805,27 @@ func TestVSPAgentKeysAreRefusedNotDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
-	if err := ai.Type(ctx, []byte("ls\x1b[A")); !errors.Is(err, console.ErrKeysDropped) {
-		t.Errorf("arrow key on a VSP: err = %v, want ErrKeysDropped", err)
+	if err := ai.Type(ctx, []byte("\x1bOP")); !errors.Is(err, console.ErrKeysDropped) {
+		t.Errorf("function key on a VSP: err = %v, want ErrKeysDropped", err)
 	}
-	if got := f.got(); got != "" {
+	f.alt.Store(true)
+	if err := ai.Type(ctx, []byte("ls\x1b[A")); !errors.Is(err, console.ErrKeysDropped) {
+		t.Errorf("arrow key in full screen: err = %v, want ErrKeysDropped", err)
+	}
+	f.alt.Store(false)
+	if err := ai.Type(ctx, []byte("\x1b[A")); err != nil {
+		t.Fatalf("arrow key at a shell: %v", err)
+	}
+	if got := f.got(); got != "\x10" {
+		t.Errorf("arrow at a shell typed %q, want ctrl+p", got)
+	}
+	if got := f.got(); got != "\x10" {
 		t.Errorf("a refused write typed %q", got)
 	}
 	if err := ai.Type(ctx, []byte("\x1b")); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.got(); got != "\x1b\x1b" {
+	if got := f.got(); got != "\x10\x1b\x1b" {
 		t.Errorf("lone ESC from the AI tool typed %q, want ESC ESC", got)
 	}
 }
@@ -1063,13 +1085,13 @@ func TestAFragmentedKeyFromAWindowIsDroppedWholeAtTheHub(t *testing.T) {
 	// interleave, so a shared buffer would glue one's half to the other's.
 	win.Enqueue([]byte("a\x1bO"))
 	win2.Enqueue([]byte("x"))
-	win.Enqueue([]byte("Ab"))
+	win.Enqueue([]byte("Pb"))
 	win.Enqueue([]byte("\x1b[1;5"))
 	win2.Enqueue([]byte("y"))
 	win.Enqueue([]byte("Cc"))
 	eventually(t, "typed around the split keys", func() bool { return len(f.got()) == len("axbyc") })
 	got := f.got()
-	if strings.Contains(got, "A") || strings.Contains(got, "C") || strings.Contains(got, "[") {
+	if strings.Contains(got, "P") || strings.Contains(got, "C") || strings.Contains(got, "[") {
 		t.Fatalf("half of an arrow key was typed: %q", got)
 	}
 	for _, c := range "abc" { // one window's own typing stays in order
@@ -1158,9 +1180,9 @@ func TestAgentKeysKeepTheirBoundariesThroughTheVSPMapping(t *testing.T) {
 	}
 	// One unpassable key refuses the whole call before anything is typed.
 	before := f.got()
-	err = ai.TypeKeys(ctx, [][]byte{[]byte("abc"), []byte("\x1b"), []byte("\x1b[A")})
+	err = ai.TypeKeys(ctx, [][]byte{[]byte("abc"), []byte("\x1b"), []byte("\x1bOP")})
 	if !errors.Is(err, console.ErrKeysDropped) {
-		t.Errorf("with an arrow key: %v, want ErrKeysDropped", err)
+		t.Errorf("with a function key: %v, want ErrKeysDropped", err)
 	}
 	if got := f.got(); got != before {
 		t.Errorf("a refused call typed %q", got[len(before):])
@@ -1319,4 +1341,89 @@ func TestWindowClearIsRefusedWhileBusy(t *testing.T) {
 	inHub(t, h, func() { h.busy-- })
 	other.Clear()
 	eventually(t, "the clear goes through once idle", func() bool { return h.ty.Queued() == 0 })
+}
+
+func TestArrowAtAFreshBashPromptReachesTheLink(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.vsp = true
+	win := host(t, f, Options{NoLinger: true})
+	f.emit("\x1b[?2004hroot@node01:~# ")
+	time.Sleep(50 * time.Millisecond)
+	win.Enqueue([]byte("\x1b[A"))
+	win.Enqueue([]byte("\x1b[H"))
+	win.Enqueue([]byte("\x1bOA"))
+	eventually(t, "arrows typed as ctrl keys", func() bool { return f.got() == "\x10\x01\x10" })
+}
+
+func TestEnterAfterALongPasteGoesLast(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reads int
+	}{{"one write", 1}, {"plain keystrokes in many reads", 30}} {
+		t.Run(tc.name, func(t *testing.T) {
+			env(t)
+			f := newFake()
+			f.vsp = true
+			f.delay = 2 * time.Millisecond
+			win := host(t, f, Options{NoLinger: true})
+			paste := strings.Repeat("pAssw0rd-", 34)[:300]
+			step := len(paste) / tc.reads
+			for i := 0; i < len(paste); i += step {
+				win.Enqueue([]byte(paste[i:min(len(paste), i+step)]))
+			}
+			win.Enqueue([]byte("\r"))
+			eventually(t, "paste then enter", func() bool { return f.got() == paste+"\r" })
+		})
+	}
+}
+
+type autoSizer interface {
+	AutoSize(rows, cols int) (string, bool)
+}
+
+func TestAutoSizeIsDecidedAtTheHub(t *testing.T) {
+	env(t)
+	f := newFake()
+	f.delay = 5 * time.Millisecond
+	win := host(t, f, Options{NoLinger: true})
+	win2, err := join(t, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := func(c *Client) bool {
+		_, sent := c.Transport().Link.(autoSizer).AutoSize(23, 80)
+		return sent
+	}
+	f.emit("\r\nroot@node01:~# ")
+	time.Sleep(50 * time.Millisecond)
+
+	// Input queued just before: not sent.
+	win.Enqueue([]byte(strings.Repeat("a", 30)))
+	if size(win) {
+		t.Fatal("size queued behind input")
+	}
+	eventually(t, "input out", func() bool { return len(f.got()) == 30 })
+	// A line with text on it is not a clean prompt (the echo shows it).
+	f.emit("ls")
+	time.Sleep(50 * time.Millisecond)
+	if size(win) {
+		t.Fatal("size typed on a line with text")
+	}
+	f.emit("\r\nroot@node01:~# ")
+	time.Sleep(50 * time.Millisecond)
+	// Only the window that opened the console does it.
+	if size(win2) {
+		t.Fatal("a joined window typed the size")
+	}
+	// The write just before leaves the line dirty until Enter goes out.
+	win.Enqueue([]byte("\r"))
+	eventually(t, "enter out", func() bool { return strings.HasSuffix(f.got(), "\r") })
+	if !size(win) {
+		t.Fatal("size not sent at a clean prompt")
+	}
+	eventually(t, "size typed", func() bool { return strings.HasSuffix(f.got(), "stty\r") })
+	if size(win) {
+		t.Error("size sent twice")
+	}
 }

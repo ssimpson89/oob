@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ssimpson89/oob/internal/app"
@@ -273,6 +274,7 @@ type cliLink struct {
 	atPrompt bool
 	tail     []byte
 	seen     chan struct{} // signalled when the prompt pattern matches the output
+	alt      atomic.Bool   // the remote is in a full-screen program (see SetAltScreen)
 }
 
 func newCLILink(sl *sshLink, sp cliSpec, atPrompt, plain bool) *cliLink {
@@ -365,8 +367,12 @@ func (l *cliLink) MapInput(b []byte) ([]byte, string) {
 	if at {
 		return b, ""
 	}
-	return console.MapVSPInput(b)
+	return console.MapVSPInput(b, l.alt.Load())
 }
+
+// SetAltScreen records whether the remote is in a full-screen program, where
+// the VSP can't be given arrow keys. See MapInput.
+func (l *cliLink) SetAltScreen(on bool) { l.alt.Store(on) }
 
 func (l *cliLink) SizeIsFree() bool { return l.plain }
 
