@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -441,3 +442,109 @@ func TestEnterAfterALongPasteGoesLast(t *testing.T) {
 		})
 	}
 }
+
+func TestShellPrompt(t *testing.T) {
+	for line, want := range map[string]bool{
+		"root@node01:~# ":            true,
+		"[user@node01 dir]$ ":        true,
+		"user@node01:/var/log$ ":     true,
+		"bash-5.1$ ":                 true,
+		"sh-4.4# ":                   true,
+		"root@node01:~# ls":          false,
+		"root@node01:~#":             false,
+		"node01 login: ":             false,
+		"Password: ":                 false,
+		"[sudo] password for u: ":    false,
+		"hpeiLO-> ":                  false,
+		"grub> ":                     false,
+		"</>hpiLO-> ":                false,
+		"-- INSERT --":               false,
+		"~":                          false,
+		"user@node01's password: ":   false,
+		"Press any key to continue ": false,
+		"":                           false,
+	} {
+		if got := ShellPrompt(line); got != want {
+			t.Errorf("ShellPrompt(%q) = %v, want %v", line, got, want)
+		}
+	}
+}
+
+// sizeLink is a serial VSP-like link that types its size with stty.
+type sizeLink struct{ vspLink }
+
+func (*sizeLink) SizeLine(r, c int) (string, bool) {
+	return fmt.Sprintf("stty rows %d cols %d", r, c), true
+}
+
+func TestSizeOnceAtTheFirstShellPrompt(t *testing.T) {
+	fl := &sizeLink{}
+	k, con := vspKeys(t, fl)
+	sent := func() string { return string(fl.sentCopy()) }
+	wait := func(want string) {
+		t.Helper()
+		for i := 0; i < 200 && sent() != want; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := sent(); got != want {
+			t.Fatalf("sent %q, want %q", got, want)
+		}
+	}
+	notOut := func(why string) {
+		t.Helper()
+		time.Sleep(60 * time.Millisecond)
+		if got := sent(); got != "" {
+			t.Fatalf("%s: sent %q", why, got)
+		}
+	}
+
+	for _, out := range []string{"node01 login: ", "Password: ", "hpeiLO-> ", "\r\nLast login: Mon\r\n"} {
+		con.Output([]byte(out))
+		k.sizeOnce()
+	}
+	notOut("not a shell prompt")
+
+	con.Output([]byte("\x1b[?1049h~\r\nroot@node01:~# ")) // full screen
+	k.sizeOnce()
+	notOut("full screen")
+	con.Output([]byte("\x1b[?1049l\r\nroot@node01:~# "))
+
+	k.Input([]byte("ls")) // input still pending: the prompt line is no longer empty
+	k.sizeOnce()
+	wait("ls")
+	con.Output([]byte("\r\nroot@node01:~# "))
+	fl.mu.Lock()
+	fl.sent = nil
+	fl.mu.Unlock()
+	con.SetSend(5, 5) // typed but not out yet
+	k.sizeOnce()
+	notOut("input pending")
+	con.SetSend(0, 0)
+	k.sizeOnce()
+	wait("stty rows 23 cols 80\r")
+	if n := barNote(con); n != "sent size 23x80" {
+		t.Errorf("bar note = %q", n)
+	}
+	k.sizeOnce() // never again
+	con.Output([]byte("\r\nroot@node01:~# "))
+	k.sizeOnce()
+	time.Sleep(60 * time.Millisecond)
+	if got := sent(); got != "stty rows 23 cols 80\r" {
+		t.Errorf("repeated: %q", got)
+	}
+}
+
+func TestSizeOnceNotOnAFreeSizeLink(t *testing.T) {
+	fl := &freeLink{}
+	k, con := vspKeys(t, fl)
+	con.Output([]byte("root@node01:~# "))
+	k.sizeOnce()
+	time.Sleep(60 * time.Millisecond)
+	if len(fl.sentCopy()) != 0 || len(fl.fits) != 0 {
+		t.Errorf("plain ssh: sent %q fits %v", fl.sentCopy(), fl.fits)
+	}
+}
+
+type freeLink struct{ sizeLink }
+
+func (*freeLink) SizeIsFree() bool { return true }

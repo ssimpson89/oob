@@ -335,6 +335,14 @@ func (c *console) SetSend(pending, total int) {
 	}
 }
 
+// cursorLine is the remote's cursor line as the user sees it, and whether the
+// remote is in a full-screen program.
+func (c *console) cursorLine() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hist.Partial(), c.alt
+}
+
 // Pending is how many bytes are still queued to be typed.
 func (c *console) Pending() int {
 	c.mu.Lock()

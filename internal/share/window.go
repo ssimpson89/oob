@@ -57,7 +57,7 @@ func RunConsole(h config.Host, name string, o Console) (int, error) {
 	code, err := console.Run(console.Setup{
 		Host: name, Kind: t.Kind, Link: l, Out: t.Out, Done: t.Done,
 		Power: o.Power, Pacing: t.Pacing, Connecting: connecting, AtPrompt: c.Status().AtPrompt,
-		Queue: c, Shared: c.Window(),
+		Queue: c, Shared: c.Window(), SizeOnce: c.Hosting(),
 	})
 	if code != 0 && o.Failed != nil && c.Hosting() {
 		o.Failed(c)

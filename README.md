@@ -247,6 +247,7 @@ Press `ctrl+]`, then one key. Everything else you type goes to the machine.
 | Key | What it does |
 | --- | --- |
 | `s` | Send the window size (`stty rows R cols C` over SOL, a window change over SSH) |
+| (automatic) | On a serial console (SOL, iLO VSP, iDRAC com2, Supermicro SOL) oob types the size once, the first time it sees an empty shell prompt such as `root@node01:~# ` after connecting, with the bar note `sent size RxC`. It skips login and password questions, BMC prompts, bootloaders, full-screen programs and anything still queued, and never repeats on its own. Only the window that opened a shared console does it |
 | `a` | Toggle sending the size whenever you resize (off by default for SOL, since it types into the shell) |
 | `l` | Start or stop logging (includes the last 10000 lines you already saw) |
 | `b` | Send BREAK |

@@ -240,3 +240,36 @@ func (t *trace) log(dir string, b []byte) {
 	defer t.mu.Unlock()
 	fmt.Fprintf(t.w, "%.6f %s %q\n", time.Since(t.t0).Seconds(), dir, b)
 }
+
+// sizeOnce types the size the first time the cursor line is an empty shell
+// prompt on a serial console (the remote doesn't know the window size, and
+// full-screen programs draw for the wrong one). It does nothing in a
+// full-screen program, with input still queued, or on a link that follows the
+// window size by itself, and it never repeats: ctrl+] s still sends it by hand.
+func (k *consoleKeys) sizeOnce() {
+	if k.sized.Load() || k.cs.Link.SizeIsFree() {
+		return
+	}
+	if s, ok := k.cs.Link.(serialLink); !ok || !s.Serial() {
+		return
+	}
+	line, alt := k.con.cursorLine()
+	if alt || !ShellPrompt(line) || k.queuedAny() {
+		return
+	}
+	if !k.sized.CompareAndSwap(false, true) {
+		return
+	}
+	rows, cols := k.con.Size()
+	rows = RemoteRows(rows)
+	if err := k.fitSize(rows, cols); err != nil {
+		k.con.Note(sizeError(err), true)
+		return
+	}
+	k.con.Note(fmt.Sprintf("sent size %dx%d", rows, cols), false)
+}
+
+// queuedAny reports whether anything typed is still waiting to go out.
+func (k *consoleKeys) queuedAny() bool {
+	return k.con.Pending() > 0 || (k.ty != nil && k.ty.Queued() > 0)
+}

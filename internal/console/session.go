@@ -86,6 +86,10 @@ type Setup struct {
 	// Shared, if set, says the console is shared: the bar shows who is on it
 	// and the i key pauses the AI tool.
 	Shared Shared
+	// SizeOnce: on a serial console, type the size (stty) once, the first time
+	// a shell prompt shows. Set for the window that owns the console, so a
+	// shared console does it once.
+	SizeOnce bool
 }
 
 // UseBar reports whether the bottom bar can run: stdin and stdout must both be
@@ -204,6 +208,7 @@ func Run(cs Setup) (int, error) {
 		})
 	}
 
+	var keysP atomic.Pointer[consoleKeys] // set once the keys exist; the output loop starts first
 	outDone := make(chan struct{})
 	guard(cleanup, func() {
 		defer close(outDone)
@@ -214,6 +219,9 @@ func Run(cs Setup) (int, error) {
 			tr.log("RX", buf[:n])
 			con.Output(buf[:n])
 			alt.Follow(cs.Link, buf[:n])
+			if k := keysP.Load(); k != nil && cs.SizeOnce && n > 0 {
+				k.sizeOnce()
+			}
 			if o, ok := cs.Link.(observer); ok && n > 0 {
 				if kind, at, changed := o.Observe(buf[:n]); changed {
 					con.SetKind(kind, at)
@@ -227,6 +235,7 @@ func Run(cs Setup) (int, error) {
 
 	keys := newKeys(&cs, con, cleanup, stop)
 	keys.auto = auto
+	keysP.Store(keys)
 	keys.start(tr)
 
 	// Window changes: follow the size at once, type stty only if asked.
@@ -338,6 +347,7 @@ type consoleKeys struct {
 	q  Queue        // ty, or the hub's queue
 
 	noted  atomic.Bool // the link's input note was shown
+	sized  atomic.Bool // the size was sent automatically at the first shell prompt
 	filter InputFilter // holds the start of an escape sequence a read ended in; used from the input loop only
 
 	// lineDirty: the last byte written was neither Enter nor ctrl+c, so the
