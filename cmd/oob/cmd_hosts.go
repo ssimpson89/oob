@@ -142,7 +142,7 @@ func lsCmd() *cobra.Command {
 // validTypes lists the accepted --type values (excluding the empty default).
 func validTypes() []string {
 	var out []string
-	for _, t := range []string{detect.TypeILO, detect.TypeIDRAC, detect.TypeSupermicro, detect.TypeIPMI} {
+	for _, t := range []string{detect.TypeILO, detect.TypeIDRAC, detect.TypeSupermicro, detect.TypeIPMI, detect.TypeOpenBMC} {
 		if detect.ValidType(t) {
 			out = append(out, t)
 		}
@@ -213,7 +213,7 @@ func (hf *hostFields) bind(f *pflag.FlagSet) {
 	f.IntVar(&hf.h.Port, "port", 0, "SSH port")
 	f.StringVar(&hf.h.Cipher, "cipher", "", "ipmitool lanplus cipher suite, e.g. 17 or 3")
 	f.StringVar(&hf.h.Notes, "notes", "", "free-form notes (also --note)")
-	f.StringVar(&hf.h.Type, "type", "", "BMC type: "+strings.Join(validTypes(), ", ")+` ("ilo": HPE iLO, Redfish and SSH CLI; "idrac" and "supermicro" are untested; "ipmi" pins generic IPMI); default: generic, and the vendor is auto-detected over SSH on first use`)
+	f.StringVar(&hf.h.Type, "type", "", "BMC type: "+strings.Join(validTypes(), ", ")+` ("ilo": HPE iLO, Redfish and SSH CLI; "idrac" and "supermicro" are untested; "ipmi" pins generic IPMI; "openbmc": OpenBMC/bmcweb such as NVIDIA GB200/GB300 trays, console over the web socket, power and boot over Redfish); default: generic, and the vendor is auto-detected over SSH on first use`)
 	f.StringSliceVar(&hf.tags, "tag", nil, "tag (repeatable; replaces existing tags)")
 	f.SetNormalizeFunc(func(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 		if name == "note" {
