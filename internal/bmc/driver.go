@@ -58,6 +58,8 @@ func DriverFor(name string, h config.Host) Driver {
 		return newIDRACDriver(name, h)
 	case detect.TypeSupermicro:
 		return newSupermicroDriver(name, h)
+	case detect.TypeOpenBMC:
+		return newOpenBMCDriver(name, h)
 	}
 	return &ipmiDriver{name, h}
 }

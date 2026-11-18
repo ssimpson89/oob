@@ -163,6 +163,7 @@ probe off.
 | Vendor | `type` | Status |
 | --- | --- | --- |
 | HPE iLO 7 | `ilo` | Tested: SSH, the VSP console, power status. Redfish write operations (power on/off/reset, PXE boot) are written to the HPE spec but untested |
+| OpenBMC (bmcweb), e.g. the NVIDIA GB300 compute tray BMC ("GB BMC") | `openbmc` | Set by hand, never detected. No IPMI or SSH needed: the console is bmcweb's `/console0` websocket (what the web UI's SOL page uses), power and one-time boot are Redfish on the system listed in `/redfish/v1/Systems`. Tested on a GB300 tray: console and power status. Power changes and boot are written to the Redfish spec but untested; UID, NMI, SEL and mc reset fall back to IPMI. No serial BREAK |
 | Dell iDRAC | `idrac` | Untested. Written from Dell's racadm documentation |
 | Supermicro | `supermicro` | Untested. ipmitool with cipher fallback, plus an SSH console fallback |
 | Generic IPMI | empty or `ipmi` | ipmitool over lanplus |
