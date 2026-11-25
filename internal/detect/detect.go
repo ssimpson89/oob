@@ -20,12 +20,16 @@ const (
 	TypeIDRAC      = "idrac"
 	TypeSupermicro = "supermicro"
 	TypeIPMI       = "ipmi"
+	// TypeOpenBMC is an OpenBMC (bmcweb) BMC, such as the NVIDIA GB200/GB300
+	// tray BMC: console over its websocket, power and boot over Redfish. Set
+	// by hand; never auto-detected.
+	TypeOpenBMC = "openbmc"
 )
 
 // ValidType reports whether t is a value for a host's type field.
 func ValidType(t string) bool {
 	switch t {
-	case "", TypeILO, TypeIDRAC, TypeSupermicro, TypeIPMI:
+	case "", TypeILO, TypeIDRAC, TypeSupermicro, TypeIPMI, TypeOpenBMC:
 		return true
 	}
 	return false
@@ -40,6 +44,8 @@ func VendorName(t string) string {
 		return "Dell iDRAC"
 	case TypeSupermicro:
 		return "Supermicro"
+	case TypeOpenBMC:
+		return "OpenBMC"
 	}
 	return "generic IPMI"
 }
